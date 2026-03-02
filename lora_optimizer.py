@@ -443,6 +443,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "default": "disabled",
                     "tooltip": "Release GPU cache between analysis and merge passes. Lowers peak VRAM at negligible speed cost."
                 }),
+                "optimization_mode": (["per_prefix", "global"], {
+                    "default": "per_prefix",
+                    "tooltip": "per_prefix: each weight group picks its own merge strategy based on local conflict. global: single strategy for all (original behavior)."
+                }),
             }
         }
 
@@ -453,7 +457,7 @@ class LoRAOptimizer(_LoRAMergeBase):
     DESCRIPTION = "Auto-analyzes LoRA stack and selects optimal merge strategy. Outputs merged model + analysis report."
 
     @staticmethod
-    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength):
+    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix"):
         """
         Build a deterministic SHA-256 hash (16 hex chars) from the stack
         configuration. Used by IS_CHANGED to let ComfyUI skip re-execution
@@ -471,15 +475,16 @@ class LoRAOptimizer(_LoRAMergeBase):
                     entries.append((str(item.get("name", "")), float(item.get("strength", 0))))
             entries.sort()
             h.update(json.dumps(entries).encode())
-        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}".encode())
+        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}".encode())
         return h.hexdigest()[:16]
 
     @classmethod
     def IS_CHANGED(cls, model, clip, lora_stack, output_strength,
                    clip_strength_multiplier=1.0, auto_strength="disabled",
-                   free_vram_between_passes="disabled"):
+                   free_vram_between_passes="disabled", optimization_mode="per_prefix"):
         return cls._compute_cache_key(lora_stack, output_strength,
-                                      clip_strength_multiplier, auto_strength)
+                                      clip_strength_multiplier, auto_strength,
+                                      optimization_mode)
 
     def _save_report_to_disk(self, cache_key, lora_combo, auto_strength, report, selected_params):
         """
