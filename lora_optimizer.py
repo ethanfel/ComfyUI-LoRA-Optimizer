@@ -427,12 +427,12 @@ class LoRAOptimizer(_LoRAMergeBase):
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "The model to apply LoRA to"}),
-                "clip": ("CLIP", {"tooltip": "The CLIP model"}),
                 "lora_stack": ("LORA_STACK", {"tooltip": "LoRA stack - accepts standard (name, model_str, clip_str) tuples or LoRAStack dicts"}),
                 "output_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                                               "tooltip": "Strength of the merged effect"}),
             },
             "optional": {
+                "clip": ("CLIP", {"tooltip": "The CLIP model (optional — omit for video/latent-only workflows)"}),
                 "clip_strength_multiplier": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                                                        "tooltip": "Strength multiplier for CLIP"}),
                 "auto_strength": (["disabled", "enabled"], {
@@ -479,7 +479,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         return h.hexdigest()[:16]
 
     @classmethod
-    def IS_CHANGED(cls, model, clip, lora_stack, output_strength,
+    def IS_CHANGED(cls, model, lora_stack, output_strength, clip=None,
                    clip_strength_multiplier=1.0, auto_strength="disabled",
                    free_vram_between_passes="disabled", optimization_mode="per_prefix"):
         return cls._compute_cache_key(lora_stack, output_strength,
@@ -1132,7 +1132,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         lines.append("=" * 50)
         return "\n".join(lines)
 
-    def optimize_merge(self, model, clip, lora_stack, output_strength, clip_strength_multiplier=1.0, auto_strength="disabled", free_vram_between_passes="disabled", optimization_mode="per_prefix"):
+    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", free_vram_between_passes="disabled", optimization_mode="per_prefix"):
         """
         Main entry point. Two-pass streaming architecture:
         Pass 1: Compute diffs per-prefix, sample conflicts + magnitudes, discard diffs
