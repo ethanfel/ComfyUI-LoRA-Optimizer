@@ -1539,29 +1539,42 @@ class ZImageLoRAOptimizer(ZImageLoRATrueMerge):
             )
 
         compute_device = self._get_compute_device()
-        logging.info(f"[Z-Image Optimizer]   Compute device: {compute_device}")
+        use_gpu = compute_device.type != "cpu"
+        logging.info(f"[Z-Image Optimizer]   Compute device: {compute_device}"
+                     f" ({'sequential' if use_gpu else 'threaded'})")
 
-        max_workers = min(4, max(1, len(all_lora_prefixes)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self._process_prefix, lora_prefix, active_loras,
-                                model_keys, clip_keys, model, clip, compute_device): lora_prefix
-                for lora_prefix in all_lora_prefixes
-            }
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result is None:
-                    continue
-                prefix, diffs, lora_diffs, partial_stats, target_info, skips = result
-                if len(diffs) > 0:
-                    all_key_diffs[prefix] = diffs
-                    all_key_targets[prefix] = target_info
-                    per_lora_diffs[prefix] = lora_diffs
-                skipped_keys += skips
-                for (idx, rank, l2) in partial_stats:
-                    per_lora_stats[idx]["ranks"].append(rank)
-                    per_lora_stats[idx]["key_count"] += 1
-                    per_lora_stats[idx]["l2_norms"].append(l2)
+        def _collect_prefix_result(result):
+            nonlocal skipped_keys
+            if result is None:
+                return
+            prefix, diffs, lora_diffs, partial_stats, target_info, skips = result
+            if len(diffs) > 0:
+                all_key_diffs[prefix] = diffs
+                all_key_targets[prefix] = target_info
+                per_lora_diffs[prefix] = lora_diffs
+            skipped_keys += skips
+            for (idx, rank, l2) in partial_stats:
+                per_lora_stats[idx]["ranks"].append(rank)
+                per_lora_stats[idx]["key_count"] += 1
+                per_lora_stats[idx]["l2_norms"].append(l2)
+
+        if use_gpu:
+            # GPU path: sequential to avoid CUDA allocator contention
+            for lora_prefix in all_lora_prefixes:
+                result = self._process_prefix(lora_prefix, active_loras,
+                                              model_keys, clip_keys, model, clip, compute_device)
+                _collect_prefix_result(result)
+        else:
+            # CPU path: thread pool to parallelize across cores
+            max_workers = min(4, max(1, len(all_lora_prefixes)))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(self._process_prefix, lora_prefix, active_loras,
+                                    model_keys, clip_keys, model, clip, compute_device): lora_prefix
+                    for lora_prefix in all_lora_prefixes
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    _collect_prefix_result(future.result())
 
         if len(all_key_diffs) == 0:
             return (model, clip, "No compatible LoRA keys found. "
@@ -1601,23 +1614,32 @@ class ZImageLoRAOptimizer(ZImageLoRATrueMerge):
         pairs = [(i, j) for i in range(len(active_loras))
                          for j in range(i + 1, len(active_loras))]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max(1, len(pairs)))) as executor:
-            futures = [
-                executor.submit(self._process_pair, i, j, active_loras,
-                                per_lora_diffs, compute_device)
-                for i, j in pairs
-            ]
-            for future in futures:  # preserve submission order for deterministic reports
-                pair_overlap, pair_conflict, ratio, pair_label = future.result()
-                total_overlap += pair_overlap
-                total_conflict += pair_conflict
-                pairwise_conflicts.append({
-                    "pair": pair_label,
-                    "overlap": pair_overlap,
-                    "conflicts": pair_conflict,
-                    "ratio": ratio,
-                })
-                logging.info(f"[Z-Image Optimizer]   {pair_label} -> {ratio:.1%} conflict")
+        def _collect_pair_result(pair_result):
+            nonlocal total_overlap, total_conflict
+            pair_overlap, pair_conflict, ratio, pair_label = pair_result
+            total_overlap += pair_overlap
+            total_conflict += pair_conflict
+            pairwise_conflicts.append({
+                "pair": pair_label,
+                "overlap": pair_overlap,
+                "conflicts": pair_conflict,
+                "ratio": ratio,
+            })
+            logging.info(f"[Z-Image Optimizer]   {pair_label} -> {ratio:.1%} conflict")
+
+        if use_gpu:
+            for i, j in pairs:
+                _collect_pair_result(self._process_pair(i, j, active_loras,
+                                                       per_lora_diffs, compute_device))
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max(1, len(pairs)))) as executor:
+                futures = [
+                    executor.submit(self._process_pair, i, j, active_loras,
+                                    per_lora_diffs, compute_device)
+                    for i, j in pairs
+                ]
+                for future in futures:  # preserve submission order for deterministic reports
+                    _collect_pair_result(future.result())
 
         avg_conflict_ratio = total_conflict / total_overlap if total_overlap > 0 else 0
         logging.info(f"[Z-Image Optimizer]   Average conflict ratio: {avg_conflict_ratio:.1%} ({time.time() - t_phase2:.1f}s)")
