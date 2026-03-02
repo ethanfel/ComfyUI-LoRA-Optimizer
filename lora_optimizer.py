@@ -443,6 +443,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "default": "disabled",
                     "tooltip": "Release GPU cache between analysis and merge passes. Lowers peak VRAM at negligible speed cost."
                 }),
+                "optimization_mode": (["per_prefix", "global"], {
+                    "default": "per_prefix",
+                    "tooltip": "per_prefix: each weight group picks its own merge strategy based on local conflict. global: single strategy for all (original behavior)."
+                }),
             }
         }
 
@@ -450,10 +454,10 @@ class LoRAOptimizer(_LoRAMergeBase):
     RETURN_NAMES = ("model", "clip", "analysis_report")
     FUNCTION = "optimize_merge"
     CATEGORY = "loaders/lora"
-    DESCRIPTION = "Auto-analyzes LoRA stack and selects optimal merge strategy. Outputs merged model + analysis report."
+    DESCRIPTION = "Auto-analyzes LoRA stack and selects optimal merge strategy per weight group. Outputs merged model + analysis report."
 
     @staticmethod
-    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength):
+    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix"):
         """
         Build a deterministic SHA-256 hash (16 hex chars) from the stack
         configuration. Used by IS_CHANGED to let ComfyUI skip re-execution
@@ -471,15 +475,16 @@ class LoRAOptimizer(_LoRAMergeBase):
                     entries.append((str(item.get("name", "")), float(item.get("strength", 0))))
             entries.sort()
             h.update(json.dumps(entries).encode())
-        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}".encode())
+        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}".encode())
         return h.hexdigest()[:16]
 
     @classmethod
     def IS_CHANGED(cls, model, clip, lora_stack, output_strength,
                    clip_strength_multiplier=1.0, auto_strength="disabled",
-                   free_vram_between_passes="disabled"):
+                   free_vram_between_passes="disabled", optimization_mode="per_prefix"):
         return cls._compute_cache_key(lora_stack, output_strength,
-                                      clip_strength_multiplier, auto_strength)
+                                      clip_strength_multiplier, auto_strength,
+                                      optimization_mode)
 
     def _save_report_to_disk(self, cache_key, lora_combo, auto_strength, report, selected_params):
         """
@@ -890,6 +895,51 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         return (new_strengths, reasoning)
 
+    @staticmethod
+    def _extract_block_name(prefix):
+        """
+        Extract a human-readable block name from a LoRA key prefix.
+        Handles common architectures: SD1.5, SDXL, Flux, Wan, etc.
+
+        Examples:
+          lora_unet_input_blocks_4_1_transformer_blocks_0_attn2_to_q -> input_blocks.4
+          lora_unet_double_blocks_12_img_attn_proj -> double_blocks.12
+          lora_unet_down_blocks_2_attentions_1_transformer_blocks_0_attn1_to_k -> down_blocks.2
+          diffusion_model.joint_blocks.5.x_block.attn.qkv -> joint_blocks.5
+          transformer.blocks.8.attn1.to_q -> blocks.8
+
+        Falls back to the first two meaningful segments if no pattern matches.
+        """
+        import re
+        # Normalize separators: lora_unet_input_blocks_4 -> input_blocks.4
+        # Strip common prefixes
+        p = prefix
+        for strip in ["lora_unet_", "lora_te_", "lora_te1_", "lora_te2_",
+                       "diffusion_model.", "transformer.", "model."]:
+            if p.startswith(strip):
+                p = p[len(strip):]
+                break
+
+        # Replace underscores with dots for pattern matching
+        p_dots = re.sub(r'_', '.', p)
+
+        # Match: word.number (e.g., input.blocks.4, double.blocks.12, down.blocks.2)
+        m = re.match(r'([a-z]+(?:\.[a-z]+)*?)\.(\d+)', p_dots)
+        if m:
+            block_type = m.group(1).replace('.', '_')
+            block_num = m.group(2)
+            return f"{block_type}.{block_num}"
+
+        # Fallback: first segment
+        parts = re.split(r'[._]', prefix)
+        meaningful = [p for p in parts if p not in ("lora", "unet", "te", "te1", "te2",
+                                                     "diffusion", "model", "transformer")]
+        if len(meaningful) >= 2:
+            return f"{meaningful[0]}.{meaningful[1]}"
+        elif meaningful:
+            return meaningful[0]
+        return prefix[:30]
+
     def _auto_select_params(self, avg_conflict_ratio, magnitude_ratio, all_key_diffs=None, magnitude_samples=None):
         """
         Decision logic for auto-selecting merge parameters.
@@ -937,7 +987,8 @@ class LoRAOptimizer(_LoRAMergeBase):
 
     def _build_report(self, lora_stats, pairwise_conflicts, collection_stats,
                       mode, density, sign_method, reasoning, merge_summary,
-                      auto_strength_info=None):
+                      auto_strength_info=None, strategy_counts=None, optimization_mode="global",
+                      prefix_decisions=None):
         """Format analysis as a multi-line report string."""
         lines = []
         lines.append("=" * 50)
@@ -993,6 +1044,72 @@ class LoRAOptimizer(_LoRAMergeBase):
         if mode == "ties":
             lines.append(f"  Density: {density:.2f}")
             lines.append(f"  Sign method: {sign_method}")
+        if optimization_mode == "per_prefix":
+            lines.append("  (global fallback — each prefix uses its own parameters)")
+
+        # Per-Prefix Strategy breakdown (only in per_prefix mode)
+        if optimization_mode == "per_prefix" and strategy_counts:
+            lines.append("")
+            lines.append("--- Per-Prefix Strategy ---")
+            total_pf = sum(strategy_counts.values())
+            if total_pf > 0:
+                if strategy_counts.get("weighted_sum", 0) > 0:
+                    n = strategy_counts["weighted_sum"]
+                    lines.append(f"  weighted_sum (single LoRA):      {n:>4} prefixes ({n/total_pf:.0%})")
+                if strategy_counts.get("weighted_average", 0) > 0:
+                    n = strategy_counts["weighted_average"]
+                    lines.append(f"  weighted_average (low conflict):  {n:>4} prefixes ({n/total_pf:.0%})")
+                if strategy_counts.get("ties", 0) > 0:
+                    n = strategy_counts["ties"]
+                    lines.append(f"  ties (high conflict):            {n:>4} prefixes ({n/total_pf:.0%})")
+                lines.append(f"  Total:                           {total_pf:>4} prefixes")
+
+        # Block Strategy Map (per_prefix mode only)
+        if optimization_mode == "per_prefix" and prefix_decisions:
+            # Group prefixes by block name
+            block_data = {}  # block_name -> list of (mode, conflict, n_loras)
+            for prefix, pf_mode, conflict, n_loras in prefix_decisions:
+                block_name = self._extract_block_name(prefix)
+                if block_name not in block_data:
+                    block_data[block_name] = []
+                block_data[block_name].append((pf_mode, conflict, n_loras))
+
+            # Aggregate per block: dominant strategy, avg conflict, max n_loras
+            block_summary = []
+            for block_name, entries in block_data.items():
+                modes = [e[0] for e in entries]
+                conflicts = [e[1] for e in entries]
+                n_loras_max = max(e[2] for e in entries)
+                # Dominant mode = most frequent
+                mode_counts = {}
+                for m in modes:
+                    mode_counts[m] = mode_counts.get(m, 0) + 1
+                dominant = max(mode_counts, key=mode_counts.get)
+                avg_conflict = sum(conflicts) / len(conflicts) if conflicts else 0
+                n_prefixes = len(entries)
+                block_summary.append((block_name, dominant, avg_conflict, n_loras_max, n_prefixes))
+
+            # Sort by block name for consistent ordering
+            block_summary.sort(key=lambda x: x[0])
+
+            lines.append("")
+            lines.append("--- Block Strategy Map ---")
+            symbols = {"weighted_sum": "====", "weighted_average": "----", "ties": "####"}
+            labels = {"weighted_sum": "sum", "weighted_average": "avg", "ties": "TIES"}
+            # Find max block name length for alignment
+            max_name = max(len(b[0]) for b in block_summary) if block_summary else 10
+            for block_name, dominant, avg_conflict, n_loras_max, n_prefixes in block_summary:
+                sym = symbols.get(dominant, "????")
+                lbl = labels.get(dominant, dominant)
+                if dominant == "weighted_sum":
+                    detail = f"1 LoRA"
+                elif dominant == "ties":
+                    detail = f"{avg_conflict:.0%} conflict"
+                else:
+                    detail = f"{avg_conflict:.0%} conflict"
+                count_str = f"({n_prefixes}x)" if n_prefixes > 1 else ""
+                lines.append(f"  {block_name:<{max_name}}  {sym}  {lbl:<4} {detail} {count_str}")
+            lines.append(f"  Legend: ==== sum (single LoRA)  ---- avg (compatible)  #### TIES (conflict)")
 
         # Reasoning
         lines.append("")
@@ -1015,7 +1132,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         lines.append("=" * 50)
         return "\n".join(lines)
 
-    def optimize_merge(self, model, clip, lora_stack, output_strength, clip_strength_multiplier=1.0, auto_strength="disabled", free_vram_between_passes="disabled"):
+    def optimize_merge(self, model, clip, lora_stack, output_strength, clip_strength_multiplier=1.0, auto_strength="disabled", free_vram_between_passes="disabled", optimization_mode="per_prefix"):
         """
         Main entry point. Two-pass streaming architecture:
         Pass 1: Compute diffs per-prefix, sample conflicts + magnitudes, discard diffs
@@ -1064,7 +1181,8 @@ class LoRAOptimizer(_LoRAMergeBase):
         # Check instance-level patch cache (survives ComfyUI re-execution
         # triggered by downstream seed changes or similar non-LoRA changes)
         cache_key = self._compute_cache_key(lora_stack, output_strength,
-                                            clip_strength_multiplier, auto_strength)
+                                            clip_strength_multiplier, auto_strength,
+                                            optimization_mode)
         if cache_key in self._merge_cache:
             model_patches, clip_patches, report, clip_strength_out = self._merge_cache[cache_key]
             new_model = model
@@ -1130,6 +1248,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         pair_accum = {(i, j): [0, 0] for i, j in pairs}  # [overlap, conflict]
         all_magnitude_samples = []    # list of small CPU tensors
         prefix_count = 0              # number of prefixes with valid diffs
+        prefix_stats = {}             # prefix -> {conflict_ratio, n_loras, magnitude_samples, magnitude_ratio}
 
         def _collect_analysis_result(result):
             nonlocal skipped_keys, prefix_count
@@ -1148,6 +1267,30 @@ class LoRAOptimizer(_LoRAMergeBase):
                 pair_accum[(i, j)][0] += ov
                 pair_accum[(i, j)][1] += conf
             all_magnitude_samples.extend(mag_samples)
+
+            # Store per-prefix stats for per_prefix optimization mode
+            if len(partial_stats) > 0:
+                # Number of LoRAs contributing to this prefix
+                n_contributing = len(partial_stats)
+
+                # Per-prefix conflict ratio
+                pf_overlap = sum(ov for ov, _ in pair_conflicts.values())
+                pf_conflict = sum(conf for _, conf in pair_conflicts.values())
+                pf_conflict_ratio = pf_conflict / pf_overlap if pf_overlap > 0 else 0.0
+
+                # Per-prefix magnitude ratio (max/min L2 among contributing LoRAs)
+                pf_l2s = [l2 for _, _, l2 in partial_stats if l2 > 0]
+                if len(pf_l2s) >= 2:
+                    pf_mag_ratio = max(pf_l2s) / min(pf_l2s)
+                else:
+                    pf_mag_ratio = 1.0
+
+                prefix_stats[prefix] = {
+                    "n_loras": n_contributing,
+                    "conflict_ratio": pf_conflict_ratio,
+                    "magnitude_ratio": pf_mag_ratio,
+                    "magnitude_samples": list(mag_samples),  # copy, not reference
+                }
 
         if use_gpu:
             for lora_prefix in all_lora_prefixes:
@@ -1282,12 +1425,15 @@ class LoRAOptimizer(_LoRAMergeBase):
         # =====================================================================
         # Pass 2 — Merge (recompute diffs per-prefix, merge, discard)
         # =====================================================================
-        logging.info(f"[LoRA Optimizer] Pass 2: Merging {len(all_key_targets)} keys..."
-                     f" ({'sequential' if use_gpu else 'threaded'})")
+        logging.info(f"[LoRA Optimizer] Pass 2: Merging {len(all_key_targets)} keys "
+                     f"({optimization_mode} strategy, "
+                     f"{'sequential' if use_gpu else 'threaded'})...")
         t_pass2 = time.time()
         model_patches = {}
         clip_patches = {}
         processed_keys = 0
+        strategy_counts = {"weighted_sum": 0, "weighted_average": 0, "ties": 0}
+        prefix_decisions = []  # list of (prefix, mode, conflict_ratio, n_loras) for block map
 
         def _merge_one_prefix(lora_prefix, target_key, is_clip_key):
             """Recompute diffs for one prefix, merge, return patch or None."""
@@ -1364,25 +1510,49 @@ class LoRAOptimizer(_LoRAMergeBase):
             if len(diffs_list) == 0:
                 return None
 
+            # Determine strategy for this prefix
+            pf_conflict = 0.0
+            pf_n_loras = len(diffs_list)
+            if optimization_mode == "per_prefix" and lora_prefix in prefix_stats:
+                pf = prefix_stats[lora_prefix]
+                pf_conflict = pf["conflict_ratio"]
+                pf_n_loras = pf["n_loras"]
+                if pf["n_loras"] <= 1 or len(diffs_list) <= 1:
+                    # Single LoRA on this prefix: weighted_sum, full strength
+                    pf_mode = "weighted_sum"
+                    pf_density = 0.5
+                    pf_sign = "frequency"
+                else:
+                    pf_mode, pf_density, pf_sign, _ = self._auto_select_params(
+                        pf["conflict_ratio"], pf["magnitude_ratio"],
+                        magnitude_samples=pf.get("magnitude_samples")
+                    )
+            else:
+                pf_mode = mode
+                pf_density = density
+                pf_sign = sign_method
+
             merged_diff = self._merge_diffs(
-                diffs_list, mode,
-                density=density, majority_sign_method=sign_method,
+                diffs_list, pf_mode,
+                density=pf_density, majority_sign_method=pf_sign,
                 compute_device=compute_device
             )
             if merged_diff is None:
                 return None
-            return (target_key, is_clip_key, merged_diff)
+            return (target_key, is_clip_key, merged_diff, pf_mode, lora_prefix, pf_conflict, pf_n_loras)
 
         def _collect_merge_result(result):
             nonlocal processed_keys
             if result is None:
                 return
-            target_key, is_clip_key, merged_diff = result
+            target_key, is_clip_key, merged_diff, used_mode, prefix, conflict, n_loras = result
             if is_clip_key:
                 clip_patches[target_key] = ("diff", (merged_diff,))
             else:
                 model_patches[target_key] = ("diff", (merged_diff,))
             processed_keys += 1
+            strategy_counts[used_mode] = strategy_counts.get(used_mode, 0) + 1
+            prefix_decisions.append((prefix, used_mode, conflict, n_loras))
 
         if use_gpu:
             for lora_prefix, (target_key, is_clip_key) in all_key_targets.items():
@@ -1399,6 +1569,11 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         logging.info(f"[LoRA Optimizer]   Model patches: {len(model_patches)}, "
                      f"CLIP patches: {len(clip_patches)} ({time.time() - t_pass2:.1f}s)")
+        if optimization_mode == "per_prefix":
+            logging.info(f"[LoRA Optimizer]   Per-prefix strategies: "
+                         f"{strategy_counts.get('weighted_sum', 0)} weighted_sum, "
+                         f"{strategy_counts.get('weighted_average', 0)} weighted_average, "
+                         f"{strategy_counts.get('ties', 0)} ties")
 
         # Apply patches
         new_model = model
@@ -1433,7 +1608,10 @@ class LoRAOptimizer(_LoRAMergeBase):
         report = self._build_report(
             lora_stats, pairwise_conflicts, collection_stats,
             mode, density, sign_method, reasoning, merge_summary,
-            auto_strength_info=auto_strength_info
+            auto_strength_info=auto_strength_info,
+            strategy_counts=strategy_counts if optimization_mode == "per_prefix" else None,
+            optimization_mode=optimization_mode,
+            prefix_decisions=prefix_decisions if optimization_mode == "per_prefix" else None
         )
 
         # Cache patches for re-use (single entry to limit memory)
@@ -1441,7 +1619,9 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         # Save report to disk for later reference
         lora_combo = [[item["name"], item["strength"]] for item in active_loras]
-        selected_params = {"mode": mode, "density": density, "sign_method": sign_method}
+        selected_params = {"mode": mode, "density": density, "sign_method": sign_method, "optimization_mode": optimization_mode}
+        if optimization_mode == "per_prefix":
+            selected_params["strategy_counts"] = dict(strategy_counts)
         report_path = self._save_report_to_disk(cache_key, lora_combo, auto_strength, report, selected_params)
         if report_path:
             logging.info(f"[LoRA Optimizer] Report saved to: {report_path}")

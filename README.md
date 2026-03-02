@@ -5,13 +5,14 @@
 <p align="center">
   <img src="https://img.shields.io/badge/ComfyUI-Custom_Nodes-blue?style=flat-square" alt="ComfyUI">
   <img src="https://img.shields.io/badge/TIES_Merging-NeurIPS_2023-8b5cf6?style=flat-square" alt="TIES">
+  <img src="https://img.shields.io/badge/Per--Prefix_Adaptive-Merge-e94560?style=flat-square" alt="Per-Prefix">
   <img src="https://img.shields.io/badge/Flux_%7C_SDXL_%7C_SD1.5-Compatible-22c55e?style=flat-square" alt="Compatible">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="MIT">
 </p>
 
 ---
 
-A ComfyUI node that **automatically analyzes your LoRA stack** and selects the best merge strategy — diff-based merging, TIES conflict resolution, and auto-tuned parameters. Two nodes: **LoRA Stack** (build input) and **LoRA Optimizer** (analyze + merge).
+A ComfyUI node that **automatically analyzes your LoRA stack** and selects the best merge strategy per weight group — diff-based merging, TIES conflict resolution, per-prefix adaptive decisions, and auto-tuned parameters. Two nodes: **LoRA Stack** (build input) and **LoRA Optimizer** (analyze + merge).
 
 ## The Problem
 
@@ -23,7 +24,7 @@ model += lora2_effect x strength2
 total effect = strength1 + strength2  -->  easily exceeds 1.0
 ```
 
-The optimizer solves this by computing full weight diffs, detecting sign conflicts, and merging with the optimal strategy.
+The optimizer solves this by computing full weight diffs, detecting sign conflicts per weight group, and merging each group with its optimal strategy.
 
 <p align="center">
   <img src="assets/comparison.png" alt="Before/After Comparison" width="100%">
@@ -43,13 +44,13 @@ Builds a list of LoRAs for the optimizer. Chain multiple Stack nodes to add any 
 
 ### LoRA Optimizer
 
-The auto-optimizer. Takes a `LORA_STACK`, analyzes the LoRAs, and automatically selects the best merge mode and parameters. Outputs the merged result plus a detailed analysis report explaining what it chose and why.
+The auto-optimizer. Takes a `LORA_STACK`, analyzes the LoRAs, and automatically selects the best merge mode and parameters **per weight group**. Outputs the merged result plus a detailed analysis report with a block strategy map.
 
 Also accepts standard tuple-format stacks `(lora_name, model_strength, clip_strength)` from Efficiency Nodes, Comfyroll, and similar packs.
 
 Uses a **two-pass streaming architecture** for low memory usage:
-- **Pass 1 (Analysis):** Computes weight diffs per prefix, samples conflict and magnitude statistics, then discards the diffs. Only lightweight scalars are kept.
-- **Pass 2 (Merge):** Recomputes diffs per prefix and merges with the auto-selected strategy. Each prefix is freed after merging.
+- **Pass 1 (Analysis):** Computes weight diffs per prefix, samples conflict and magnitude statistics per prefix, then discards the diffs. Only lightweight scalars are kept.
+- **Pass 2 (Merge):** Recomputes diffs per prefix, looks up that prefix's conflict data, picks the optimal strategy for it, and merges. Each prefix is freed after merging.
 
 Peak memory is ~one prefix at a time (~260MB) regardless of LoRA count or model size. GPU-accelerated on both passes.
 
@@ -57,29 +58,46 @@ Peak memory is ~one prefix at a time (~260MB) regardless of LoRA count or model 
   <img src="assets/optimizer-pipeline.svg" alt="Optimizer Pipeline" width="100%">
 </p>
 
-**What it analyzes:**
-- Per-LoRA metrics (rank, key count, effective L2 norms)
-- Pairwise sign conflict ratios (sampled for efficiency)
-- Magnitude distribution across all weight diffs
-- Key overlap between LoRAs
+#### Per-Prefix Adaptive Merge
 
-**How it decides:**
+The key insight: two LoRAs may overlap in some model blocks but not others. A face LoRA and a style LoRA might only conflict in attention layers 4-7, while the rest of the model is touched by only one of them.
 
-| Condition | Decision |
+Instead of picking one global strategy (which either wastes TIES trimming on non-overlapping blocks or misses real conflicts), the optimizer decides **per weight prefix**:
+
+| Condition | Strategy |
 |-----------|----------|
-| Sign conflict > 25% | TIES mode (resolves conflicts) |
-| Sign conflict <= 25% | weighted_average (simple, effective) |
-| Magnitude ratio > 2x between LoRAs | `total` sign method (stronger LoRA gets more influence) |
-| Magnitude ratio <= 2x | `frequency` sign method (equal votes) |
-| TIES mode selected | Auto-density estimated from magnitude distribution |
+| Only 1 LoRA touches this prefix | `weighted_sum` — full strength, no dilution |
+| 2+ LoRAs, sign conflict <= 25% | `weighted_average` — compatible, simple merge |
+| 2+ LoRAs, sign conflict > 25% | `ties` — resolve conflicts with trim/elect/merge |
+| Magnitude ratio > 2x at prefix | `total` sign method (stronger LoRA dominates) |
+| Magnitude ratio <= 2x at prefix | `frequency` sign method (equal votes) |
 
-**Inputs:** `MODEL`, `CLIP`, `LORA_STACK`, output strength, clip strength multiplier, auto strength, free VRAM between passes.
+This means non-overlapping regions keep 100% of their LoRA's effect, while genuinely conflicting regions get proper TIES resolution. Set `optimization_mode` to `global` for a single strategy across all prefixes (original behavior).
 
-**Outputs:** `MODEL`, `CLIP`, `STRING` (analysis report)
+#### Block Strategy Map
+
+The analysis report includes a visual block-by-block map showing what strategy was used and why:
+
+```
+--- Block Strategy Map ---
+  input_blocks.0   ====  sum  1 LoRA (6x)
+  input_blocks.4   ----  avg  12% conflict (6x)
+  middle_block.1   ####  TIES 42% conflict (6x)
+  output_blocks.3  ----  avg  8% conflict (6x)
+  output_blocks.8  ====  sum  1 LoRA (6x)
+  Legend: ==== sum (single LoRA)  ---- avg (compatible)  #### TIES (conflict)
+```
+
+#### What It Analyzes
+
+- Per-LoRA metrics (rank, key count, effective L2 norms)
+- Pairwise sign conflict ratios per prefix (sampled for efficiency)
+- Magnitude distribution per prefix
+- Key overlap between LoRAs
 
 #### TIES Merging
 
-The optimizer can automatically select TIES-Merging (Trim, Elect Sign, Disjoint Merge — [Yadav et al., NeurIPS 2023](https://arxiv.org/abs/2306.01708)) when sign conflicts are detected between LoRAs.
+The optimizer automatically selects TIES-Merging (Trim, Elect Sign, Disjoint Merge — [Yadav et al., NeurIPS 2023](https://arxiv.org/abs/2306.01708)) on prefixes where sign conflicts are detected between LoRAs.
 
 <p align="center">
   <img src="assets/ties-diagram.svg" alt="TIES Merging Pipeline" width="100%">
@@ -99,6 +117,12 @@ The algorithm uses **L2-aware energy normalization**: it measures each LoRA's ac
 | `auto_strength` disabled | No adjustment (default) |
 
 Your original strength ratios are always preserved — the algorithm only scales them down uniformly.
+
+#### Inputs / Outputs
+
+**Inputs:** `MODEL`, `CLIP`, `LORA_STACK`, output strength, clip strength multiplier, auto strength, optimization mode (`per_prefix` / `global`), free VRAM between passes.
+
+**Outputs:** `MODEL`, `CLIP`, `STRING` (analysis report)
 
 #### Example Report
 
@@ -140,6 +164,23 @@ LORA OPTIMIZER - ANALYSIS REPORT
   Merge mode: ties
   Density: 0.42
   Sign method: frequency
+  (global fallback — each prefix uses its own parameters)
+
+--- Per-Prefix Strategy ---
+  weighted_sum (single LoRA):        28 prefixes (14%)
+  weighted_average (low conflict):  120 prefixes (61%)
+  ties (high conflict):              48 prefixes (24%)
+  Total:                            196 prefixes
+
+--- Block Strategy Map ---
+  input_blocks.0   ====  sum  1 LoRA (6x)
+  input_blocks.1   ====  sum  1 LoRA (6x)
+  input_blocks.4   ----  avg  12% conflict (6x)
+  input_blocks.5   ####  TIES 38% conflict (6x)
+  middle_block.1   ####  TIES 42% conflict (6x)
+  output_blocks.3  ----  avg  15% conflict (6x)
+  output_blocks.8  ====  sum  1 LoRA (6x)
+  Legend: ==== sum (single LoRA)  ---- avg (compatible)  #### TIES (conflict)
 
 --- Reasoning ---
   Sign conflict ratio 35.0% > 25% threshold -> TIES mode selected
@@ -184,6 +225,8 @@ Restart ComfyUI. Both nodes appear under the `loaders/lora` category.
 ## Credits
 
 - Originally based on [ComfyUI-ZImage-LoRA-Merger](https://github.com/DanrisiUA/ComfyUI-ZImage-LoRA-Merger) by DanrisiUA
+- Per-prefix adaptive approach inspired by [comfyUI-Realtime-Lora](https://github.com/shootthesound/comfyUI-Realtime-Lora) by shootthesound (per-block LoRA analysis)
+- Thanks to Scruffy and Ramonguthrie for suggesting the per-block analysis approach
 - TIES-Merging: [Yadav et al., NeurIPS 2023](https://arxiv.org/abs/2306.01708)
 
 ## License
