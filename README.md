@@ -183,6 +183,7 @@ Restart ComfyUI. Both nodes appear under the `loaders/lora` category.
 
 ## Credits
 
+- Originally developed as ZImage LoRA Merger
 - TIES-Merging: [Yadav et al., NeurIPS 2023](https://arxiv.org/abs/2306.01708)
 
 ## License
