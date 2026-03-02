@@ -201,6 +201,8 @@ LORA OPTIMIZER - ANALYSIS REPORT
 
 Connect the `STRING` output to a **Show Text** node to see the report in ComfyUI.
 
+> **Distillation LoRAs:** Do not put distillation LoRAs (LCM, Lightning, Turbo, Hyper) in the optimizer stack. These LoRAs rewire the model's denoising process and their weights are precisely calibrated — merging them with style LoRAs can break few-step convergence. Apply distillation LoRAs via a standard **Load LoRA** node upstream, then feed only your style/character LoRAs into the optimizer.
+
 > **Limitation:** The optimizer only analyzes LoRAs in its own stack. It cannot see LoRA patches applied by upstream nodes (Load LoRA, etc.) — those stack additively on top of the optimizer's output. Fully baked merges (safetensors checkpoints) are indistinguishable from base weights and cannot be detected.
 
 ## Installation
