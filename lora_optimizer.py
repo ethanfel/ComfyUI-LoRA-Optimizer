@@ -895,6 +895,51 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         return (new_strengths, reasoning)
 
+    @staticmethod
+    def _extract_block_name(prefix):
+        """
+        Extract a human-readable block name from a LoRA key prefix.
+        Handles common architectures: SD1.5, SDXL, Flux, Wan, etc.
+
+        Examples:
+          lora_unet_input_blocks_4_1_transformer_blocks_0_attn2_to_q -> input_blocks.4
+          lora_unet_double_blocks_12_img_attn_proj -> double_blocks.12
+          lora_unet_down_blocks_2_attentions_1_transformer_blocks_0_attn1_to_k -> down_blocks.2
+          diffusion_model.joint_blocks.5.x_block.attn.qkv -> joint_blocks.5
+          transformer.blocks.8.attn1.to_q -> blocks.8
+
+        Falls back to the first two meaningful segments if no pattern matches.
+        """
+        import re
+        # Normalize separators: lora_unet_input_blocks_4 -> input_blocks.4
+        # Strip common prefixes
+        p = prefix
+        for strip in ["lora_unet_", "lora_te_", "lora_te1_", "lora_te2_",
+                       "diffusion_model.", "transformer.", "model."]:
+            if p.startswith(strip):
+                p = p[len(strip):]
+                break
+
+        # Replace underscores with dots for pattern matching
+        p_dots = re.sub(r'_', '.', p)
+
+        # Match: word.number (e.g., input.blocks.4, double.blocks.12, down.blocks.2)
+        m = re.match(r'([a-z]+(?:\.[a-z]+)*?)\.(\d+)', p_dots)
+        if m:
+            block_type = m.group(1).replace('.', '_')
+            block_num = m.group(2)
+            return f"{block_type}.{block_num}"
+
+        # Fallback: first segment
+        parts = re.split(r'[._]', prefix)
+        meaningful = [p for p in parts if p not in ("lora", "unet", "te", "te1", "te2",
+                                                     "diffusion", "model", "transformer")]
+        if len(meaningful) >= 2:
+            return f"{meaningful[0]}.{meaningful[1]}"
+        elif meaningful:
+            return meaningful[0]
+        return prefix[:30]
+
     def _auto_select_params(self, avg_conflict_ratio, magnitude_ratio, all_key_diffs=None, magnitude_samples=None):
         """
         Decision logic for auto-selecting merge parameters.
@@ -942,7 +987,8 @@ class LoRAOptimizer(_LoRAMergeBase):
 
     def _build_report(self, lora_stats, pairwise_conflicts, collection_stats,
                       mode, density, sign_method, reasoning, merge_summary,
-                      auto_strength_info=None, strategy_counts=None, optimization_mode="global"):
+                      auto_strength_info=None, strategy_counts=None, optimization_mode="global",
+                      prefix_decisions=None):
         """Format analysis as a multi-line report string."""
         lines = []
         lines.append("=" * 50)
@@ -1017,6 +1063,53 @@ class LoRAOptimizer(_LoRAMergeBase):
                     n = strategy_counts["ties"]
                     lines.append(f"  ties (high conflict):            {n:>4} prefixes ({n/total_pf:.0%})")
                 lines.append(f"  Total:                           {total_pf:>4} prefixes")
+
+        # Block Strategy Map (per_prefix mode only)
+        if optimization_mode == "per_prefix" and prefix_decisions:
+            # Group prefixes by block name
+            block_data = {}  # block_name -> list of (mode, conflict, n_loras)
+            for prefix, pf_mode, conflict, n_loras in prefix_decisions:
+                block_name = self._extract_block_name(prefix)
+                if block_name not in block_data:
+                    block_data[block_name] = []
+                block_data[block_name].append((pf_mode, conflict, n_loras))
+
+            # Aggregate per block: dominant strategy, avg conflict, max n_loras
+            block_summary = []
+            for block_name, entries in block_data.items():
+                modes = [e[0] for e in entries]
+                conflicts = [e[1] for e in entries]
+                n_loras_max = max(e[2] for e in entries)
+                # Dominant mode = most frequent
+                mode_counts = {}
+                for m in modes:
+                    mode_counts[m] = mode_counts.get(m, 0) + 1
+                dominant = max(mode_counts, key=mode_counts.get)
+                avg_conflict = sum(conflicts) / len(conflicts) if conflicts else 0
+                n_prefixes = len(entries)
+                block_summary.append((block_name, dominant, avg_conflict, n_loras_max, n_prefixes))
+
+            # Sort by block name for consistent ordering
+            block_summary.sort(key=lambda x: x[0])
+
+            lines.append("")
+            lines.append("--- Block Strategy Map ---")
+            symbols = {"weighted_sum": "====", "weighted_average": "----", "ties": "####"}
+            labels = {"weighted_sum": "sum", "weighted_average": "avg", "ties": "TIES"}
+            # Find max block name length for alignment
+            max_name = max(len(b[0]) for b in block_summary) if block_summary else 10
+            for block_name, dominant, avg_conflict, n_loras_max, n_prefixes in block_summary:
+                sym = symbols.get(dominant, "????")
+                lbl = labels.get(dominant, dominant)
+                if dominant == "weighted_sum":
+                    detail = f"1 LoRA"
+                elif dominant == "ties":
+                    detail = f"{avg_conflict:.0%} conflict"
+                else:
+                    detail = f"{avg_conflict:.0%} conflict"
+                count_str = f"({n_prefixes}x)" if n_prefixes > 1 else ""
+                lines.append(f"  {block_name:<{max_name}}  {sym}  {lbl:<4} {detail} {count_str}")
+            lines.append(f"  Legend: ==== sum (single LoRA)  ---- avg (compatible)  #### TIES (conflict)")
 
         # Reasoning
         lines.append("")
@@ -1340,6 +1433,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         clip_patches = {}
         processed_keys = 0
         strategy_counts = {"weighted_sum": 0, "weighted_average": 0, "ties": 0}
+        prefix_decisions = []  # list of (prefix, mode, conflict_ratio, n_loras) for block map
 
         def _merge_one_prefix(lora_prefix, target_key, is_clip_key):
             """Recompute diffs for one prefix, merge, return patch or None."""
@@ -1417,8 +1511,12 @@ class LoRAOptimizer(_LoRAMergeBase):
                 return None
 
             # Determine strategy for this prefix
+            pf_conflict = 0.0
+            pf_n_loras = len(diffs_list)
             if optimization_mode == "per_prefix" and lora_prefix in prefix_stats:
                 pf = prefix_stats[lora_prefix]
+                pf_conflict = pf["conflict_ratio"]
+                pf_n_loras = pf["n_loras"]
                 if pf["n_loras"] <= 1 or len(diffs_list) <= 1:
                     # Single LoRA on this prefix: weighted_sum, full strength
                     pf_mode = "weighted_sum"
@@ -1441,19 +1539,20 @@ class LoRAOptimizer(_LoRAMergeBase):
             )
             if merged_diff is None:
                 return None
-            return (target_key, is_clip_key, merged_diff, pf_mode)
+            return (target_key, is_clip_key, merged_diff, pf_mode, lora_prefix, pf_conflict, pf_n_loras)
 
         def _collect_merge_result(result):
             nonlocal processed_keys
             if result is None:
                 return
-            target_key, is_clip_key, merged_diff, used_mode = result
+            target_key, is_clip_key, merged_diff, used_mode, prefix, conflict, n_loras = result
             if is_clip_key:
                 clip_patches[target_key] = ("diff", (merged_diff,))
             else:
                 model_patches[target_key] = ("diff", (merged_diff,))
             processed_keys += 1
             strategy_counts[used_mode] = strategy_counts.get(used_mode, 0) + 1
+            prefix_decisions.append((prefix, used_mode, conflict, n_loras))
 
         if use_gpu:
             for lora_prefix, (target_key, is_clip_key) in all_key_targets.items():
@@ -1511,7 +1610,8 @@ class LoRAOptimizer(_LoRAMergeBase):
             mode, density, sign_method, reasoning, merge_summary,
             auto_strength_info=auto_strength_info,
             strategy_counts=strategy_counts if optimization_mode == "per_prefix" else None,
-            optimization_mode=optimization_mode
+            optimization_mode=optimization_mode,
+            prefix_decisions=prefix_decisions if optimization_mode == "per_prefix" else None
         )
 
         # Cache patches for re-use (single entry to limit memory)
