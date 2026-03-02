@@ -73,7 +73,9 @@ Peak memory is ~one prefix at a time (~260MB) regardless of LoRA count or model 
 | Magnitude ratio <= 2x | `frequency` sign method (equal votes) |
 | TIES mode selected | Auto-density estimated from magnitude distribution |
 
-**Inputs:** `MODEL`, `CLIP`, `LORA_STACK`, output strength, clip strength multiplier, auto strength, free VRAM between passes.
+**Per-prefix adaptive mode** (default): Each weight prefix picks its own strategy based on local conflict data. Non-overlapping prefixes use `weighted_sum` at full strength — preserving the full effect of each LoRA where they don't compete. Only genuinely conflicting prefixes use TIES. Set `optimization_mode` to `global` for the original single-strategy behavior.
+
+**Inputs:** `MODEL`, `CLIP`, `LORA_STACK`, output strength, clip strength multiplier, auto strength, optimization mode, free VRAM between passes.
 
 **Outputs:** `MODEL`, `CLIP`, `STRING` (analysis report)
 
@@ -140,6 +142,12 @@ LORA OPTIMIZER - ANALYSIS REPORT
   Merge mode: ties
   Density: 0.42
   Sign method: frequency
+
+--- Per-Prefix Strategy ---
+  weighted_sum (single LoRA):        28 prefixes (14%)
+  weighted_average (low conflict):  120 prefixes (61%)
+  ties (high conflict):              48 prefixes (24%)
+  Total:                            196 prefixes
 
 --- Reasoning ---
   Sign conflict ratio 35.0% > 25% threshold -> TIES mode selected

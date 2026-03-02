@@ -454,7 +454,7 @@ class LoRAOptimizer(_LoRAMergeBase):
     RETURN_NAMES = ("model", "clip", "analysis_report")
     FUNCTION = "optimize_merge"
     CATEGORY = "loaders/lora"
-    DESCRIPTION = "Auto-analyzes LoRA stack and selects optimal merge strategy. Outputs merged model + analysis report."
+    DESCRIPTION = "Auto-analyzes LoRA stack and selects optimal merge strategy per weight group. Outputs merged model + analysis report."
 
     @staticmethod
     def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix"):
