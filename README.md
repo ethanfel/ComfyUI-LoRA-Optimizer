@@ -35,6 +35,8 @@ The optimizer solves this by computing full weight diffs, detecting sign conflic
 
 <p align="center"><img src="assets/merge-use-cases.png" width="720" alt="Should I merge this LoRA? Decision guide"></p>
 
+---
+
 ## Nodes
 
 ### LoRA Stack
