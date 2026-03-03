@@ -492,9 +492,9 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "default": "enabled",
                     "tooltip": "Cache merged patches in RAM for faster re-execution. Disable to free RAM after merge (recommended for video models)."
                 }),
-                "compress_patches": (["disabled", "auto", "64", "128", "256"], {
+                "compress_patches": (["disabled", "auto", "64", "128", "256", "512", "1024"], {
                     "default": "disabled",
-                    "tooltip": "Re-compress full-rank merged patches to low-rank via SVD. 'auto' uses max input LoRA rank. Dramatically reduces RAM (~32-64x) with slight quality loss. Recommended for video models."
+                    "tooltip": "Re-compress full-rank merged patches to low-rank via SVD. 'auto' uses sum of input LoRA ranks (preserves full merge information). Lower ranks save more RAM but reduce quality. Recommended for video models."
                 }),
             }
         }
@@ -1479,10 +1479,12 @@ class LoRAOptimizer(_LoRAMergeBase):
         # Resolve compress_patches rank
         compress_rank = 0  # 0 = disabled
         if compress_patches == "auto":
-            # Use max input LoRA rank
-            max_rank = max((int(stat["avg_rank"]) for stat in lora_stats if stat["avg_rank"] > 0), default=64)
-            compress_rank = max_rank
-            logging.info(f"[LoRA Optimizer] Patch compression: auto (rank {compress_rank} from max input LoRA rank)")
+            # Sum of input LoRA ranks — merging N rank-R LoRAs produces
+            # effective rank up to N*R, so we need the full sum to preserve
+            # all merge information without quality loss.
+            sum_rank = sum(int(stat["avg_rank"]) for stat in lora_stats if stat["avg_rank"] > 0)
+            compress_rank = max(sum_rank, 64)  # floor at 64
+            logging.info(f"[LoRA Optimizer] Patch compression: auto (rank {compress_rank} from sum of input LoRA ranks)")
         elif compress_patches != "disabled":
             compress_rank = int(compress_patches)
             logging.info(f"[LoRA Optimizer] Patch compression: rank {compress_rank}")
