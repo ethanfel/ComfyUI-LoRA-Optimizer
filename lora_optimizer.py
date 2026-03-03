@@ -351,11 +351,17 @@ class _LoRAMergeBase:
                 new_k = new_k.replace('lycoris_blocks_', 'blocks.')
                 # Add dot separator after block number
                 new_k = re.sub(r'^blocks\.(\d+)_', r'blocks.\1.', new_k)
-                new_k = new_k.replace('_cross_attn_', '.cross_attn.')
-                new_k = new_k.replace('_self_attn_', '.self_attn.')
-                new_k = new_k.replace('_ffn_net_0_proj', '.ffn.0')
-                new_k = new_k.replace('_ffn_net_2', '.ffn.2')
+                # Use regex to match both underscore and dot as leading separator
+                # (dot comes from the block number fix above)
+                new_k = re.sub(r'[._]cross_attn[._]', '.cross_attn.', new_k)
+                new_k = re.sub(r'[._]self_attn[._]', '.self_attn.', new_k)
+                new_k = re.sub(r'[._]ffn_net_0_proj', '.ffn.0', new_k)
+                new_k = re.sub(r'[._]ffn_net_2', '.ffn.2', new_k)
                 new_k = new_k.replace('to_out_0', 'o')
+
+            # Strip PEFT prefix first so subsequent checks work
+            if new_k.startswith('base_model.model.'):
+                new_k = new_k[len('base_model.model.'):]
 
             # Diffusers format prefixes
             if new_k.startswith('transformer.'):
@@ -370,7 +376,6 @@ class _LoRAMergeBase:
             # Common diffusers cleanup
             new_k = new_k.replace('.default.', '.')
             new_k = new_k.replace('.diff_m', '.modulation.diff')
-            new_k = new_k.replace('base_model.model.', 'diffusion_model.')
 
             # Fun LoRA format: lora_unet__blocks_N_...
             if new_k.startswith('lora_unet__'):
@@ -404,6 +409,10 @@ class _LoRAMergeBase:
                                 component += '_img'
                                 idx += 1
                             rebuilt += f'.{component}'
+                        # Append any remaining components with dot separators
+                        while idx < len(components):
+                            rebuilt += f'.{components[idx]}'
+                            idx += 1
 
                     if weight_type:
                         if weight_type == 'alpha':
@@ -470,6 +479,10 @@ class _LoRAMergeBase:
         for k, v in lora_sd.items():
             new_k = k
 
+            # Strip PEFT prefix first so subsequent checks work
+            if new_k.startswith('base_model.model.'):
+                new_k = new_k[len('base_model.model.'):]
+
             # Diffusers format: text_encoder.* -> lora_te1_*, text_encoder_2.* -> lora_te2_*
             if new_k.startswith('text_encoder_2.'):
                 new_k = 'lora_te2_' + new_k[len('text_encoder_2.'):].replace('.', '_')
@@ -479,9 +492,6 @@ class _LoRAMergeBase:
             # Diffusers UNet: unet.* -> lora_unet_*
             if new_k.startswith('unet.'):
                 new_k = 'lora_unet_' + new_k[len('unet.'):].replace('.', '_')
-
-            # base_model.model -> strip prefix
-            new_k = new_k.replace('base_model.model.', '')
 
             normalized[new_k] = v
         return normalized
@@ -498,6 +508,10 @@ class _LoRAMergeBase:
         normalized = {}
         for k, v in lora_sd.items():
             new_k = k
+
+            # Strip PEFT prefix first so subsequent checks work
+            if new_k.startswith('base_model.model.'):
+                new_k = new_k[len('base_model.model.'):]
 
             # Kohya format: lora_unet_transformer_blocks_N_... -> diffusion_model.transformer_blocks.N...
             if new_k.startswith('lora_unet_'):
@@ -516,9 +530,6 @@ class _LoRAMergeBase:
             if new_k.startswith('transformer_blocks.'):
                 new_k = 'diffusion_model.' + new_k
 
-            # base_model.model prefix
-            new_k = new_k.replace('base_model.model.', 'diffusion_model.')
-
             normalized[new_k] = v
         return normalized
 
@@ -535,6 +546,10 @@ class _LoRAMergeBase:
         normalized = {}
         for k, v in lora_sd.items():
             new_k = k
+
+            # Strip PEFT prefix first so subsequent checks work
+            if new_k.startswith('base_model.model.'):
+                new_k = new_k[len('base_model.model.'):]
 
             # LyCORIS format: lycoris_transformer_blocks_N_... -> diffusion_model.transformer_blocks.N...
             if new_k.startswith('lycoris_'):
@@ -555,9 +570,6 @@ class _LoRAMergeBase:
             # Ensure diffusion_model. prefix
             if new_k.startswith('transformer_blocks.'):
                 new_k = 'diffusion_model.' + new_k
-
-            # base_model.model prefix
-            new_k = new_k.replace('base_model.model.', 'diffusion_model.')
 
             normalized[new_k] = v
         return normalized
