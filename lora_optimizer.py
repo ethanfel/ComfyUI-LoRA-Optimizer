@@ -1698,12 +1698,26 @@ class LoRAOptimizer(_LoRAMergeBase):
     def _build_report(self, lora_stats, pairwise_conflicts, collection_stats,
                       mode, density, sign_method, reasoning, merge_summary,
                       auto_strength_info=None, strategy_counts=None, optimization_mode="global",
-                      prefix_decisions=None):
+                      prefix_decisions=None, detected_arch=None, normalize_keys="disabled"):
         """Format analysis as a multi-line report string."""
         lines = []
         lines.append("=" * 50)
         lines.append("LORA OPTIMIZER - ANALYSIS REPORT")
         lines.append("=" * 50)
+
+        # Architecture info (when normalization is enabled)
+        if normalize_keys == "enabled" and detected_arch:
+            arch_names = {
+                'zimage': 'Z-Image Turbo (Lumina2)',
+                'flux': 'FLUX',
+                'wan': 'Wan 2.1/2.2',
+                'sdxl': 'SDXL',
+                'ltx': 'LTX Video',
+                'qwen_image': 'Qwen-Image',
+            }
+            lines.append(f"Architecture: {arch_names.get(detected_arch, detected_arch)} (auto-detected)")
+            lines.append(f"Key normalization: enabled")
+            lines.append("")
 
         # Per-LoRA Analysis
         lines.append("")
@@ -2424,7 +2438,9 @@ class LoRAOptimizer(_LoRAMergeBase):
             auto_strength_info=auto_strength_info,
             strategy_counts=strategy_counts if optimization_mode == "per_prefix" else None,
             optimization_mode=optimization_mode,
-            prefix_decisions=prefix_decisions if optimization_mode == "per_prefix" else None
+            prefix_decisions=prefix_decisions if optimization_mode == "per_prefix" else None,
+            detected_arch=getattr(self, '_detected_arch', None),
+            normalize_keys=normalize_keys,
         )
 
         # Cache patches for re-use (single entry to limit memory)
