@@ -1413,7 +1413,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 }),
                 "optimization_mode": (["per_prefix", "global", "weighted_sum_only"], {
                     "default": "per_prefix",
-                    "tooltip": "How the optimizer decides to combine LoRAs. 'per_prefix' (recommended): automatically picks the best method for each layer. 'global': uses one method everywhere. 'weighted_sum_only': simple addition, fastest and most compatible but may give worse results with conflicting LoRAs."
+                    "tooltip": "How the optimizer decides to combine LoRAs. 'per_prefix' (recommended): automatically picks the best method for each layer. 'global': uses one method everywhere. 'weighted_sum_only': simple addition, no TIES trimming — use this if your stack includes edit, distillation, or DPO LoRAs whose weights must be preserved exactly."
                 }),
                 "cache_patches": (["enabled", "disabled"], {
                     "default": "enabled",
@@ -1451,7 +1451,7 @@ class LoRAOptimizer(_LoRAMergeBase):
     RETURN_NAMES = ("model", "clip", "analysis_report", "lora_data")
     FUNCTION = "optimize_merge"
     CATEGORY = "loaders/lora"
-    DESCRIPTION = "Auto-analyzes LoRA stack and selects optimal merge strategy per weight group. Outputs merged model + analysis report."
+    DESCRIPTION = "Auto-analyzes LoRA stack and selects optimal merge strategy per weight group. Outputs merged model + analysis report. Best for style/character LoRAs — apply edit, distillation (LCM/Turbo/Hyper), or DPO LoRAs via a standard Load LoRA node instead."
 
     @staticmethod
     def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7):

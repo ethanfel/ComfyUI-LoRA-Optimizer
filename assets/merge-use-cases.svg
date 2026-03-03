@@ -1,0 +1,166 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 680">
+  <defs>
+    <linearGradient id="ucbg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f172a"/>
+      <stop offset="100%" style="stop-color:#1e1b4b"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#475569" stroke-width="1"/>
+    </marker>
+    <marker id="arrG" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#22c55e" stroke-width="1"/>
+    </marker>
+    <marker id="arrR" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#e94560" stroke-width="1"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="680" rx="12" fill="url(#ucbg)"/>
+
+  <!-- Title -->
+  <text x="450" y="30" font-family="Segoe UI, Arial, sans-serif" font-size="15" fill="#64ffda" text-anchor="middle" font-weight="700" letter-spacing="2">SHOULD I MERGE THIS LORA?</text>
+
+  <!-- ===== DECISION FLOWCHART (top) ===== -->
+
+  <!-- Start node -->
+  <rect x="370" y="48" width="160" height="32" rx="16" fill="#334155" stroke="#64ffda" stroke-width="1.5"/>
+  <text x="450" y="69" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#e2e8f0" text-anchor="middle" font-weight="600">Your LoRA</text>
+
+  <!-- Arrow down -->
+  <line x1="450" y1="80" x2="450" y2="100" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Decision 1: Edit or Structural? -->
+  <polygon points="450,104 570,140 450,176 330,140" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="450" y="136" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f59e0b" text-anchor="middle" font-weight="600">Edit or structural?</text>
+  <text x="450" y="149" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#64748b" text-anchor="middle">LCM, DPO, Qwen edit...</text>
+
+  <!-- YES branch (left) → Load LoRA -->
+  <line x1="330" y1="140" x2="230" y2="140" stroke="#e94560" stroke-width="1.5" marker-end="url(#arrR)"/>
+  <text x="280" y="133" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#e94560" font-weight="600">YES</text>
+  <rect x="100" y="124" width="122" height="32" rx="8" fill="#e94560" opacity="0.15" stroke="#e94560" stroke-width="1"/>
+  <text x="161" y="144" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e94560" text-anchor="middle" font-weight="600">Load LoRA node</text>
+
+  <!-- NO branch (right) → next decision -->
+  <line x1="570" y1="140" x2="630" y2="140" stroke="#475569" stroke-width="1.5"/>
+  <text x="600" y="133" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" font-weight="600">NO</text>
+  <line x1="630" y1="140" x2="630" y2="170" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Decision 2: Same concept as others? -->
+  <polygon points="630,174 750,210 630,246 510,210" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="630" y="206" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f59e0b" text-anchor="middle" font-weight="600">Same concept as</text>
+  <text x="630" y="219" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f59e0b" text-anchor="middle" font-weight="600">others in stack?</text>
+
+  <!-- YES branch (left) → Pick best -->
+  <line x1="510" y1="210" x2="410" y2="210" stroke="#e94560" stroke-width="1.5" marker-end="url(#arrR)"/>
+  <text x="460" y="203" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#e94560" font-weight="600">YES</text>
+  <rect x="255" y="194" width="147" height="32" rx="8" fill="#e94560" opacity="0.15" stroke="#e94560" stroke-width="1"/>
+  <text x="328" y="214" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e94560" text-anchor="middle" font-weight="600">Pick the best one</text>
+
+  <!-- NO branch (down) → Merge! -->
+  <line x1="630" y1="246" x2="630" y2="266" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrG)"/>
+  <text x="645" y="260" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#22c55e" font-weight="600">NO</text>
+
+  <!-- Merge result -->
+  <rect x="555" y="270" width="150" height="36" rx="10" fill="#22c55e" opacity="0.15" stroke="#22c55e" stroke-width="2"/>
+  <text x="630" y="293" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#22c55e" text-anchor="middle" font-weight="700">Optimizer Stack</text>
+
+  <!-- ===== DIVIDER ===== -->
+  <line x1="60" y1="330" x2="840" y2="330" stroke="#334155" stroke-width="1" stroke-dasharray="4,4"/>
+
+  <!-- ===== TWO-COLUMN COMPARISON (bottom) ===== -->
+
+  <!-- LEFT: WORKS WELL -->
+  <rect x="30" y="345" width="410" height="32" rx="8" fill="#22c55e" opacity="0.12"/>
+  <text x="50" y="366" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#22c55e" font-weight="700">IDEAL MERGE — COMPLEMENTARY LORAS</text>
+
+  <!-- Card: visual showing 3 different LoRAs combining -->
+  <rect x="30" y="385" width="410" height="170" rx="10" fill="#1e293b" stroke="#22c55e" stroke-width="1"/>
+
+  <!-- Style LoRA -->
+  <circle cx="95" cy="440" r="32" fill="#f87171" opacity="0.12" stroke="#f87171" stroke-width="1.5"/>
+  <text x="95" y="435" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f87171" text-anchor="middle" font-weight="600">Style</text>
+  <text x="95" y="448" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#f87171" text-anchor="middle" opacity="0.7">color, texture</text>
+
+  <!-- Character LoRA -->
+  <circle cx="195" cy="440" r="32" fill="#c084fc" opacity="0.12" stroke="#c084fc" stroke-width="1.5"/>
+  <text x="195" y="435" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#c084fc" text-anchor="middle" font-weight="600">Character</text>
+  <text x="195" y="448" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#c084fc" text-anchor="middle" opacity="0.7">face, identity</text>
+
+  <!-- Concept LoRA -->
+  <circle cx="295" cy="440" r="32" fill="#38bdf8" opacity="0.12" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="295" y="435" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#38bdf8" text-anchor="middle" font-weight="600">Concept</text>
+  <text x="295" y="448" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#38bdf8" text-anchor="middle" opacity="0.7">pose, scene</text>
+
+  <!-- Arrow to merged -->
+  <line x1="335" y1="440" x2="358" y2="440" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Merged result circle -->
+  <circle cx="400" cy="440" r="30" fill="none" stroke="#22c55e" stroke-width="2"/>
+  <circle cx="389" cy="432" r="9" fill="#f87171" opacity="0.25"/>
+  <circle cx="400" cy="432" r="9" fill="#c084fc" opacity="0.25"/>
+  <circle cx="411" cy="432" r="9" fill="#38bdf8" opacity="0.25"/>
+  <text x="400" y="456" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#22c55e" text-anchor="middle" font-weight="600">All preserved</text>
+
+  <!-- Explanation bullets -->
+  <text x="50" y="495" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Each LoRA modifies different weight regions — minimal conflict</text>
+  <text x="50" y="512" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">TIES resolves rare overlaps without destroying unique features</text>
+  <text x="50" y="529" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Result combines all capabilities in a single efficient pass</text>
+  <rect x="42" y="486" width="4" height="4" rx="2" fill="#22c55e"/>
+  <rect x="42" y="503" width="4" height="4" rx="2" fill="#22c55e"/>
+  <rect x="42" y="520" width="4" height="4" rx="2" fill="#22c55e"/>
+
+  <!-- RIGHT: AVOID -->
+  <rect x="460" y="345" width="410" height="32" rx="8" fill="#e94560" opacity="0.12"/>
+  <text x="480" y="366" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#e94560" font-weight="700">AVOID MERGING</text>
+
+  <!-- Card A: Same concept -->
+  <rect x="460" y="385" width="410" height="92" rx="10" fill="#1e293b" stroke="#e94560" stroke-width="1"/>
+  <text x="480" y="407" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e2e8f0" font-weight="600">Same concept from different trainers</text>
+
+  <!-- Visual: 3 similar arrows → blurred result -->
+  <rect x="480" y="418" width="50" height="6" rx="3" fill="#f87171" opacity="0.8"/>
+  <rect x="480" y="428" width="50" height="6" rx="3" fill="#f87171" opacity="0.55"/>
+  <rect x="480" y="438" width="50" height="6" rx="3" fill="#f87171" opacity="0.35"/>
+  <text x="545" y="435" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64748b">→</text>
+  <rect x="560" y="425" width="50" height="12" rx="6" fill="#f87171" opacity="0.15" stroke="#f87171" stroke-width="0.5" stroke-dasharray="2,2"/>
+  <text x="585" y="434" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#e94560" text-anchor="middle">blurred</text>
+  <text x="625" y="434" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">Averages out — dilutes the best one</text>
+  <text x="480" y="466" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64748b">Tip: pick the best LoRA and use it at full strength instead</text>
+
+  <!-- Card B: Edit / Structural -->
+  <rect x="460" y="485" width="410" height="92" rx="10" fill="#1e293b" stroke="#e94560" stroke-width="1"/>
+  <text x="480" y="507" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e2e8f0" font-weight="600">Edit &amp; structural LoRAs</text>
+  <text x="480" y="521" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64748b">Qwen edit, Klein edit, LCM, Lightning, DPO</text>
+
+  <!-- Visual: precise bars → damaged bars -->
+  <rect x="480" y="533" width="5" height="16" rx="1" fill="#38bdf8" opacity="0.8"/>
+  <rect x="489" y="537" width="5" height="12" rx="1" fill="#38bdf8" opacity="0.8"/>
+  <rect x="498" y="535" width="5" height="14" rx="1" fill="#38bdf8" opacity="0.8"/>
+  <rect x="507" y="539" width="5" height="10" rx="1" fill="#38bdf8" opacity="0.8"/>
+  <rect x="516" y="536" width="5" height="13" rx="1" fill="#38bdf8" opacity="0.8"/>
+  <rect x="525" y="534" width="5" height="15" rx="1" fill="#38bdf8" opacity="0.8"/>
+  <text x="507" y="560" font-family="Segoe UI, Arial, sans-serif" font-size="7" fill="#38bdf8" text-anchor="middle">calibrated</text>
+
+  <text x="540" y="545" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64748b">→</text>
+
+  <rect x="555" y="533" width="5" height="16" rx="1" fill="#e94560" opacity="0.5"/>
+  <rect x="564" y="537" width="5" height="0" rx="1" fill="#e94560" opacity="0.2"/>
+  <rect x="573" y="538" width="5" height="11" rx="1" fill="#e94560" opacity="0.5"/>
+  <rect x="582" y="539" width="5" height="0" rx="1" fill="#e94560" opacity="0.2"/>
+  <rect x="591" y="536" width="5" height="13" rx="1" fill="#e94560" opacity="0.5"/>
+  <rect x="600" y="534" width="5" height="0" rx="1" fill="#e94560" opacity="0.2"/>
+  <text x="580" y="560" font-family="Segoe UI, Arial, sans-serif" font-size="7" fill="#e94560" text-anchor="middle">trimmed</text>
+
+  <text x="620" y="545" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">TIES trims 50% of weights</text>
+  <text x="480" y="567" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64748b">Tip: apply via Load LoRA upstream, or use weighted_sum_only</text>
+
+  <!-- Card C: Bad LoRA negative -->
+  <rect x="460" y="585" width="410" height="62" rx="10" fill="#1e293b" stroke="#f59e0b" stroke-width="1"/>
+  <text x="480" y="607" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e2e8f0" font-weight="600">Bad LoRA at negative strength</text>
+  <text x="480" y="623" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">Subtracting noise removes good signal along with bad — unpredictable</text>
+  <text x="480" y="637" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64748b">Tip: just remove it from the stack entirely</text>
+
+  <!-- Bottom summary -->
+  <text x="450" y="670" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64748b" text-anchor="middle">Merge LoRAs that do different things — apply everything else via a standard Load LoRA node</text>
+</svg>
