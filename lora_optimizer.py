@@ -129,6 +129,8 @@ class _LoRAMergeBase:
         has_img_mlp = any('img_mlp' in k for k in keys)
         if not has_img_mlp and any(
                 'transformer_blocks' in k and ('attn1' in k or 'attn2' in k)
+                and 'input_blocks' not in k and 'output_blocks' not in k
+                and 'down_blocks' not in k and 'up_blocks' not in k
                 for k in keys):
             return 'ltx'
 
@@ -460,16 +462,23 @@ class _LoRAMergeBase:
 
             normalized[new_k] = v
 
-        # RS-LoRA compensation: detect and fix alpha scaling
-        rs_marker = 'diffusion_model.blocks.0.cross_attn.k.lora_A.weight'
-        if rs_marker in normalized:
-            rank = normalized[rs_marker].shape[0]
+        # RS-LoRA compensation: detect and fix alpha scaling.
+        # RS-LoRA files omit ALL alpha keys and rely on sqrt(rank) scaling.
+        # Only apply compensation if the file has zero alpha keys (reliable
+        # heuristic — standard LoRAs either include explicit alphas or use
+        # rank as default alpha, which _get_lora_key_info handles).
+        has_any_alpha = any(nk.endswith('.alpha') for nk in normalized)
+        has_any_lora = any(nk.endswith('.lora_A.weight') for nk in normalized)
+        if not has_any_alpha and has_any_lora:
+            # Find rank from any lora_A weight
+            sample_key = next(nk for nk in normalized if nk.endswith('.lora_A.weight'))
+            rank = normalized[sample_key].shape[0]
+            # alpha/rank = rank^1.5/rank = sqrt(rank), matching RS-LoRA scaling
             corrected_alpha = torch.tensor(rank * (rank ** 0.5))
             for nk in list(normalized.keys()):
                 if nk.endswith('.lora_A.weight'):
                     alpha_key = nk.replace('.lora_A.weight', '.alpha')
-                    if alpha_key not in normalized:
-                        normalized[alpha_key] = corrected_alpha
+                    normalized[alpha_key] = corrected_alpha
 
         return normalized
 
