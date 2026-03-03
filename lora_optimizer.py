@@ -364,6 +364,11 @@ class _LoRAMergeBase:
             del d1
             v2 = d2.to(device=dev, dtype=torch.float32).flatten()
             del d2
+            # Negative weights negate the diff direction (same as TIES/weighted_avg)
+            if w1 < 0:
+                v1 = -v1
+            if w2 < 0:
+                v2 = -v2
 
             # t = interpolation factor from weights (0 = all v1, 1 = all v2)
             total_w = abs(w1) + abs(w2)
