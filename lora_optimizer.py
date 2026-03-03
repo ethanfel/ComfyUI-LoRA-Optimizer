@@ -248,6 +248,34 @@ class _LoRAMergeBase:
         contributor_count.clamp_(min=1.0)
         return result.div_(contributor_count)
 
+    @staticmethod
+    @torch.no_grad()
+    def _compress_to_lowrank(diff, rank):
+        """
+        Re-compress a full-rank diff tensor to low-rank via truncated SVD.
+        Returns ("lora", (mat_up, mat_down, 1.0, None)) patch — alpha=1.0
+        because the scaling is already baked into the singular values.
+
+        For a [4096, 4096] diff at rank 128: 64MB → 2MB (~32x reduction).
+        """
+        original_shape = diff.shape
+        # Reshape to 2D for SVD: [out_features, in_features]
+        mat = diff.reshape(original_shape[0], -1).float()
+        rank = min(rank, min(mat.shape))
+
+        # Truncated SVD on CPU (more stable than GPU for large matrices)
+        device = mat.device
+        if device.type != "cpu":
+            mat = mat.cpu()
+        U, S, V = torch.svd_lowrank(mat, q=rank)
+        # U: [out, rank], S: [rank], V: [in, rank]
+        # Reconstruct as: mat_up = U * sqrt(S), mat_down = sqrt(S) * V^T
+        sqrt_S = S.sqrt()
+        mat_up = (U * sqrt_S.unsqueeze(0))    # [out, rank]
+        mat_down = (V * sqrt_S.unsqueeze(0)).T  # [rank, in]
+        # alpha=rank so ComfyUI computes: up @ down * (rank/rank) = up @ down
+        return ("lora", (mat_up, mat_down, float(rank), None))
+
     @torch.no_grad()
     def _merge_diffs(self, diffs_with_weights, mode, density=0.5, majority_sign_method="frequency",
                      compute_device=None):
@@ -464,6 +492,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "default": "enabled",
                     "tooltip": "Cache merged patches in RAM for faster re-execution. Disable to free RAM after merge (recommended for video models)."
                 }),
+                "compress_patches": (["disabled", "auto", "64", "128", "256"], {
+                    "default": "disabled",
+                    "tooltip": "Re-compress full-rank merged patches to low-rank via SVD. 'auto' uses max input LoRA rank. Dramatically reduces RAM (~32-64x) with slight quality loss. Recommended for video models."
+                }),
             }
         }
 
@@ -474,7 +506,7 @@ class LoRAOptimizer(_LoRAMergeBase):
     DESCRIPTION = "Auto-analyzes LoRA stack and selects optimal merge strategy per weight group. Outputs merged model + analysis report."
 
     @staticmethod
-    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix"):
+    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix", compress_patches="disabled"):
         """
         Build a deterministic SHA-256 hash (16 hex chars) from the stack
         configuration. Used by IS_CHANGED to let ComfyUI skip re-execution
@@ -492,17 +524,17 @@ class LoRAOptimizer(_LoRAMergeBase):
                     entries.append((str(item.get("name", "")), float(item.get("strength", 0))))
             entries.sort()
             h.update(json.dumps(entries).encode())
-        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}".encode())
+        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}|cp={compress_patches}".encode())
         return h.hexdigest()[:16]
 
     @classmethod
     def IS_CHANGED(cls, model, lora_stack, output_strength, clip=None,
                    clip_strength_multiplier=1.0, auto_strength="disabled",
                    free_vram_between_passes="disabled", optimization_mode="per_prefix",
-                   cache_patches="enabled"):
+                   cache_patches="enabled", compress_patches="disabled"):
         return cls._compute_cache_key(lora_stack, output_strength,
                                       clip_strength_multiplier, auto_strength,
-                                      optimization_mode)
+                                      optimization_mode, compress_patches)
 
     def _save_report_to_disk(self, cache_key, lora_combo, auto_strength, report, selected_params):
         """
@@ -1154,7 +1186,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         lines.append("=" * 50)
         return "\n".join(lines)
 
-    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", free_vram_between_passes="disabled", optimization_mode="per_prefix", cache_patches="enabled"):
+    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", free_vram_between_passes="disabled", optimization_mode="per_prefix", cache_patches="enabled", compress_patches="disabled"):
         """
         Main entry point. Two-pass streaming architecture:
         Pass 1: Compute diffs per-prefix, sample conflicts + magnitudes, discard diffs
@@ -1204,7 +1236,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         # triggered by downstream seed changes or similar non-LoRA changes)
         cache_key = self._compute_cache_key(lora_stack, output_strength,
                                             clip_strength_multiplier, auto_strength,
-                                            optimization_mode)
+                                            optimization_mode, compress_patches)
         if cache_patches == "enabled" and cache_key in self._merge_cache:
             model_patches, clip_patches, report, clip_strength_out = self._merge_cache[cache_key]
             new_model = model
@@ -1444,6 +1476,17 @@ class LoRAOptimizer(_LoRAMergeBase):
         if free_vram_between_passes == "enabled" and use_gpu:
             torch.cuda.empty_cache()
 
+        # Resolve compress_patches rank
+        compress_rank = 0  # 0 = disabled
+        if compress_patches == "auto":
+            # Use max input LoRA rank
+            max_rank = max((int(stat["avg_rank"]) for stat in lora_stats if stat["avg_rank"] > 0), default=64)
+            compress_rank = max_rank
+            logging.info(f"[LoRA Optimizer] Patch compression: auto (rank {compress_rank} from max input LoRA rank)")
+        elif compress_patches != "disabled":
+            compress_rank = int(compress_patches)
+            logging.info(f"[LoRA Optimizer] Patch compression: rank {compress_rank}")
+
         # =====================================================================
         # Pass 2 — Merge (recompute diffs per-prefix, merge, discard)
         # =====================================================================
@@ -1454,6 +1497,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         model_patches = {}
         clip_patches = {}
         processed_keys = 0
+        compressed_count = 0
         strategy_counts = {"weighted_sum": 0, "weighted_average": 0, "ties": 0}
         prefix_decisions = []  # list of (prefix, mode, conflict_ratio, n_loras) for block map
 
@@ -1517,7 +1561,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     # Bake eff_strength into alpha so ComfyUI applies it correctly
                     alpha_scaled = alpha * eff_strength
                     patch = ("lora", (mat_up, mat_down, alpha_scaled, mid))
-                    return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1))
+                    return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), False)
                 return None
 
             # FULL-RANK PATH: compute diffs on GPU, merge
@@ -1586,16 +1630,23 @@ class LoRAOptimizer(_LoRAMergeBase):
             diffs_list.clear()  # Free input diffs from GPU
             if merged_diff is None:
                 return None
-            patch = ("diff", (merged_diff,))
-            return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, len(diffs_list)))
+            # Compress full-rank diff to low-rank via SVD if requested
+            if compress_rank > 0:
+                patch = self._compress_to_lowrank(merged_diff, compress_rank)
+                del merged_diff
+                is_compressed = True
+            else:
+                patch = ("diff", (merged_diff,))
+                is_compressed = False
+            return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), is_compressed)
 
         lowrank_count = 0
 
         def _collect_merge_result(result):
-            nonlocal processed_keys, lowrank_count
+            nonlocal processed_keys, lowrank_count, compressed_count
             if result is None:
                 return
-            target_key, is_clip_key, patch, used_mode, prefix, conflict, n_loras = result
+            target_key, is_clip_key, patch, used_mode, prefix, conflict, n_loras, is_compressed = result
             if is_clip_key:
                 clip_patches[target_key] = patch
             else:
@@ -1603,6 +1654,8 @@ class LoRAOptimizer(_LoRAMergeBase):
             processed_keys += 1
             if patch[0] == "lora":
                 lowrank_count += 1
+            if is_compressed:
+                compressed_count += 1
             strategy_counts[used_mode] = strategy_counts.get(used_mode, 0) + 1
             prefix_decisions.append((prefix, used_mode, conflict, n_loras))
 
@@ -1631,6 +1684,11 @@ class LoRAOptimizer(_LoRAMergeBase):
                          f"{strategy_counts.get('weighted_sum', 0)} weighted_sum, "
                          f"{strategy_counts.get('weighted_average', 0)} weighted_average, "
                          f"{strategy_counts.get('ties', 0)} ties")
+        if compressed_count > 0:
+            passthrough_count = lowrank_count - compressed_count
+            logging.info(f"[LoRA Optimizer]   SVD-compressed: {compressed_count} patches "
+                         f"(rank {compress_rank}), passthrough: {passthrough_count}, "
+                         f"full-rank: {fullrank_count}")
 
         # Free analysis data no longer needed
         prefix_stats.clear()
