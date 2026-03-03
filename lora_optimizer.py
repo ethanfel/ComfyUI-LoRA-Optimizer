@@ -124,9 +124,10 @@ class _LoRAMergeBase:
         # LTX Video: transformer_blocks with attn1/attn2 and adaln_single
         if any('adaln_single' in k for k in keys):
             return 'ltx'
-        if any('transformer_blocks' in k and ('attn1' in k or 'attn2' in k)
-               and not any('transformer_blocks' in k2 and 'img_mlp' in k2 for k2 in keys)
-               for k in keys):
+        has_img_mlp = any('img_mlp' in k for k in keys)
+        if not has_img_mlp and any(
+                'transformer_blocks' in k and ('attn1' in k or 'attn2' in k)
+                for k in keys):
             return 'ltx'
 
         # Qwen-Image: transformer_blocks with img_mlp/txt_mlp/img_mod/txt_mod
@@ -189,12 +190,13 @@ class _LoRAMergeBase:
 
         for base, layer_idx in layers_seen:
             # --- Split fused QKV ---
+            # In fused QKV LoRAs: lora_down/A is [rank, in_features] (shared),
+            # lora_up/B is [3*out_features, rank] (fused). Only the up/B
+            # matrix needs splitting; the down/A matrix is copied to all three.
             for lora_fmt in [('.lora_A.weight', '.lora_B.weight'),
-                             ('.lora_up.weight', '.lora_down.weight'),
-                             ('.lora_B.weight', '.lora_A.weight'),
-                             ('.lora.up.weight', '.lora.down.weight')]:
-                # Try each LoRA format for the fused QKV key
-                down_suffix, up_suffix = lora_fmt[0], lora_fmt[1]
+                             ('.lora_down.weight', '.lora_up.weight'),
+                             ('.lora.down.weight', '.lora.up.weight')]:
+                down_suffix, up_suffix = lora_fmt
                 qkv_down_key = f"{base}.qkv{down_suffix}"
                 qkv_up_key = f"{base}.qkv{up_suffix}"
 
@@ -202,24 +204,17 @@ class _LoRAMergeBase:
                     qkv_down = prefix_fixed[qkv_down_key]
                     qkv_up = prefix_fixed[qkv_up_key]
 
-                    # Split down matrix (rank*3 -> 3 x rank)
-                    rank_down = qkv_down.shape[0]
-                    if rank_down % 3 == 0:
-                        q_down, k_down, v_down = torch.chunk(qkv_down, 3, dim=0)
-                    else:
-                        break
-
-                    # Split up matrix (out_features*3 -> 3 x out_features)
+                    # Only the up/B matrix is fused [3*out, rank] — split it
                     out_dim = qkv_up.shape[0]
-                    if out_dim % 3 == 0:
-                        q_up, k_up, v_up = torch.chunk(qkv_up, 3, dim=0)
-                    else:
-                        break
+                    if out_dim % 3 != 0:
+                        continue  # Not valid fused QKV, try next format
+                    q_up, k_up, v_up = torch.chunk(qkv_up, 3, dim=0)
 
-                    for comp, comp_down, comp_up in [('to_q', q_down, q_up),
-                                                      ('to_k', k_down, k_up),
-                                                      ('to_v', v_down, v_up)]:
-                        normalized[f"{base}.{comp}{down_suffix}"] = comp_down
+                    # Down/A is shared [rank, in] — copy to all three
+                    for comp, comp_up in [('to_q', q_up),
+                                          ('to_k', k_up),
+                                          ('to_v', v_up)]:
+                        normalized[f"{base}.{comp}{down_suffix}"] = qkv_down
                         normalized[f"{base}.{comp}{up_suffix}"] = comp_up
 
                     # Copy alpha (same for all three components)
@@ -260,8 +255,32 @@ class _LoRAMergeBase:
 
         return normalized
 
-    @staticmethod
-    def _normalize_keys_flux(lora_sd):
+    # Compound component names in FLUX models where underscores must be preserved
+    _FLUX_COMPOUND_NAMES = sorted([
+        'img_attn', 'txt_attn', 'img_mlp', 'txt_mlp',
+        'img_mod', 'txt_mod', 'img_norm1', 'img_norm2',
+        'txt_norm1', 'txt_norm2', 'query_norm', 'key_norm',
+        'lora_up', 'lora_down', 'lora_A', 'lora_B',
+        'lora_mid', 'redux_up', 'redux_down',
+    ], key=len, reverse=True)  # longest first to avoid partial matches
+
+    @classmethod
+    def _flux_kohya_underscore_to_dot(cls, rest):
+        """Convert Kohya underscore-separated key to dot-separated,
+        preserving compound component names like img_attn, lora_up."""
+        protected = []
+        for i, name in enumerate(cls._FLUX_COMPOUND_NAMES):
+            placeholder = f'\x00{i}\x00'
+            if name in rest:
+                rest = rest.replace(name, placeholder)
+                protected.append((placeholder, name))
+        rest = rest.replace('_', '.')
+        for placeholder, name in protected:
+            rest = rest.replace(placeholder, name)
+        return rest
+
+    @classmethod
+    def _normalize_keys_flux(cls, lora_sd):
         """
         Normalize FLUX LoRA keys from various trainer formats to canonical format.
 
@@ -288,16 +307,16 @@ class _LoRAMergeBase:
                 r'^transformer\.transformer_blocks\.(\d+)\.',
                 r'diffusion_model.double_blocks.\1.', new_k)
 
-            # Kohya underscore format
+            # Kohya underscore format — smart replacement preserving compound names
             m = re.match(r'^lora_transformer_single_transformer_blocks_(\d+)_(.*)', new_k)
             if m:
                 block_num = m.group(1)
-                rest = m.group(2).replace('_', '.')
+                rest = cls._flux_kohya_underscore_to_dot(m.group(2))
                 new_k = f"diffusion_model.single_blocks.{block_num}.{rest}"
             m = re.match(r'^lora_transformer_double_blocks_(\d+)_(.*)', new_k)
             if m:
                 block_num = m.group(1)
-                rest = m.group(2).replace('_', '.')
+                rest = cls._flux_kohya_underscore_to_dot(m.group(2))
                 new_k = f"diffusion_model.double_blocks.{block_num}.{rest}"
 
             # Ensure diffusion_model. prefix for standard format
@@ -627,13 +646,14 @@ class _LoRAMergeBase:
                     fused_diff = torch.cat([q_diff, k_diff, v_diff], dim=0)
                     fused[fused_key] = ("diff", (fused_diff,))
                 elif isinstance(q_patch, LoRAAdapter):
-                    # Low-rank patch — concatenate A and B matrices
+                    # Low-rank patch: up/B is split [out, rank] per component,
+                    # down/A is shared [rank, in] (same for all three).
                     q_data = q_patch.lora_data
                     k_data = k_patch.lora_data
                     v_data = v_patch.lora_data
-                    # (mat_up, mat_down, alpha, mid, dora_scale, bias)
+                    # lora_data = (mat_up, mat_down, alpha, mid, dora_scale, bias)
                     fused_up = torch.cat([q_data[0], k_data[0], v_data[0]], dim=0)
-                    fused_down = torch.cat([q_data[1], k_data[1], v_data[1]], dim=0)
+                    fused_down = q_data[1]  # shared — use one copy
                     fused_alpha = q_data[2]  # alpha is the same for all components
                     fused_mid = None  # Mid not expected for attention
                     fused_patch = LoRAAdapter(set(), (fused_up, fused_down, fused_alpha, fused_mid, None, None))
@@ -1026,6 +1046,7 @@ class LoRAOptimizer(_LoRAMergeBase):
     def __init__(self):
         self.loaded_loras = {}
         self._merge_cache = {}  # single-entry: {cache_key: (model_patches, clip_patches, report, clip_strength_out)}
+        self._detected_arch = None
 
     def _normalize_stack(self, lora_stack, normalize_keys="disabled"):
         """
@@ -1891,7 +1912,9 @@ class LoRAOptimizer(_LoRAMergeBase):
         # Single LoRA: skip analysis, apply directly via ComfyUI's standard
         # additive LoRA application (faster than diff-based pipeline).
         # auto_strength is a no-op with a single LoRA (scale would be 1.0).
-        if len(active_loras) == 1:
+        # Skip fast path for Z-Image: normalized keys (to_q/to_k/to_v) won't
+        # match the model's fused qkv keys — need full pipeline + re-fusion.
+        if len(active_loras) == 1 and getattr(self, '_detected_arch', None) != 'zimage':
             item = active_loras[0]
             lora_dict = item["lora"]
             strength = item["strength"]
