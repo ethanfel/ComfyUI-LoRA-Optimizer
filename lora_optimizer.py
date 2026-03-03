@@ -492,9 +492,9 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "default": "enabled",
                     "tooltip": "Cache merged patches in RAM for faster re-execution. Disable to free RAM after merge (recommended for video models)."
                 }),
-                "compress_patches": (["disabled", "auto", "64", "128", "256", "512", "1024"], {
+                "compress_patches": (["disabled", "non_ties", "all"], {
                     "default": "disabled",
-                    "tooltip": "Re-compress full-rank merged patches to low-rank via SVD. 'auto' uses sum of input LoRA ranks (preserves full merge information). Lower ranks save more RAM but reduce quality. Recommended for video models."
+                    "tooltip": "Re-compress full-rank merged patches to low-rank via SVD. 'non_ties' compresses only weighted_sum/weighted_average prefixes (lossless, TIES stays full-rank). 'all' compresses everything (lossy on TIES prefixes). Recommended for video models."
                 }),
             }
         }
@@ -1476,18 +1476,12 @@ class LoRAOptimizer(_LoRAMergeBase):
         if free_vram_between_passes == "enabled" and use_gpu:
             torch.cuda.empty_cache()
 
-        # Resolve compress_patches rank
+        # Resolve compress_patches rank (sum of input LoRA ranks)
         compress_rank = 0  # 0 = disabled
-        if compress_patches == "auto":
-            # Sum of input LoRA ranks — merging N rank-R LoRAs produces
-            # effective rank up to N*R, so we need the full sum to preserve
-            # all merge information without quality loss.
+        if compress_patches in ("non_ties", "all"):
             sum_rank = sum(int(stat["avg_rank"]) for stat in lora_stats if stat["avg_rank"] > 0)
             compress_rank = max(sum_rank, 64)  # floor at 64
-            logging.info(f"[LoRA Optimizer] Patch compression: auto (rank {compress_rank} from sum of input LoRA ranks)")
-        elif compress_patches != "disabled":
-            compress_rank = int(compress_patches)
-            logging.info(f"[LoRA Optimizer] Patch compression: rank {compress_rank}")
+            logging.info(f"[LoRA Optimizer] Patch compression: {compress_patches} (rank {compress_rank} from sum of input LoRA ranks)")
 
         # =====================================================================
         # Pass 2 — Merge (recompute diffs per-prefix, merge, discard)
@@ -1633,7 +1627,10 @@ class LoRAOptimizer(_LoRAMergeBase):
             if merged_diff is None:
                 return None
             # Compress full-rank diff to low-rank via SVD if requested
-            if compress_rank > 0:
+            # non_ties: skip compression on TIES prefixes (lossy); all: compress everything
+            should_compress = (compress_rank > 0 and
+                               (compress_patches == "all" or pf_mode != "ties"))
+            if should_compress:
                 patch = self._compress_to_lowrank(merged_diff, compress_rank)
                 del merged_diff
                 is_compressed = True
