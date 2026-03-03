@@ -44,8 +44,8 @@
   <rect x="310" y="136" width="120" height="26" rx="13" fill="#64ffda" opacity="0.12"/>
   <text x="370" y="154" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64ffda" text-anchor="middle" font-weight="600">Auto-Params</text>
 
-  <rect x="440" y="136" width="130" height="26" rx="13" fill="#e94560" opacity="0.12"/>
-  <text x="505" y="154" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e94560" text-anchor="middle" font-weight="600">Low Memory</text>
+  <rect x="440" y="136" width="140" height="26" rx="13" fill="#e94560" opacity="0.12"/>
+  <text x="510" y="154" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e94560" text-anchor="middle" font-weight="600">SVD Compression</text>
 
   <!-- ComfyUI badge -->
   <text x="862" y="26" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64748b" text-anchor="end" font-weight="600">ComfyUI</text>

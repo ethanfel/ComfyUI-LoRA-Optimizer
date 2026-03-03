@@ -6,13 +6,14 @@
   <img src="https://img.shields.io/badge/ComfyUI-Custom_Nodes-blue?style=flat-square" alt="ComfyUI">
   <img src="https://img.shields.io/badge/TIES_Merging-NeurIPS_2023-8b5cf6?style=flat-square" alt="TIES">
   <img src="https://img.shields.io/badge/Per--Prefix_Adaptive-Merge-e94560?style=flat-square" alt="Per-Prefix">
+  <img src="https://img.shields.io/badge/SVD_Patch-Compression-64ffda?style=flat-square" alt="SVD">
   <img src="https://img.shields.io/badge/Flux_%7C_SDXL_%7C_SD1.5-Compatible-22c55e?style=flat-square" alt="Compatible">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="MIT">
 </p>
 
 ---
 
-A ComfyUI node that **automatically analyzes your LoRA stack** and selects the best merge strategy per weight group — diff-based merging, TIES conflict resolution, per-prefix adaptive decisions, and auto-tuned parameters. Two nodes: **LoRA Stack** (build input) and **LoRA Optimizer** (analyze + merge).
+A ComfyUI node that **automatically analyzes your LoRA stack** and selects the best merge strategy per weight group — diff-based merging, TIES conflict resolution, per-prefix adaptive decisions, SVD patch compression, and auto-tuned parameters. Two nodes: **LoRA Stack** (build input) and **LoRA Optimizer** (analyze + merge).
 
 ## The Problem
 
@@ -50,7 +51,7 @@ Also accepts standard tuple-format stacks `(lora_name, model_strength, clip_stre
 
 Uses a **two-pass streaming architecture** for low memory usage:
 - **Pass 1 (Analysis):** Computes weight diffs per prefix, samples conflict and magnitude statistics per prefix, then discards the diffs. Only lightweight scalars are kept.
-- **Pass 2 (Merge):** Recomputes diffs per prefix, looks up that prefix's conflict data, picks the optimal strategy for it, and merges. Each prefix is freed after merging.
+- **Pass 2 (Merge):** Recomputes diffs per prefix, looks up that prefix's conflict data, picks the optimal strategy for it, and merges. Each prefix is freed after merging. Non-TIES patches are SVD-compressed to low-rank by default.
 
 Peak memory is ~one prefix at a time (~260MB) regardless of LoRA count or model size. GPU-accelerated on both passes.
 
@@ -72,7 +73,15 @@ Instead of picking one global strategy (which either wastes TIES trimming on non
 | Magnitude ratio > 2x at prefix | `total` sign method (stronger LoRA dominates) |
 | Magnitude ratio <= 2x at prefix | `frequency` sign method (equal votes) |
 
-This means non-overlapping regions keep 100% of their LoRA's effect, while genuinely conflicting regions get proper TIES resolution. Set `optimization_mode` to `global` for a single strategy across all prefixes (original behavior).
+This means non-overlapping regions keep 100% of their LoRA's effect, while genuinely conflicting regions get proper TIES resolution.
+
+#### Optimization Modes
+
+| Mode | Behavior |
+|------|----------|
+| `per_prefix` (default) | Each weight group picks its own strategy based on local conflict data |
+| `global` | Single strategy for all prefixes (original behavior) |
+| `weighted_sum_only` | Forces simple weighted sum everywhere — no TIES, no averaging. Combined with patch compression, all patches are fully compressible with zero quality loss |
 
 #### Block Strategy Map
 
@@ -103,6 +112,20 @@ The optimizer automatically selects TIES-Merging (Trim, Elect Sign, Disjoint Mer
   <img src="assets/ties-diagram.svg" alt="TIES Merging Pipeline" width="100%">
 </p>
 
+#### SVD Patch Compression
+
+After merging, full-rank diff patches consume ~128x more RAM than standard LoRA patches (64MB vs 0.5MB per key for a 4096x4096 weight). The optimizer re-compresses merged patches to low-rank via truncated SVD, dramatically reducing post-merge RAM.
+
+| Mode | What gets compressed | Quality | RAM savings |
+|------|---------------------|---------|-------------|
+| `non_ties` (default) | `weighted_sum` and `weighted_average` prefixes only | Lossless — sum of input ranks preserves all merge information | ~32x on compressed prefixes |
+| `all` | Everything including TIES | Lossy on TIES prefixes — nonlinear ops (trim, sign election) produce full-rank results that can't be perfectly captured | ~32x on all prefixes |
+| `disabled` | Nothing | No loss | No savings |
+
+The compression rank is automatically computed as the sum of all input LoRA ranks. For example, 3 rank-32 LoRAs produce a rank-96 compressed patch — enough to represent the full merge without quality loss on linear operations.
+
+> **Tip:** For video models (LTX2, Wan, etc.) with high RAM usage, use `weighted_sum_only` + `non_ties` (or `all`). Every patch gets losslessly compressed with minimal RAM footprint.
+
 #### Auto-Strength
 
 When `auto_strength` is set to `enabled`, the optimizer automatically reduces per-LoRA strengths before merging to prevent overexposure from stacking. This is especially useful on distilled/turbo models where 2+ LoRAs at full strength cause blown-out results even with optimal merge mode selection.
@@ -118,9 +141,17 @@ The algorithm uses **L2-aware energy normalization**: it measures each LoRA's ac
 
 Your original strength ratios are always preserved — the algorithm only scales them down uniformly.
 
+#### Memory Options
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `cache_patches` | enabled | Cache merged patches in RAM for faster re-execution. Disable to free RAM after merge (recommended for video models) |
+| `compress_patches` | non_ties | SVD re-compression of merged patches (see above) |
+| `free_vram_between_passes` | disabled | Release GPU cache between analysis and merge passes. Lowers peak VRAM at negligible speed cost |
+
 #### Inputs / Outputs
 
-**Inputs:** `MODEL`, `CLIP`, `LORA_STACK`, output strength, clip strength multiplier, auto strength, optimization mode (`per_prefix` / `global`), free VRAM between passes.
+**Inputs:** `MODEL`, `CLIP` (optional), `LORA_STACK`, output strength, clip strength multiplier, auto strength, optimization mode, cache patches, compress patches, free VRAM between passes.
 
 **Outputs:** `MODEL`, `CLIP`, `STRING` (analysis report)
 

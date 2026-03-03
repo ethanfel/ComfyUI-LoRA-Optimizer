@@ -1,61 +1,100 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 300">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 340">
   <defs>
     <linearGradient id="pbg" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" style="stop-color:#0f172a"/>
       <stop offset="100%" style="stop-color:#1e1b4b"/>
     </linearGradient>
   </defs>
-  <rect width="900" height="300" rx="12" fill="url(#pbg)"/>
+  <rect width="900" height="340" rx="12" fill="url(#pbg)"/>
 
   <text x="450" y="30" font-family="Segoe UI, Arial, sans-serif" font-size="14" fill="#64ffda" text-anchor="middle" font-weight="700" letter-spacing="2">TWO-PASS STREAMING PIPELINE</text>
 
   <!-- Pass 1: Analysis -->
-  <rect x="30" y="50" width="400" height="155" rx="10" fill="#1e293b" stroke="#e94560" stroke-width="1.5"/>
-  <rect x="30" y="50" width="400" height="28" rx="10" fill="#e94560" opacity="0.15"/>
-  <rect x="30" y="68" width="400" height="10" fill="#1e293b"/>
-  <text x="230" y="70" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#e94560" text-anchor="middle" font-weight="700">PASS 1: ANALYSIS</text>
+  <rect x="20" y="50" width="280" height="155" rx="10" fill="#1e293b" stroke="#e94560" stroke-width="1.5"/>
+  <rect x="20" y="50" width="280" height="28" rx="10" fill="#e94560" opacity="0.15"/>
+  <rect x="20" y="68" width="280" height="10" fill="#1e293b"/>
+  <text x="160" y="70" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#e94560" text-anchor="middle" font-weight="700">PASS 1: ANALYSIS</text>
 
-  <text x="50" y="100" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#ccd6f6">For each weight prefix:</text>
-  <text x="65" y="118" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">1. Compute diffs (Up @ Down x alpha)</text>
-  <text x="65" y="136" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">2. Sample sign conflict + magnitude stats</text>
-  <text x="65" y="154" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e94560">3. Discard diffs immediately</text>
+  <text x="38" y="100" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#ccd6f6">For each weight prefix:</text>
+  <text x="50" y="118" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">1. Compute diffs (Up @ Down x alpha)</text>
+  <text x="50" y="136" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">2. Sample conflict + magnitude stats</text>
+  <text x="50" y="154" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e94560">3. Discard diffs immediately</text>
 
-  <line x1="50" y1="166" x2="410" y2="166" stroke="#334155" stroke-width="0.5"/>
-  <text x="50" y="183" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64748b">Keeps only: per-LoRA L2 norms, conflict ratios, magnitude samples</text>
-  <text x="50" y="198" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64ffda">Memory: ~one prefix at a time</text>
+  <line x1="38" y1="166" x2="282" y2="166" stroke="#334155" stroke-width="0.5"/>
+  <text x="38" y="183" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64748b">Keeps: L2 norms, conflict ratios, samples</text>
+  <text x="38" y="198" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64ffda">Memory: ~one prefix at a time</text>
 
   <!-- Arrow Pass 1 → Decision -->
-  <line x1="430" y1="128" x2="463" y2="128" stroke="#94a3b8" stroke-width="1.5"/>
-  <polygon points="463,123 473,128 463,133" fill="#94a3b8"/>
+  <line x1="300" y1="128" x2="328" y2="128" stroke="#94a3b8" stroke-width="1.5"/>
+  <polygon points="328,123 338,128 328,133" fill="#94a3b8"/>
 
   <!-- Decision box -->
-  <rect x="475" y="78" width="195" height="100" rx="10" fill="#1e293b" stroke="#a78bfa" stroke-width="1.5"/>
-  <text x="572" y="102" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#a78bfa" text-anchor="middle" font-weight="700">AUTO-SELECT</text>
-  <text x="572" y="122" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">conflict > 25% -> TIES</text>
-  <text x="572" y="138" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">conflict &lt;= 25% -> weighted_avg</text>
-  <text x="572" y="154" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">+ auto density, sign method</text>
-  <text x="572" y="170" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">+ auto strength (optional)</text>
+  <rect x="340" y="50" width="170" height="155" rx="10" fill="#1e293b" stroke="#a78bfa" stroke-width="1.5"/>
+  <rect x="340" y="50" width="170" height="28" rx="10" fill="#a78bfa" opacity="0.1"/>
+  <rect x="340" y="68" width="170" height="10" fill="#1e293b"/>
+  <text x="425" y="70" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#a78bfa" text-anchor="middle" font-weight="700">AUTO-SELECT</text>
+
+  <text x="425" y="98" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">Per prefix decision:</text>
+  <text x="425" y="116" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">conflict > 25% → TIES</text>
+  <text x="425" y="132" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">conflict ≤ 25% → weighted_avg</text>
+  <text x="425" y="148" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">1 LoRA → weighted_sum</text>
+  <text x="425" y="168" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">+ density, sign method</text>
+  <text x="425" y="184" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">+ auto strength (optional)</text>
 
   <!-- Arrow Decision → Pass 2 -->
-  <line x1="670" y1="128" x2="703" y2="128" stroke="#94a3b8" stroke-width="1.5"/>
-  <polygon points="703,123 713,128 703,133" fill="#94a3b8"/>
+  <line x1="510" y1="128" x2="538" y2="128" stroke="#94a3b8" stroke-width="1.5"/>
+  <polygon points="538,123 548,128 538,133" fill="#94a3b8"/>
 
   <!-- Pass 2: Merge -->
-  <rect x="715" y="50" width="155" height="155" rx="10" fill="#1e293b" stroke="#64ffda" stroke-width="1.5"/>
-  <rect x="715" y="50" width="155" height="28" rx="10" fill="#64ffda" opacity="0.1"/>
-  <rect x="715" y="68" width="155" height="10" fill="#1e293b"/>
-  <text x="792" y="70" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#64ffda" text-anchor="middle" font-weight="700">PASS 2: MERGE</text>
+  <rect x="550" y="50" width="155" height="155" rx="10" fill="#1e293b" stroke="#64ffda" stroke-width="1.5"/>
+  <rect x="550" y="50" width="155" height="28" rx="10" fill="#64ffda" opacity="0.1"/>
+  <rect x="550" y="68" width="155" height="10" fill="#1e293b"/>
+  <text x="627" y="70" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#64ffda" text-anchor="middle" font-weight="700">PASS 2: MERGE</text>
 
-  <text x="735" y="100" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#ccd6f6">Per prefix:</text>
-  <text x="735" y="118" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Recompute diffs</text>
-  <text x="735" y="134" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Merge with auto</text>
-  <text x="735" y="150" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">params, free</text>
-  <line x1="730" y1="162" x2="855" y2="162" stroke="#334155" stroke-width="0.5"/>
-  <text x="792" y="180" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64ffda" text-anchor="middle">MODEL + CLIP</text>
-  <text x="792" y="196" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64ffda" text-anchor="middle">+ report</text>
+  <text x="567" y="98" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#ccd6f6">Per prefix:</text>
+  <text x="567" y="116" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Recompute diffs</text>
+  <text x="567" y="132" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Merge with strategy</text>
+  <text x="567" y="148" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Free diffs after merge</text>
+  <line x1="565" y1="160" x2="690" y2="160" stroke="#334155" stroke-width="0.5"/>
+  <text x="627" y="178" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64ffda" text-anchor="middle">Full-rank merged diff</text>
+
+  <!-- Arrow Pass 2 → SVD -->
+  <line x1="705" y1="128" x2="728" y2="128" stroke="#94a3b8" stroke-width="1.5"/>
+  <polygon points="728,123 738,128 728,133" fill="#94a3b8"/>
+
+  <!-- SVD Compression box -->
+  <rect x="740" y="50" width="140" height="155" rx="10" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5"/>
+  <rect x="740" y="50" width="140" height="28" rx="10" fill="#f59e0b" opacity="0.1"/>
+  <rect x="740" y="68" width="140" height="10" fill="#1e293b"/>
+  <text x="810" y="70" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#f59e0b" text-anchor="middle" font-weight="700">SVD COMPRESS</text>
+
+  <text x="810" y="98" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">Truncated SVD</text>
+  <text x="810" y="114" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">diff → low-rank A, B</text>
+  <text x="810" y="134" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f59e0b" text-anchor="middle">~32x RAM reduction</text>
+  <line x1="755" y1="148" x2="865" y2="148" stroke="#334155" stroke-width="0.5"/>
+  <text x="810" y="166" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">non_ties: lossless</text>
+  <text x="810" y="182" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">rank = sum(input ranks)</text>
+  <text x="810" y="198" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64ffda" text-anchor="middle">MODEL + CLIP + report</text>
 
   <!-- Bottom notes -->
-  <text x="450" y="240" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle">Two-pass: diffs are never all in memory at once. Each prefix computed, used, then freed.</text>
-  <text x="450" y="258" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle">Peak VRAM: ~260MB (one prefix) regardless of LoRA count or model size. GPU-accelerated.</text>
-  <text x="450" y="282" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64748b" text-anchor="middle">Compatible with Flux, SDXL, SD 1.5, and all LoRA formats including LoCon</text>
+  <text x="450" y="234" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle">Two-pass: diffs are never all in memory at once. Each prefix computed, used, then freed.</text>
+  <text x="450" y="254" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle">Peak VRAM: ~260MB (one prefix) regardless of LoRA count or model size. GPU-accelerated.</text>
+
+  <!-- Mode tags -->
+  <rect x="175" y="274" width="110" height="22" rx="11" fill="#a78bfa" opacity="0.12"/>
+  <text x="230" y="289" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#a78bfa" text-anchor="middle" font-weight="600">per_prefix</text>
+
+  <rect x="295" y="274" width="90" height="22" rx="11" fill="#a78bfa" opacity="0.12"/>
+  <text x="340" y="289" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#a78bfa" text-anchor="middle" font-weight="600">global</text>
+
+  <rect x="395" y="274" width="145" height="22" rx="11" fill="#a78bfa" opacity="0.12"/>
+  <text x="467" y="289" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#a78bfa" text-anchor="middle" font-weight="600">weighted_sum_only</text>
+
+  <rect x="550" y="274" width="100" height="22" rx="11" fill="#f59e0b" opacity="0.12"/>
+  <text x="600" y="289" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f59e0b" text-anchor="middle" font-weight="600">non_ties (default)</text>
+
+  <rect x="660" y="274" width="55" height="22" rx="11" fill="#f59e0b" opacity="0.12"/>
+  <text x="687" y="289" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f59e0b" text-anchor="middle" font-weight="600">all</text>
+
+  <text x="450" y="324" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64748b" text-anchor="middle">Compatible with Flux, SDXL, SD 1.5, and all LoRA formats including LoCon</text>
 </svg>
