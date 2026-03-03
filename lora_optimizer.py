@@ -559,6 +559,96 @@ class _LoRAMergeBase:
             return cls._normalize_keys_qwen_image(lora_sd)
         return lora_sd  # unknown — pass through unchanged
 
+    @staticmethod
+    def _refuse_zimage_patches(patches):
+        """
+        Re-fuse split to_q/to_k/to_v patches back into fused QKV patches
+        for Z-Image Turbo models. Also remaps to_out.0 -> out.
+
+        Called after merging, before applying patches to the model.
+        Returns a new dict with fused patches.
+        """
+        fused = {}
+        qkv_groups = {}  # base -> {comp: (key, patch)}
+
+        for key, patch in patches.items():
+            # Handle both string keys and tuple keys
+            if isinstance(key, tuple):
+                key_str = key[0]
+            else:
+                key_str = key
+
+            # Detect to_q/to_k/to_v patterns in the key
+            m = re.search(r'(layers\.\d+\.attention)\.to_(q|k|v)(?:\.|$)', key_str)
+            if m:
+                base = m.group(1)
+                comp = m.group(2)
+                if base not in qkv_groups:
+                    qkv_groups[base] = {}
+                qkv_groups[base][comp] = (key, patch)
+                continue
+
+            # Detect to_out.0 -> out remap
+            m_out = re.search(r'(layers\.\d+\.attention)\.to_out\.0(?:\.|$)', key_str)
+            if m_out:
+                new_key_str = key_str.replace('.to_out.0', '.out')
+                if isinstance(key, tuple):
+                    new_key = (new_key_str,) + key[1:]
+                else:
+                    new_key = new_key_str
+                fused[new_key] = patch
+                continue
+
+            # Not a QKV or out key — pass through
+            fused[key] = patch
+
+        # Fuse QKV groups
+        for base, comps in qkv_groups.items():
+            if len(comps) == 3 and 'q' in comps and 'k' in comps and 'v' in comps:
+                # All three components present — fuse
+                q_key, q_patch = comps['q']
+                k_key, k_patch = comps['k']
+                v_key, v_patch = comps['v']
+
+                # Build the fused key name
+                if isinstance(q_key, tuple):
+                    fused_key_str = re.sub(r'\.to_q(?=\.|$)', '.qkv', q_key[0])
+                    fused_key = (fused_key_str,) + q_key[1:]
+                else:
+                    fused_key_str = re.sub(r'\.to_q(?=\.|$)', '.qkv', q_key)
+                    fused_key = fused_key_str
+
+                # Handle different patch formats
+                if isinstance(q_patch, tuple) and q_patch[0] == "diff":
+                    # Full-rank diff patch: ("diff", (tensor,))
+                    q_diff = q_patch[1][0]
+                    k_diff = k_patch[1][0]
+                    v_diff = v_patch[1][0]
+                    fused_diff = torch.cat([q_diff, k_diff, v_diff], dim=0)
+                    fused[fused_key] = ("diff", (fused_diff,))
+                elif isinstance(q_patch, LoRAAdapter):
+                    # Low-rank patch — concatenate A and B matrices
+                    q_data = q_patch.lora_data
+                    k_data = k_patch.lora_data
+                    v_data = v_patch.lora_data
+                    # (mat_up, mat_down, alpha, mid, dora_scale, bias)
+                    fused_up = torch.cat([q_data[0], k_data[0], v_data[0]], dim=0)
+                    fused_down = torch.cat([q_data[1], k_data[1], v_data[1]], dim=0)
+                    fused_alpha = q_data[2]  # alpha is the same for all components
+                    fused_mid = None  # Mid not expected for attention
+                    fused_patch = LoRAAdapter(set(), (fused_up, fused_down, fused_alpha, fused_mid, None, None))
+                    fused[fused_key] = fused_patch
+                else:
+                    # Unknown patch format — pass through unfused
+                    for comp_key, comp_patch in [(q_key, q_patch), (k_key, k_patch), (v_key, v_patch)]:
+                        fused[comp_key] = comp_patch
+            else:
+                # Incomplete QKV group — pass through individual components
+                for comp, (comp_key, comp_patch) in comps.items():
+                    fused[comp_key] = comp_patch
+
+        return fused
+
     def _load_lora(self, lora_name):
         """Loads LoRA file with caching"""
         if lora_name == "None" or lora_name is None:
@@ -2291,6 +2381,12 @@ class LoRAOptimizer(_LoRAMergeBase):
         self.loaded_loras.clear()
         if use_gpu:
             torch.cuda.empty_cache()
+
+        # Re-fuse Z-Image QKV patches if architecture normalization was used
+        if getattr(self, '_detected_arch', None) == 'zimage':
+            if len(model_patches) > 0:
+                model_patches = self._refuse_zimage_patches(model_patches)
+                logging.info(f"[LoRA Optimizer] Re-fused Z-Image QKV patches ({len(model_patches)} model patches)")
 
         # Apply patches
         new_model = model
