@@ -11,6 +11,7 @@ import os
 import json
 import hashlib
 import time
+import re
 import concurrent.futures
 import folder_paths
 import comfy.utils
@@ -81,6 +82,68 @@ class _LoRAMergeBase:
         if torch.cuda.is_available():
             return torch.device("cuda")
         return torch.device("cpu")
+
+    @staticmethod
+    def _detect_architecture(lora_sd):
+        """
+        Detect model architecture from LoRA key patterns.
+        Returns: 'zimage', 'flux', 'wan', 'sdxl', 'ltx', 'qwen_image', or 'unknown'.
+        """
+        keys = list(lora_sd.keys())
+        keys_str = ' '.join(k.lower() for k in keys)
+
+        # Z-Image Turbo (Lumina2): layers.N with attention patterns
+        # Handles: diffusion_model.layers.N, single_transformer_blocks.N (non-FLUX),
+        #          lora_unet_layers_N (Musubi Tuner)
+        if any('diffusion_model.layers.' in k and ('attention' in k or 'adaln' in k.lower())
+               for k in keys):
+            return 'zimage'
+        if any('lora_unet_layers_' in k and 'attention' in k.lower() for k in keys):
+            return 'zimage'
+        # single_transformer_blocks WITHOUT transformer. prefix = Z-Image
+        if any('single_transformer_blocks' in k and 'transformer.single_transformer_blocks' not in k
+               for k in keys):
+            return 'zimage'
+
+        # FLUX: double/single blocks in various trainer formats
+        if any('transformer.single_transformer_blocks' in k or 'transformer.transformer_blocks' in k
+               for k in keys):
+            return 'flux'
+        if any('transformer_single_transformer_blocks' in k or 'transformer_double_blocks' in k
+               for k in keys):
+            return 'flux'
+        if any('double_blocks' in k or 'single_blocks' in k for k in keys):
+            return 'flux'
+
+        # Wan: blocks.N with self_attn/cross_attn/ffn
+        if any(('blocks.' in k or 'blocks_' in k) and
+               any(x in k for x in ['self_attn', 'cross_attn', 'ffn'])
+               for k in keys):
+            return 'wan'
+
+        # LTX Video: transformer_blocks with attn1/attn2 and adaln_single
+        if any('adaln_single' in k for k in keys):
+            return 'ltx'
+        if any('transformer_blocks' in k and ('attn1' in k or 'attn2' in k)
+               and not any('transformer_blocks' in k2 and 'img_mlp' in k2 for k2 in keys)
+               for k in keys):
+            return 'ltx'
+
+        # Qwen-Image: transformer_blocks with img_mlp/txt_mlp/img_mod/txt_mod
+        if any('transformer_blocks' in k and
+               any(x in k for x in ['img_mlp', 'txt_mlp', 'img_mod', 'txt_mod', 'add_q_proj'])
+               for k in keys):
+            return 'qwen_image'
+
+        # SDXL: text encoders or UNet block patterns
+        if 'lora_te1_' in keys_str or 'lora_te2_' in keys_str:
+            return 'sdxl'
+        if any('input_blocks' in k or 'output_blocks' in k for k in keys):
+            return 'sdxl'
+        if any('down_blocks' in k or 'up_blocks' in k for k in keys):
+            return 'sdxl'
+
+        return 'unknown'
 
     def _load_lora(self, lora_name):
         """Loads LoRA file with caching"""
