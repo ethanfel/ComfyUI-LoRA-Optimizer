@@ -16,6 +16,7 @@ import folder_paths
 import comfy.utils
 import comfy.sd
 import comfy.lora
+from comfy.weight_adapter.lora import LoRAAdapter
 
 
 class LoRAStack:
@@ -277,7 +278,7 @@ class _LoRAMergeBase:
         mat_down = ((V * sqrt_S.unsqueeze(0)).T).cpu()  # [rank, in]
         del U, S, V, sqrt_S
         # alpha=rank so ComfyUI computes: up @ down * (rank/rank) = up @ down
-        return ("lora", (mat_up, mat_down, float(rank), None))
+        return LoRAAdapter(set(), (mat_up, mat_down, float(rank), None, None, None))
 
     @torch.no_grad()
     def _merge_diffs(self, diffs_with_weights, mode, density=0.5, majority_sign_method="frequency",
@@ -1654,7 +1655,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                             eff_strength *= scale_ratios.get(i, 1.0)
                     # Bake eff_strength into alpha so ComfyUI applies it correctly
                     alpha_scaled = alpha * eff_strength
-                    patch = ("lora", (mat_up, mat_down, alpha_scaled, mid))
+                    patch = LoRAAdapter(set(), (mat_up, mat_down, alpha_scaled, mid, None, None))
                     return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), False)
                 return None
 
@@ -1749,7 +1750,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             else:
                 model_patches[target_key] = patch
             processed_keys += 1
-            if patch[0] == "lora":
+            if isinstance(patch, LoRAAdapter):
                 lowrank_count += 1
             if is_compressed:
                 compressed_count += 1
