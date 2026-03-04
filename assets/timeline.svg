@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 1280" width="900" height="1280">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 1320" width="720" height="1320">
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" style="stop-color:#0f172a"/>
@@ -19,175 +19,171 @@
     </filter>
   </defs>
 
-  <rect width="900" height="1280" fill="url(#bg)" rx="16"/>
+  <rect width="720" height="1320" fill="url(#bg)" rx="16"/>
 
   <!-- Title -->
-  <text x="450" y="46" font-family="Segoe UI, Arial, sans-serif" font-size="28" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="-0.5">LoRA Optimizer</text>
-  <text x="450" y="68" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#94a3b8" text-anchor="middle" letter-spacing="2">DEVELOPMENT TIMELINE</text>
+  <text x="360" y="44" font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="-0.5">LoRA Optimizer</text>
+  <text x="360" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle" letter-spacing="2">DEVELOPMENT TIMELINE</text>
 
   <!-- Central timeline line -->
-  <line x1="450" y1="88" x2="450" y2="1230" stroke="url(#line-grad)" stroke-width="3" opacity="0.5"/>
+  <line x1="360" y1="84" x2="360" y2="1270" stroke="url(#line-grad)" stroke-width="3" opacity="0.5"/>
 
-  <!-- === 1: Initial Release === -->
-  <circle cx="450" cy="114" r="8" fill="#e94560" filter="url(#glow)"/>
-  <circle cx="450" cy="114" r="3" fill="#fff"/>
-  <rect x="80" y="96" width="340" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="420" y1="114" x2="442" y2="114" stroke="#e94560" stroke-width="2"/>
-  <text x="96" y="112" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#e94560">Initial Release</text>
-  <text x="96" y="126" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">Basic weighted-sum LoRA merging</text>
-  <rect x="330" y="100" width="80" height="16" rx="8" fill="#e94560" opacity="0.15"/>
-  <text x="370" y="112" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#e94560" text-anchor="middle" font-weight="600">v1.0.0</text>
+  <!-- === 1: Initial Release === LEFT -->
+  <circle cx="360" cy="112" r="8" fill="#e94560" filter="url(#glow)"/>
+  <circle cx="360" cy="112" r="3" fill="#fff"/>
+  <rect x="50" y="94" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="112" x2="352" y2="112" stroke="#e94560" stroke-width="2"/>
+  <text x="64" y="110" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#e94560">Initial Release</text>
+  <text x="64" y="124" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Basic weighted-sum LoRA merging</text>
+  <rect x="248" y="98" width="74" height="16" rx="8" fill="#e94560" opacity="0.15"/>
+  <text x="285" y="110" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#e94560" text-anchor="middle" font-weight="600">v1.0.0</text>
 
-  <!-- === 2: LoRA Optimizer Node === -->
-  <circle cx="450" cy="186" r="8" fill="#f59e0b" filter="url(#glow)"/>
-  <circle cx="450" cy="186" r="3" fill="#fff"/>
-  <rect x="480" y="164" width="340" height="44" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="458" y1="186" x2="480" y2="186" stroke="#f59e0b" stroke-width="2"/>
-  <text x="496" y="184" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#f59e0b">LoRA Optimizer Node</text>
-  <text x="496" y="200" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">TIES merging + sign-conflict analysis + auto-strength</text>
+  <!-- === 2: LoRA Optimizer Node === RIGHT -->
+  <circle cx="360" cy="184" r="8" fill="#f59e0b" filter="url(#glow)"/>
+  <circle cx="360" cy="184" r="3" fill="#fff"/>
+  <rect x="388" y="164" width="282" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="184" x2="388" y2="184" stroke="#f59e0b" stroke-width="2"/>
+  <text x="402" y="182" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#f59e0b">LoRA Optimizer Node</text>
+  <text x="402" y="198" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">TIES merging + sign-conflict + auto-strength</text>
 
-  <!-- === 3: GPU Acceleration === -->
-  <circle cx="450" cy="258" r="8" fill="#c026d3" filter="url(#glow)"/>
-  <circle cx="450" cy="258" r="3" fill="#fff"/>
-  <rect x="80" y="240" width="340" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="420" y1="258" x2="442" y2="258" stroke="#c026d3" stroke-width="2"/>
-  <text x="96" y="256" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#c026d3">GPU Acceleration</text>
-  <text x="96" y="270" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">CUDA-accelerated merge + thread-pool parallelization</text>
-  <rect x="330" y="244" width="80" height="16" rx="8" fill="#c026d3" opacity="0.15"/>
-  <text x="370" y="256" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#c026d3" text-anchor="middle" font-weight="600">PERF</text>
+  <!-- === 3: GPU Acceleration === LEFT -->
+  <circle cx="360" cy="256" r="8" fill="#c026d3" filter="url(#glow)"/>
+  <circle cx="360" cy="256" r="3" fill="#fff"/>
+  <rect x="50" y="238" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="256" x2="352" y2="256" stroke="#c026d3" stroke-width="2"/>
+  <text x="64" y="254" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#c026d3">GPU Acceleration</text>
+  <text x="64" y="268" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">CUDA merge + thread-pool parallelization</text>
+  <rect x="248" y="242" width="74" height="16" rx="8" fill="#c026d3" opacity="0.15"/>
+  <text x="285" y="254" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#c026d3" text-anchor="middle" font-weight="600">PERF</text>
 
-  <!-- === 4: Two-Pass Streaming === -->
-  <circle cx="450" cy="330" r="8" fill="#c026d3" filter="url(#glow)"/>
-  <circle cx="450" cy="330" r="3" fill="#fff"/>
-  <rect x="480" y="312" width="340" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="458" y1="330" x2="480" y2="330" stroke="#c026d3" stroke-width="2"/>
-  <text x="496" y="328" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#c026d3">Two-Pass Streaming</text>
-  <text x="496" y="342" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">~50 GB peak → ~260 MB. Runs on consumer hardware</text>
-  <rect x="730" y="316" width="80" height="16" rx="8" fill="#c026d3" opacity="0.15"/>
-  <text x="770" y="328" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#c026d3" text-anchor="middle" font-weight="600">PERF</text>
+  <!-- === 4: Two-Pass Streaming === RIGHT -->
+  <circle cx="360" cy="328" r="8" fill="#c026d3" filter="url(#glow)"/>
+  <circle cx="360" cy="328" r="3" fill="#fff"/>
+  <rect x="388" y="310" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="328" x2="388" y2="328" stroke="#c026d3" stroke-width="2"/>
+  <text x="402" y="326" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#c026d3">Two-Pass Streaming</text>
+  <text x="402" y="340" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">~50 GB → ~260 MB. Consumer hardware</text>
+  <rect x="596" y="314" width="64" height="16" rx="8" fill="#c026d3" opacity="0.15"/>
+  <text x="628" y="326" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#c026d3" text-anchor="middle" font-weight="600">PERF</text>
 
-  <!-- === 5: Per-Prefix Adaptive Merge === -->
-  <circle cx="450" cy="402" r="8" fill="#a78bfa" filter="url(#glow)"/>
-  <circle cx="450" cy="402" r="3" fill="#fff"/>
-  <rect x="80" y="384" width="340" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="420" y1="402" x2="442" y2="402" stroke="#a78bfa" stroke-width="2"/>
-  <text x="96" y="400" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#a78bfa">Per-Prefix Adaptive Merge</text>
-  <text x="96" y="414" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">TIES for high-conflict, weighted sum for clean layers</text>
-  <rect x="330" y="388" width="80" height="16" rx="8" fill="#a78bfa" opacity="0.15"/>
-  <text x="370" y="400" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#a78bfa" text-anchor="middle" font-weight="600">STRATEGY</text>
+  <!-- === 5: Per-Prefix === LEFT -->
+  <circle cx="360" cy="400" r="8" fill="#a78bfa" filter="url(#glow)"/>
+  <circle cx="360" cy="400" r="3" fill="#fff"/>
+  <rect x="50" y="382" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="400" x2="352" y2="400" stroke="#a78bfa" stroke-width="2"/>
+  <text x="64" y="398" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#a78bfa">Per-Prefix Adaptive Merge</text>
+  <text x="64" y="412" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">TIES or weighted sum per layer automatically</text>
 
-  <!-- === 6: SVD Compression === -->
-  <circle cx="450" cy="474" r="8" fill="#22c55e" filter="url(#glow)"/>
-  <circle cx="450" cy="474" r="3" fill="#fff"/>
-  <rect x="480" y="456" width="340" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="458" y1="474" x2="480" y2="474" stroke="#22c55e" stroke-width="2"/>
-  <text x="496" y="472" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#22c55e">SVD Patch Compression</text>
-  <text x="496" y="486" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">Post-merge low-rank re-compression, up to 128x RAM savings</text>
-  <rect x="730" y="460" width="80" height="16" rx="8" fill="#22c55e" opacity="0.15"/>
-  <text x="770" y="472" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#22c55e" text-anchor="middle" font-weight="600">OPTIMIZE</text>
+  <!-- === 6: SVD === RIGHT -->
+  <circle cx="360" cy="472" r="8" fill="#22c55e" filter="url(#glow)"/>
+  <circle cx="360" cy="472" r="3" fill="#fff"/>
+  <rect x="388" y="454" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="472" x2="388" y2="472" stroke="#22c55e" stroke-width="2"/>
+  <text x="402" y="470" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#22c55e">SVD Patch Compression</text>
+  <text x="402" y="484" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Low-rank re-compression, up to 128x savings</text>
 
-  <!-- === 7: SLERP === -->
-  <circle cx="450" cy="546" r="8" fill="#a78bfa" filter="url(#glow)"/>
-  <circle cx="450" cy="546" r="3" fill="#fff"/>
-  <rect x="80" y="530" width="340" height="32" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="420" y1="546" x2="442" y2="546" stroke="#a78bfa" stroke-width="2"/>
-  <text x="96" y="550" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#a78bfa">SLERP Merge</text>
-  <text x="260" y="550" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">Spherical interpolation for 2-LoRA blending</text>
+  <!-- === 7: SLERP === LEFT -->
+  <circle cx="360" cy="544" r="8" fill="#a78bfa" filter="url(#glow)"/>
+  <circle cx="360" cy="544" r="3" fill="#fff"/>
+  <rect x="50" y="528" width="282" height="32" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="544" x2="352" y2="544" stroke="#a78bfa" stroke-width="2"/>
+  <text x="64" y="548" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#a78bfa">SLERP Merge</text>
+  <text x="185" y="548" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Spherical interpolation for 2 LoRAs</text>
 
-  <!-- === 8: Key Normalization === -->
-  <circle cx="450" cy="618" r="8" fill="#64ffda" filter="url(#glow)"/>
-  <circle cx="450" cy="618" r="3" fill="#fff"/>
-  <rect x="480" y="598" width="340" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="458" y1="618" x2="480" y2="618" stroke="#64ffda" stroke-width="2"/>
-  <text x="496" y="616" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#64ffda">Architecture-Aware Normalization</text>
-  <text x="496" y="632" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">Cross-trainer compat — FLUX, SDXL, Wan, Z-Image, LTX</text>
-  <rect x="730" y="602" width="80" height="16" rx="8" fill="#64ffda" opacity="0.15"/>
-  <text x="770" y="614" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64ffda" text-anchor="middle" font-weight="600">COMPAT</text>
+  <!-- === 8: Key Normalization === RIGHT -->
+  <circle cx="360" cy="616" r="8" fill="#64ffda" filter="url(#glow)"/>
+  <circle cx="360" cy="616" r="3" fill="#fff"/>
+  <rect x="388" y="596" width="282" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="616" x2="388" y2="616" stroke="#64ffda" stroke-width="2"/>
+  <text x="402" y="614" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#64ffda">Arch-Aware Normalization</text>
+  <text x="402" y="630" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Cross-trainer — FLUX, SDXL, Wan, Z-Image</text>
+  <rect x="596" y="600" width="64" height="16" rx="8" fill="#64ffda" opacity="0.15"/>
+  <text x="628" y="612" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64ffda" text-anchor="middle" font-weight="600">COMPAT</text>
 
-  <!-- === 9: DARE / DELLA === -->
-  <circle cx="450" cy="690" r="8" fill="#f59e0b" filter="url(#glow)"/>
-  <circle cx="450" cy="690" r="3" fill="#fff"/>
-  <rect x="80" y="672" width="340" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="420" y1="690" x2="442" y2="690" stroke="#f59e0b" stroke-width="2"/>
-  <text x="96" y="688" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#f59e0b">DARE / DELLA Sparsification</text>
-  <text x="96" y="702" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">Random weight dropout — conflict-aware for hot areas</text>
+  <!-- === 9: DARE === LEFT -->
+  <circle cx="360" cy="688" r="8" fill="#f59e0b" filter="url(#glow)"/>
+  <circle cx="360" cy="688" r="3" fill="#fff"/>
+  <rect x="50" y="670" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="688" x2="352" y2="688" stroke="#f59e0b" stroke-width="2"/>
+  <text x="64" y="686" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#f59e0b">DARE / DELLA Sparsification</text>
+  <text x="64" y="700" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Weight dropout — conflict-aware variant</text>
 
-  <!-- === 10: Save Merged LoRA === -->
-  <circle cx="450" cy="762" r="8" fill="#22c55e" filter="url(#glow)"/>
-  <circle cx="450" cy="762" r="3" fill="#fff"/>
-  <rect x="480" y="746" width="340" height="32" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="458" y1="762" x2="480" y2="762" stroke="#22c55e" stroke-width="2"/>
-  <text x="496" y="766" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#22c55e">Save Merged LoRA</text>
-  <text x="660" y="766" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">Export as .safetensors</text>
+  <!-- === 10: Save === RIGHT -->
+  <circle cx="360" cy="760" r="8" fill="#22c55e" filter="url(#glow)"/>
+  <circle cx="360" cy="760" r="3" fill="#fff"/>
+  <rect x="388" y="744" width="282" height="32" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="760" x2="388" y2="760" stroke="#22c55e" stroke-width="2"/>
+  <text x="402" y="764" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#22c55e">Save Merged LoRA</text>
+  <text x="556" y="764" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Export .safetensors</text>
 
-  <!-- === 11: Dynamic LoRA Stacker === -->
-  <circle cx="450" cy="834" r="8" fill="#38bdf8" filter="url(#glow)"/>
-  <circle cx="450" cy="834" r="3" fill="#fff"/>
-  <rect x="80" y="816" width="340" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="420" y1="834" x2="442" y2="834" stroke="#38bdf8" stroke-width="2"/>
-  <text x="96" y="832" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#38bdf8">Dynamic LoRA Stacker</text>
-  <text x="96" y="846" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">1-10 slots, simple or advanced per-LoRA CLIP strength</text>
-  <rect x="330" y="820" width="80" height="16" rx="8" fill="#38bdf8" opacity="0.15"/>
-  <text x="370" y="832" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#38bdf8" text-anchor="middle" font-weight="600">NODE</text>
+  <!-- === 11: Dynamic Stacker === LEFT -->
+  <circle cx="360" cy="832" r="8" fill="#38bdf8" filter="url(#glow)"/>
+  <circle cx="360" cy="832" r="3" fill="#fff"/>
+  <rect x="50" y="814" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="832" x2="352" y2="832" stroke="#38bdf8" stroke-width="2"/>
+  <text x="64" y="830" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#38bdf8">Dynamic LoRA Stacker</text>
+  <text x="64" y="844" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">1-10 slots, simple or advanced CLIP strength</text>
+  <rect x="248" y="818" width="74" height="16" rx="8" fill="#38bdf8" opacity="0.15"/>
+  <text x="285" y="830" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#38bdf8" text-anchor="middle" font-weight="600">NODE</text>
 
-  <!-- === 12: Interference-Aware Auto-Strength === -->
-  <circle cx="450" cy="906" r="8" fill="#e94560" filter="url(#glow)"/>
-  <circle cx="450" cy="906" r="3" fill="#fff"/>
-  <rect x="480" y="886" width="340" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="458" y1="906" x2="480" y2="906" stroke="#e94560" stroke-width="2"/>
-  <text x="496" y="904" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#e94560">Interference-Aware Auto-Strength</text>
-  <text x="496" y="920" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">Cosine similarity scales strengths per reinforcement</text>
-  <rect x="730" y="890" width="80" height="16" rx="8" fill="#e94560" opacity="0.15"/>
-  <text x="770" y="902" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#e94560" text-anchor="middle" font-weight="600">ANALYSIS</text>
+  <!-- === 12: Auto-Strength === RIGHT -->
+  <circle cx="360" cy="904" r="8" fill="#e94560" filter="url(#glow)"/>
+  <circle cx="360" cy="904" r="3" fill="#fff"/>
+  <rect x="388" y="884" width="282" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="904" x2="388" y2="904" stroke="#e94560" stroke-width="2"/>
+  <text x="402" y="902" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#e94560">Interference Auto-Strength</text>
+  <text x="402" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Cosine similarity scales per reinforcement</text>
+  <rect x="596" y="888" width="64" height="16" rx="8" fill="#e94560" opacity="0.15"/>
+  <text x="628" y="900" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#e94560" text-anchor="middle" font-weight="600">ANALYSIS</text>
 
-  <!-- === 13: WanVideo LoRA Optimizer === -->
-  <circle cx="450" cy="978" r="8" fill="#38bdf8" filter="url(#glow)"/>
-  <circle cx="450" cy="978" r="3" fill="#fff"/>
-  <rect x="80" y="958" width="340" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="420" y1="978" x2="442" y2="978" stroke="#38bdf8" stroke-width="2"/>
-  <text x="96" y="976" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#38bdf8">WanVideo LoRA Optimizer</text>
-  <text x="96" y="992" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">Full merge pipeline for WanVideo models via kijai wrapper</text>
-  <rect x="330" y="962" width="80" height="16" rx="8" fill="#38bdf8" opacity="0.15"/>
-  <text x="370" y="974" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#38bdf8" text-anchor="middle" font-weight="600">NODE</text>
+  <!-- === 13: WanVideo === LEFT -->
+  <circle cx="360" cy="976" r="8" fill="#38bdf8" filter="url(#glow)"/>
+  <circle cx="360" cy="976" r="3" fill="#fff"/>
+  <rect x="50" y="958" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="976" x2="352" y2="976" stroke="#38bdf8" stroke-width="2"/>
+  <text x="64" y="974" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#38bdf8">WanVideo LoRA Optimizer</text>
+  <text x="64" y="988" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Full merge pipeline for WanVideo models</text>
+  <rect x="248" y="962" width="74" height="16" rx="8" fill="#38bdf8" opacity="0.15"/>
+  <text x="285" y="974" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#38bdf8" text-anchor="middle" font-weight="600">NODE</text>
 
-  <!-- === 14: Merged LoRA to Hook === -->
-  <circle cx="450" cy="1050" r="8" fill="#22c55e" filter="url(#glow)"/>
-  <circle cx="450" cy="1050" r="3" fill="#fff"/>
-  <rect x="480" y="1030" width="340" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="458" y1="1050" x2="480" y2="1050" stroke="#22c55e" stroke-width="2"/>
-  <text x="496" y="1048" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#22c55e">Merged LoRA to Hook</text>
-  <text x="496" y="1064" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">Per-conditioning LoRA application via ComfyUI hooks</text>
-  <rect x="730" y="1034" width="80" height="16" rx="8" fill="#22c55e" opacity="0.15"/>
-  <text x="770" y="1046" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#22c55e" text-anchor="middle" font-weight="600">OUTPUT</text>
+  <!-- === 14: Hooks === RIGHT -->
+  <circle cx="360" cy="1048" r="8" fill="#22c55e" filter="url(#glow)"/>
+  <circle cx="360" cy="1048" r="3" fill="#fff"/>
+  <rect x="388" y="1028" width="282" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="1048" x2="388" y2="1048" stroke="#22c55e" stroke-width="2"/>
+  <text x="402" y="1046" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#22c55e">Merged LoRA to Hook</text>
+  <text x="402" y="1062" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Per-conditioning LoRA via ComfyUI hooks</text>
+  <rect x="596" y="1032" width="64" height="16" rx="8" fill="#22c55e" opacity="0.15"/>
+  <text x="628" y="1044" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#22c55e" text-anchor="middle" font-weight="600">OUTPUT</text>
 
-  <!-- === 15: Text Input Mode === -->
-  <circle cx="450" cy="1122" r="8" fill="#38bdf8" filter="url(#glow)"/>
-  <circle cx="450" cy="1122" r="3" fill="#fff"/>
-  <rect x="80" y="1104" width="340" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
-  <line x1="420" y1="1122" x2="442" y2="1122" stroke="#38bdf8" stroke-width="2"/>
-  <text x="96" y="1120" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#38bdf8">Text Input Mode + Name Resolution</text>
-  <text x="96" y="1134" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8">Type short names or connect text nodes — auto-resolves</text>
-  <rect x="330" y="1108" width="80" height="16" rx="8" fill="#38bdf8" opacity="0.15"/>
-  <text x="370" y="1120" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#38bdf8" text-anchor="middle" font-weight="600">NODE</text>
+  <!-- === 15: Text Input === LEFT -->
+  <circle cx="360" cy="1120" r="8" fill="#38bdf8" filter="url(#glow)"/>
+  <circle cx="360" cy="1120" r="3" fill="#fff"/>
+  <rect x="50" y="1102" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="1120" x2="352" y2="1120" stroke="#38bdf8" stroke-width="2"/>
+  <text x="64" y="1118" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#38bdf8">Text Input + Name Resolution</text>
+  <text x="64" y="1132" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Type short names or connect text nodes</text>
+  <rect x="248" y="1106" width="74" height="16" rx="8" fill="#38bdf8" opacity="0.15"/>
+  <text x="285" y="1118" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#38bdf8" text-anchor="middle" font-weight="600">NODE</text>
 
   <!-- End dot -->
-  <circle cx="450" cy="1180" r="5" fill="#a78bfa" opacity="0.6"/>
-  <circle cx="450" cy="1180" r="2" fill="#fff" opacity="0.8"/>
+  <circle cx="360" cy="1180" r="5" fill="#a78bfa" opacity="0.6"/>
+  <circle cx="360" cy="1180" r="2" fill="#fff" opacity="0.8"/>
 
   <!-- Legend -->
-  <rect x="160" y="1244" width="580" height="24" rx="12" fill="#0f172a" stroke="#334155" stroke-width="1"/>
-  <circle cx="198" cy="1256" r="5" fill="#e94560"/>
-  <text x="208" y="1260" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Feature</text>
-  <circle cx="265" cy="1256" r="5" fill="#c026d3"/>
-  <text x="275" y="1260" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Perf</text>
-  <circle cx="315" cy="1256" r="5" fill="#a78bfa"/>
-  <text x="325" y="1260" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Strategy</text>
-  <circle cx="395" cy="1256" r="5" fill="#22c55e"/>
-  <text x="405" y="1260" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Optimize</text>
-  <circle cx="475" cy="1256" r="5" fill="#64ffda"/>
-  <text x="485" y="1260" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Compat</text>
-  <circle cx="545" cy="1256" r="5" fill="#f59e0b"/>
-  <text x="555" y="1260" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Preprocess</text>
-  <circle cx="640" cy="1256" r="5" fill="#38bdf8"/>
-  <text x="650" y="1260" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Node</text>
+  <rect x="80" y="1284" width="560" height="24" rx="12" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <circle cx="115" cy="1296" r="5" fill="#e94560"/>
+  <text x="125" y="1300" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Feature</text>
+  <circle cx="182" cy="1296" r="5" fill="#c026d3"/>
+  <text x="192" y="1300" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Perf</text>
+  <circle cx="228" cy="1296" r="5" fill="#a78bfa"/>
+  <text x="238" y="1300" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Strategy</text>
+  <circle cx="305" cy="1296" r="5" fill="#22c55e"/>
+  <text x="315" y="1300" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Optimize</text>
+  <circle cx="385" cy="1296" r="5" fill="#64ffda"/>
+  <text x="395" y="1300" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Compat</text>
+  <circle cx="455" cy="1296" r="5" fill="#f59e0b"/>
+  <text x="465" y="1300" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Preprocess</text>
+  <circle cx="545" cy="1296" r="5" fill="#38bdf8"/>
+  <text x="555" y="1300" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Node</text>
 </svg>
