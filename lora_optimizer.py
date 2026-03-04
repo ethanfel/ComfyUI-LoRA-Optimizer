@@ -3078,9 +3078,32 @@ class LoRAConflictEditor(_LoRAMergeBase):
     RETURN_NAMES = ("lora_stack", "analysis_report", "merge_strategy")
     FUNCTION = "analyze_and_enrich"
     CATEGORY = "loaders/lora"
+    DESCRIPTION = "Analyzes LoRA conflicts and lets you control per-LoRA conflict modes and merge strategy. Connect between a LoRA Stack and the LoRA Optimizer."
 
     def __init__(self):
         super().__init__()
+
+    @classmethod
+    def IS_CHANGED(cls, lora_stack, merge_strategy, **kwargs):
+        """Cache key so ComfyUI skips re-execution when nothing changed."""
+        h = hashlib.sha256()
+        if lora_stack:
+            first = lora_stack[0] if len(lora_stack) > 0 else None
+            entries = []
+            if isinstance(first, (tuple, list)):
+                for entry in lora_stack:
+                    entries.append((str(entry[0]), float(entry[1]), float(entry[2])))
+            elif isinstance(first, dict):
+                for item in lora_stack:
+                    entries.append((str(item.get("name", "")), float(item.get("strength", 0))))
+            entries.sort()
+            h.update(json.dumps(entries).encode())
+        h.update(f"|ms={merge_strategy}".encode())
+        # Include all conflict_mode widgets
+        for i in range(1, cls.MAX_LORAS + 1):
+            cm = kwargs.get(f"conflict_mode_{i}", "auto")
+            h.update(f"|cm{i}={cm}".encode())
+        return h.hexdigest()[:16]
 
     def analyze_and_enrich(self, lora_stack, merge_strategy, **kwargs):
         """
@@ -3093,7 +3116,7 @@ class LoRAConflictEditor(_LoRAMergeBase):
 
         n_active = len(active_loras)
         if n_active == 0:
-            return (lora_stack, "No active LoRAs in stack.", merge_strategy)
+            return (lora_stack, "No active LoRAs in stack.", "")
 
         if n_active == 1:
             # Single LoRA — no pairwise conflicts to analyze
