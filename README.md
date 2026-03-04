@@ -19,17 +19,15 @@ A ComfyUI node that **automatically analyzes your LoRA stack** and selects the b
 
 ## The Problem
 
-<p align="center"><img src="assets/the-problem.png" width="720" alt="The Problem with LoRA Stacking vs the Optimizer"></p>
+<img src="assets/the-problem.png" width="720" alt="The Problem with LoRA Stacking vs the Optimizer">
 
-<p align="center">
-  <img src="assets/comparison.png" alt="Before/After Comparison" width="100%">
-</p>
+<img src="assets/comparison.png" alt="Before/After Comparison" width="100%">
 
 ---
 
 ### Should I Merge This LoRA?
 
-<p align="center"><img src="assets/merge-use-cases.png" width="720" alt="Should I merge this LoRA? Decision guide"></p>
+<img src="assets/merge-use-cases.png" width="720" alt="Should I merge this LoRA? Decision guide">
 
 ---
 
@@ -72,9 +70,7 @@ Uses a **two-pass streaming architecture** for low memory usage:
 
 Peak memory is ~one prefix at a time (~260MB) regardless of LoRA count or model size. GPU-accelerated on both passes.
 
-<p align="center">
-  <img src="assets/optimizer-pipeline.svg" alt="Optimizer Pipeline" width="100%">
-</p>
+<img src="assets/optimizer-pipeline.svg" alt="Optimizer Pipeline" width="100%">
 
 #### What It Analyzes
 
@@ -100,25 +96,23 @@ Instead of picking one global strategy (which either wastes TIES trimming on non
 
 This means non-overlapping regions keep 100% of their LoRA's effect, while genuinely conflicting regions get proper TIES resolution.
 
-<p align="center">
-  <img src="assets/merge-strategies.svg" alt="Merge Strategies Comparison" width="100%">
-</p>
+<img src="assets/merge-strategies.svg" alt="Merge Strategies Comparison" width="100%">
 
-#### TIES Merging
+<details>
+<summary><b>TIES Merging</b></summary>
 
 The optimizer automatically selects TIES-Merging (Trim, Elect Sign, Disjoint Merge — [Yadav et al., NeurIPS 2023](https://arxiv.org/abs/2306.01708)) on prefixes where sign conflicts are detected between LoRAs.
 
-<p align="center">
-  <img src="assets/ties-diagram.svg" alt="TIES Merging Pipeline" width="100%">
-</p>
+<img src="assets/ties-diagram.svg" alt="TIES Merging Pipeline" width="100%">
 
-#### DARE / DELLA Sparsification
+</details>
+
+<details>
+<summary><b>DARE / DELLA Sparsification</b></summary>
 
 DARE and DELLA **sparsify each LoRA's diff before merging**, reducing parameter interference between LoRAs. Available in two modes: **standard** (drops weights everywhere) and **conflict-aware** (only drops weights where LoRAs actually interfere).
 
-<p align="center">
-  <img src="assets/sparsification-diagram.svg" alt="DARE / DELLA Sparsification" width="100%">
-</p>
+<img src="assets/sparsification-diagram.svg" alt="DARE / DELLA Sparsification" width="100%">
 
 | Method | How It Works |
 |--------|-------------|
@@ -138,7 +132,10 @@ DARE and DELLA **sparsify each LoRA's diff before merging**, reducing parameter 
 | `sparsification` | disabled | `disabled`, `dare`, `della`, `dare_conflict`, `della_conflict` |
 | `sparsification_density` | 0.7 | Fraction of parameters to keep (lower = more aggressive) |
 
-#### Auto-Strength
+</details>
+
+<details>
+<summary><b>Auto-Strength</b></summary>
 
 When `auto_strength` is set to `enabled`, the optimizer automatically reduces per-LoRA strengths before merging to prevent overexposure from stacking. This is especially useful on distilled/turbo models where 2+ LoRAs at full strength cause blown-out results even with optimal merge mode selection.
 
@@ -159,15 +156,16 @@ The algorithm uses **interference-aware energy normalization**: it measures pair
 
 Your original strength ratios are always preserved — the algorithm only scales them down uniformly.
 
-#### Architecture-Aware Key Normalization
+</details>
+
+<details>
+<summary><b>Architecture-Aware Key Normalization</b></summary>
 
 Different LoRA trainers (Kohya, AI-Toolkit, LyCORIS, diffusers/PEFT) produce LoRAs with **different key naming conventions** for the same model weights. When mixing LoRAs from different trainers, the optimizer sees no key overlap and cannot merge them correctly.
 
 Key normalization auto-detects the model architecture from LoRA key patterns and remaps all keys to a canonical format, enabling correct overlap detection and conflict analysis across trainer formats.
 
-<p align="center">
-  <img src="assets/key-normalization.svg" alt="Architecture-Aware Key Normalization" width="100%">
-</p>
+<img src="assets/key-normalization.svg" alt="Architecture-Aware Key Normalization" width="100%">
 
 | Architecture | Detected From | Normalization |
 |-------------|--------------|---------------|
@@ -184,7 +182,10 @@ Key normalization auto-detects the model architecture from LoRA key patterns and
 |---------|---------|--------|
 | `normalize_keys` | disabled | `disabled` or `enabled`. Enable when mixing LoRAs from different trainers or for Z-Image QKV fusion. |
 
-#### SVD Patch Compression
+</details>
+
+<details>
+<summary><b>SVD Patch Compression</b></summary>
 
 After merging, full-rank diff patches consume ~128x more RAM than standard LoRA patches (64MB vs 0.5MB per key for a 4096x4096 weight). The optimizer re-compresses merged patches to low-rank via truncated SVD, dramatically reducing post-merge RAM.
 
@@ -198,7 +199,10 @@ The compression rank is automatically computed as the sum of all input LoRA rank
 
 > **Tip:** For video models (LTX, Wan, etc.) with high RAM usage, use `weighted_sum_only` + `non_ties` (or `all`). Every patch gets losslessly compressed with minimal RAM footprint.
 
-#### Optimization Modes
+</details>
+
+<details>
+<summary><b>Optimization Modes</b></summary>
 
 | Mode | Behavior |
 |------|----------|
@@ -206,7 +210,10 @@ The compression rank is automatically computed as the sum of all input LoRA rank
 | `global` | Single strategy for all prefixes (original behavior) |
 | `weighted_sum_only` | Forces simple weighted sum everywhere — no TIES, no averaging. Combined with patch compression, all patches are fully compressible with zero quality loss |
 
-#### Block Strategy Map
+</details>
+
+<details>
+<summary><b>Block Strategy Map</b></summary>
 
 The analysis report includes a visual block-by-block map showing what strategy was used and why:
 
@@ -220,7 +227,10 @@ The analysis report includes a visual block-by-block map showing what strategy w
   Legend: ==== sum (single LoRA)  ---- avg (compatible)  #### TIES (conflict)
 ```
 
-#### Memory Options
+</details>
+
+<details>
+<summary><b>Memory Options</b></summary>
 
 | Option | Default | Effect |
 |--------|---------|--------|
@@ -229,13 +239,16 @@ The analysis report includes a visual block-by-block map showing what strategy w
 | `svd_device` | gpu | Device for SVD compression. GPU is ~10-50x faster than CPU. Use CPU if GPU memory is tight |
 | `free_vram_between_passes` | disabled | Release GPU cache between analysis and merge passes. Lowers peak VRAM at negligible speed cost |
 
+</details>
+
 #### Inputs / Outputs
 
 **Inputs:** `MODEL`, `CLIP` (optional), `LORA_STACK`, output strength, clip strength multiplier, auto strength, optimization mode, cache patches, compress patches, SVD device, free VRAM between passes, normalize keys, sparsification, sparsification density.
 
-**Outputs:** `MODEL`, `CLIP`, `STRING` (analysis report), `LORA_DATA` (for Save Merged LoRA)
+**Outputs:** `MODEL`, `CLIP`, `STRING` (analysis report), `LORA_DATA` (for Save Merged LoRA / Merged LoRA to Hook)
 
-#### Example Report
+<details>
+<summary><b>Example Report</b></summary>
 
 ```
 ==================================================
@@ -318,6 +331,8 @@ LORA OPTIMIZER - ANALYSIS REPORT
 
 Connect the `STRING` output to a **Show Text** node to see the report in ComfyUI.
 
+</details>
+
 > **Structural & Edit LoRAs:** Do not put distillation LoRAs (LCM, Lightning, Turbo, Hyper), DPO LoRAs, or **edit model LoRAs** (Qwen edit, Klein edit, instruction-editing LoRAs) in the optimizer stack. These LoRAs modify the model's fundamental behavior — their weights are precisely calibrated and merging them with style LoRAs can break their training. Apply them via a standard **Load LoRA** node upstream, then feed only your style/character LoRAs into the optimizer. If you must include an edit LoRA in the stack, use `weighted_sum_only` mode and disable sparsification to avoid weight trimming.
 
 > **Limitation:** The optimizer only analyzes LoRAs in its own stack. It cannot see LoRA patches applied by upstream nodes (Load LoRA, etc.) — those stack additively on top of the optimizer's output. Fully baked merges (safetensors checkpoints) are indistinguishable from base weights and cannot be detected.
@@ -338,6 +353,41 @@ Connect the `LORA_DATA` output from LoRA Optimizer to this node.
 
 **Outputs:** `STRING` (file path)
 
+---
+
+### Merged LoRA to Hook
+
+Wraps the optimizer's merged patches as a **conditioning hook** (`HOOKS`) for per-conditioning LoRA application. Instead of applying the merged LoRA globally to the model, you can attach it to specific conditioning entries using ComfyUI's hook system.
+
+Connect the `LORA_DATA` output from LoRA Optimizer to this node, then connect the `HOOKS` output to a **Cond Set Props** (or similar) node.
+
+**Inputs:** `LORA_DATA` (required), `HOOKS` (optional — chain with existing hooks)
+
+**Outputs:** `HOOKS`
+
+<details>
+<summary><b>When to use this</b></summary>
+
+Use this node when you want the merged LoRA to apply **only to specific conditioning** rather than the entire model:
+
+- **Per-prompt LoRA:** Apply different merged LoRAs to positive vs negative conditioning
+- **Scheduled application:** Combine with hook keyframes to apply the LoRA only during certain sampling steps
+- **Regional conditioning:** Use with area-based conditioning to apply the LoRA to specific image regions
+- **Preserving the base model:** Keep the MODEL output clean (unpatched) while still using the merged LoRA through conditioning hooks
+
+**Workflow example:**
+```
+Load Checkpoint → MODEL ──┬──→ LoRA Optimizer → LORA_DATA → Merged LoRA to Hook → HOOKS
+                           │                                                          ↓
+                           └──→ KSampler ←──── Conditioning ←──── Cond Set Props
+```
+
+The `prev_hooks` input allows chaining multiple hook sources together.
+
+</details>
+
+---
+
 ## Installation
 
 ### ComfyUI Manager
@@ -348,7 +398,7 @@ Search for "LoRA Optimizer" in ComfyUI Manager and install.
 cd ComfyUI/custom_nodes/
 git clone https://github.com/ethanfel/ComfyUI-LoRA-Optimizer.git
 ```
-Restart ComfyUI. Both nodes appear under the `loaders/lora` category.
+Restart ComfyUI. Nodes appear under the `loaders` category.
 
 ## Compatibility
 

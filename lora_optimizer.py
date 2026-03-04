@@ -3041,6 +3041,74 @@ class SaveMergedLoRA:
         return (save_path,)
 
 
+class MergedLoRAToHook:
+    """Converts merged LoRA data into a conditioning hook for per-conditioning application."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "lora_data": ("LORA_DATA", {
+                    "tooltip": "Connect the lora_data output from LoRA Optimizer."
+                }),
+            },
+            "optional": {
+                "prev_hooks": ("HOOKS", {
+                    "tooltip": "Optional: chain with existing hooks."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("HOOKS",)
+    RETURN_NAMES = ("hooks",)
+    FUNCTION = "convert"
+    CATEGORY = "loaders"
+    DESCRIPTION = (
+        "Wraps merged LoRA patches as a conditioning hook (HOOKS). "
+        "Connect to 'Cond Set Props' or similar nodes to apply the merged LoRA "
+        "per-conditioning instead of globally."
+    )
+
+    def convert(self, lora_data, prev_hooks=None):
+        import comfy.hooks
+
+        if prev_hooks is None:
+            prev_hooks = comfy.hooks.HookGroup()
+        else:
+            prev_hooks = prev_hooks.clone()
+
+        if lora_data is None:
+            logging.warning("[MergedLoRAToHook] No lora_data received. Returning empty hooks.")
+            return (prev_hooks,)
+
+        model_patches = lora_data.get("model_patches", {})
+        clip_patches = lora_data.get("clip_patches", {})
+
+        if not model_patches and not clip_patches:
+            logging.warning("[MergedLoRAToHook] lora_data has no patches. Returning empty hooks.")
+            return (prev_hooks,)
+
+        strength_model = lora_data.get("output_strength", 1.0)
+        strength_clip = lora_data.get("clip_strength", 1.0)
+        if strength_clip is None:
+            strength_clip = 1.0
+
+        if strength_model == 0 and strength_clip == 0:
+            return (prev_hooks,)
+
+        hook = comfy.hooks.WeightHook(
+            strength_model=strength_model,
+            strength_clip=strength_clip,
+        )
+        hook.weights = model_patches
+        hook.weights_clip = clip_patches
+        hook.need_weight_init = False
+
+        hook_group = comfy.hooks.HookGroup()
+        hook_group.add(hook)
+        return (prev_hooks.clone_and_combine(hook_group),)
+
+
 class LoRAConflictEditor(_LoRAMergeBase):
     """
     Analyzes pairwise sign conflicts between LoRAs in a stack and enriches
@@ -3448,6 +3516,7 @@ NODE_CLASS_MAPPINGS = {
     "LoRAOptimizer": LoRAOptimizer,
     "SaveMergedLoRA": SaveMergedLoRA,
     "LoRAConflictEditor": LoRAConflictEditor,
+    "MergedLoRAToHook": MergedLoRAToHook,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -3456,4 +3525,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoRAOptimizer": "LoRA Optimizer",
     "SaveMergedLoRA": "Save Merged LoRA",
     "LoRAConflictEditor": "LoRA Conflict Editor",
+    "MergedLoRAToHook": "Merged LoRA to Hook",
 }
