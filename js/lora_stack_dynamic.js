@@ -92,3 +92,12 @@ app.registerExtension({
         setTimeout(() => updateVisibility(node), 100);
     },
 });
+
+app.registerExtension({
+    name: "LoRAOptimizer.LoRAConflictEditor",
+    nodeCreated(node) {
+        if (node.comfyClass !== "LoRAConflictEditor") return;
+        // All 10 conflict_mode slots are always visible.
+        // Unused slots (beyond the stack size) default to "auto" and are ignored.
+    },
+});
