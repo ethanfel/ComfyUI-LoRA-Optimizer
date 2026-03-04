@@ -84,18 +84,27 @@ class LoRAStackDynamic:
 
     @classmethod
     def INPUT_TYPES(cls):
+        loras = ["None"] + folder_paths.get_filename_list("loras")
         inputs = {
             "required": {
                 "mode": (["simple", "advanced"], {
                     "tooltip": "Simple: one strength slider per LoRA (controls both image and text). "
                                "Advanced: separate model_strength and clip_strength sliders for fine-tuning how each LoRA affects image generation vs prompt understanding."
                 }),
+                "input_mode": (["dropdown", "text"], {
+                    "default": "dropdown",
+                    "tooltip": "Dropdown: pick LoRAs from a list. "
+                               "Text: type LoRA names or connect text nodes (short names are auto-resolved)."
+                }),
                 "lora_count": ("INT", {"default": 3, "min": 1, "max": cls.MAX_LORAS, "step": 1,
                                        "tooltip": "How many LoRA slots to show. Increase to add more LoRAs."}),
             }
         }
         for i in range(1, cls.MAX_LORAS + 1):
-            inputs["required"][f"lora_name_{i}"] = ("STRING", {
+            inputs["required"][f"lora_name_{i}"] = (loras, {
+                "tooltip": f"LoRA #{i} — pick a LoRA file or leave as 'None' to skip this slot."
+            })
+            inputs["required"][f"lora_name_text_{i}"] = ("STRING", {
                 "default": "None",
                 "tooltip": f"LoRA #{i} — type a LoRA filename (without extension or path), "
                            f"a full relative path, or 'None' to skip. Accepts text node connections."
@@ -175,14 +184,17 @@ class LoRAStackDynamic:
         logger.warning(f"LoRA name '{name}' not found in installed LoRAs, skipping")
         return None
 
-    def build_stack(self, mode, lora_count, lora_stack=None, **kwargs):
+    def build_stack(self, mode, input_mode, lora_count, lora_stack=None, **kwargs):
         loras = []
+        use_text = input_mode == "text"
         for i in range(1, lora_count + 1):
-            name = kwargs.get(f"lora_name_{i}", "None")
-            if name == "None":
+            if use_text:
+                name = kwargs.get(f"lora_name_text_{i}", "None")
+            else:
+                name = kwargs.get(f"lora_name_{i}", "None")
+            if name == "None" or not name.strip():
                 continue
-            # Resolve short names (e.g. "Milena_20260216180133") to full paths
-            resolved = self._resolve_lora_name(name)
+            resolved = self._resolve_lora_name(name.strip())
             if not resolved:
                 continue
             conflict_mode = kwargs.get(f"conflict_mode_{i}", "all")

@@ -58,17 +58,20 @@ function interceptWidgetValue(widget, onChange) {
 
 function updateVisibility(node) {
     const modeWidget = findWidget(node, "mode");
+    const inputModeWidget = findWidget(node, "input_mode");
     const countWidget = findWidget(node, "lora_count");
-    if (!modeWidget || !countWidget) return;
+    if (!modeWidget || !inputModeWidget || !countWidget) return;
 
     const isSimple = modeWidget.value === "simple";
+    const isText = inputModeWidget.value === "text";
     const count = countWidget.value;
     const MAX = 10;
 
     for (let i = 1; i <= MAX; i++) {
         const visible = i <= count;
 
-        toggleWidget(node, findWidget(node, `lora_name_${i}`), visible);
+        toggleWidget(node, findWidget(node, `lora_name_${i}`), visible && !isText);
+        toggleWidget(node, findWidget(node, `lora_name_text_${i}`), visible && isText);
         toggleWidget(node, findWidget(node, `strength_${i}`), visible && isSimple);
         toggleWidget(node, findWidget(node, `model_strength_${i}`), visible && !isSimple);
         toggleWidget(node, findWidget(node, `clip_strength_${i}`), visible && !isSimple);
@@ -87,9 +90,9 @@ app.registerExtension({
     nodeCreated(node) {
         if (node.comfyClass !== "LoRAStackDynamic") return;
 
-        // Intercept mode and lora_count changes to update visibility
+        // Intercept mode, input_mode, and lora_count changes to update visibility
         for (const w of node.widgets || []) {
-            if (w.name !== "mode" && w.name !== "lora_count") continue;
+            if (w.name !== "mode" && w.name !== "input_mode" && w.name !== "lora_count") continue;
             interceptWidgetValue(w, () => updateVisibility(node));
         }
 
