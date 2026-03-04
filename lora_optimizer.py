@@ -2263,13 +2263,13 @@ class LoRAOptimizer(_LoRAMergeBase):
         """
         # Normalize stack format (standard tuples or LoRAStack dicts)
         if not lora_stack or len(lora_stack) == 0:
-            return (model, clip, "No LoRAs in stack.")
+            return (model, clip, "No LoRAs in stack.", None)
 
         normalized_stack = self._normalize_stack(lora_stack, normalize_keys=normalize_keys)
         active_loras = [item for item in normalized_stack if item["strength"] != 0]
 
         if len(active_loras) == 0:
-            return (model, clip, "No LoRAs in stack (all zero strength or malformed).")
+            return (model, clip, "No LoRAs in stack (all zero strength or malformed).", None)
 
         # Single LoRA: skip analysis, apply directly via ComfyUI's standard
         # additive LoRA application (faster than diff-based pipeline).
@@ -2299,7 +2299,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 f"  Applied directly with output_strength={output_strength}\n"
                 "\n" + "=" * 50
             )
-            return (new_model, new_clip, report)
+            return (new_model, new_clip, report, None)
 
         # Check instance-level patch cache (survives ComfyUI re-execution
         # triggered by downstream seed changes or similar non-LoRA changes)
@@ -2439,7 +2439,7 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         if prefix_count == 0:
             return (model, clip, "No compatible LoRA keys found. "
-                    "LoRAs may be incompatible with this model architecture.")
+                    "LoRAs may be incompatible with this model architecture.", None)
 
         # Log per-LoRA summaries
         for i, stat in enumerate(per_lora_stats):
@@ -2520,7 +2520,8 @@ class LoRAOptimizer(_LoRAMergeBase):
         del all_magnitude_samples
 
         # Apply merge strategy override from Conflict Editor
-        if merge_strategy_override:
+        # Skip when user explicitly chose weighted_sum_only (protects DPO/edit LoRAs)
+        if merge_strategy_override and optimization_mode != "weighted_sum_only":
             if merge_strategy_override in ("ties", "weighted_average", "weighted_sum"):
                 mode = merge_strategy_override
                 reasoning.append(f"Merge mode overridden to '{mode}' by Conflict Editor")
@@ -2644,8 +2645,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                     if pf_mode == "weighted_average" and pf["n_loras"] == 2:
                         pf_mode = "slerp"
 
-            # Apply merge strategy override from Conflict Editor (takes priority over all auto-selection)
-            if merge_strategy_override and merge_strategy_override in ("ties", "weighted_average", "weighted_sum"):
+            # Apply merge strategy override from Conflict Editor (takes priority over auto-selection)
+            # Skip when user explicitly chose weighted_sum_only (protects DPO/edit LoRAs)
+            if (merge_strategy_override and optimization_mode != "weighted_sum_only"
+                    and merge_strategy_override in ("ties", "weighted_average", "weighted_sum")):
                 pf_mode = merge_strategy_override
 
             # LOW-RANK PATH: single-LoRA weighted_sum — keep low-rank matrices
