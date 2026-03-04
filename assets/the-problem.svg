@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 520">
+  <defs>
+    <linearGradient id="pbg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f172a"/>
+      <stop offset="100%" style="stop-color:#1e1b4b"/>
+    </linearGradient>
+    <marker id="pa" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#475569" stroke-width="1"/>
+    </marker>
+    <marker id="paG" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#22c55e" stroke-width="1"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="520" rx="12" fill="url(#pbg)"/>
+
+  <!-- ===== TOP: STANDARD STACKING ===== -->
+  <rect x="30" y="14" width="840" height="22" rx="6" fill="#e94560" opacity="0.12"/>
+  <text x="450" y="30" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#e94560" text-anchor="middle" font-weight="700" letter-spacing="2">STANDARD LORA STACKING</text>
+
+  <!-- Pipeline: Model → +A → +B → +C → Output -->
+  <rect x="40" y="50" width="70" height="30" rx="6" fill="#334155" stroke="#64748b" stroke-width="1"/>
+  <text x="75" y="69" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">Model</text>
+
+  <line x1="110" y1="65" x2="138" y2="65" stroke="#475569" stroke-width="1.5" marker-end="url(#pa)"/>
+
+  <rect x="146" y="50" width="110" height="30" rx="6" fill="#1e293b" stroke="#f87171" stroke-width="1.5"/>
+  <text x="201" y="69" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f87171" text-anchor="middle" font-weight="600">+ LoRA A  (0.8)</text>
+
+  <line x1="256" y1="65" x2="274" y2="65" stroke="#475569" stroke-width="1.5" marker-end="url(#pa)"/>
+
+  <rect x="282" y="50" width="110" height="30" rx="6" fill="#1e293b" stroke="#c084fc" stroke-width="1.5"/>
+  <text x="337" y="69" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#c084fc" text-anchor="middle" font-weight="600">+ LoRA B  (0.7)</text>
+
+  <line x1="392" y1="65" x2="410" y2="65" stroke="#475569" stroke-width="1.5" marker-end="url(#pa)"/>
+
+  <rect x="418" y="50" width="110" height="30" rx="6" fill="#1e293b" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="473" y="69" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#38bdf8" text-anchor="middle" font-weight="600">+ LoRA C  (0.6)</text>
+
+  <line x1="528" y1="65" x2="546" y2="65" stroke="#475569" stroke-width="1.5" marker-end="url(#pa)"/>
+
+  <!-- Output (bad) -->
+  <rect x="554" y="50" width="70" height="30" rx="6" fill="#e94560" opacity="0.15" stroke="#e94560" stroke-width="1.5"/>
+  <text x="589" y="69" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#e94560" text-anchor="middle" font-weight="600">Output</text>
+
+  <!-- Accumulation bar -->
+  <text x="660" y="57" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64748b">Total effect:</text>
+  <rect x="660" y="62" width="180" height="10" rx="3" fill="#334155"/>
+  <rect x="660" y="62" width="180" height="10" rx="3" fill="#e94560" opacity="0.6"/>
+  <line x1="746" y1="60" x2="746" y2="74" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="746" y="82" font-family="Segoe UI, Arial, sans-serif" font-size="7" fill="#f59e0b" text-anchor="middle">1.0</text>
+  <text x="840" y="82" font-family="Segoe UI, Arial, sans-serif" font-size="7" fill="#e94560" text-anchor="end">2.1x</text>
+
+  <!-- Three problem cards -->
+  <!-- Card 1: Overshoot -->
+  <rect x="40" y="100" width="260" height="120" rx="10" fill="#1e293b" stroke="#e94560" stroke-width="1"/>
+  <text x="60" y="122" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#e94560" font-weight="700">Strength Overshoot</text>
+  <text x="60" y="140" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">Effects add up blindly — total strength far</text>
+  <text x="60" y="153" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">exceeds what the model can handle.</text>
+
+  <!-- Visual: stacking bars overshooting -->
+  <rect x="60" y="165" width="220" height="6" rx="2" fill="#334155"/>
+  <rect x="60" y="165" width="77" height="6" rx="2" fill="#f87171" opacity="0.7"/>
+  <rect x="60" y="175" width="220" height="6" rx="2" fill="#334155"/>
+  <rect x="60" y="175" width="145" height="6" rx="2" fill="#c084fc" opacity="0.5"/>
+  <rect x="60" y="185" width="220" height="6" rx="2" fill="#334155"/>
+  <rect x="60" y="185" width="200" height="6" rx="2" fill="#38bdf8" opacity="0.4"/>
+  <text x="62" y="207" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#64748b">A alone</text>
+  <text x="62" y="217" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#64748b">A + B</text>
+  <line x1="220" y1="162" x2="220" y2="195" stroke="#f59e0b" stroke-width="1" stroke-dasharray="3,2"/>
+  <text x="224" y="200" font-family="Segoe UI, Arial, sans-serif" font-size="7" fill="#f59e0b">safe limit</text>
+
+  <!-- Card 2: Conflicts -->
+  <rect x="320" y="100" width="260" height="120" rx="10" fill="#1e293b" stroke="#f59e0b" stroke-width="1"/>
+  <text x="340" y="122" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#f59e0b" font-weight="700">Weight Conflicts</text>
+  <text x="340" y="140" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">LoRAs push the same weights in opposite</text>
+  <text x="340" y="153" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">directions — they cancel each other out.</text>
+
+  <!-- Visual: opposing arrows -->
+  <!-- LoRA A pushes right -->
+  <rect x="340" y="170" width="60" height="14" rx="4" fill="#f87171" opacity="0.2" stroke="#f87171" stroke-width="0.5"/>
+  <text x="370" y="180" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#f87171" text-anchor="middle">A: +0.8</text>
+  <line x1="405" y1="177" x2="435" y2="177" stroke="#f87171" stroke-width="2"/>
+  <polygon points="435,173 443,177 435,181" fill="#f87171"/>
+
+  <!-- LoRA B pushes left -->
+  <rect x="340" y="190" width="60" height="14" rx="4" fill="#c084fc" opacity="0.2" stroke="#c084fc" stroke-width="0.5"/>
+  <text x="370" y="200" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#c084fc" text-anchor="middle">B: -0.7</text>
+  <line x1="435" y1="197" x2="405" y2="197" stroke="#c084fc" stroke-width="2"/>
+  <polygon points="405,193 397,197 405,201" fill="#c084fc"/>
+
+  <!-- Result: tiny bar -->
+  <text x="460" y="184" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#64748b">=</text>
+  <rect x="475" y="182" width="6" height="10" rx="2" fill="#f59e0b" opacity="0.5"/>
+  <text x="488" y="191" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#f59e0b">+0.1</text>
+  <text x="488" y="203" font-family="Segoe UI, Arial, sans-serif" font-size="7" fill="#64748b">both lost</text>
+
+  <!-- Card 3: Bleeding -->
+  <rect x="600" y="100" width="260" height="120" rx="10" fill="#1e293b" stroke="#c084fc" stroke-width="1"/>
+  <text x="620" y="122" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#c084fc" font-weight="700">Style Bleeding</text>
+  <text x="620" y="140" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">Each LoRA is applied to the output of the</text>
+  <text x="620" y="153" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">previous — one style contaminates the next.</text>
+
+  <!-- Visual: overlapping color blobs -->
+  <circle cx="680" cy="192" r="22" fill="#f87171" opacity="0.2" stroke="#f87171" stroke-width="1"/>
+  <text x="680" y="195" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#f87171" text-anchor="middle">Style</text>
+  <circle cx="710" cy="185" r="22" fill="#c084fc" opacity="0.2" stroke="#c084fc" stroke-width="1"/>
+  <text x="710" y="188" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#c084fc" text-anchor="middle">Char</text>
+  <circle cx="740" cy="192" r="22" fill="#38bdf8" opacity="0.2" stroke="#38bdf8" stroke-width="1"/>
+  <text x="740" y="195" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#38bdf8" text-anchor="middle">Pose</text>
+  <text x="790" y="192" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#64748b">Overlap =</text>
+  <text x="790" y="204" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#c084fc">artifacts</text>
+
+  <!-- ===== DIVIDER ===== -->
+  <line x1="60" y1="240" x2="840" y2="240" stroke="#334155" stroke-width="1" stroke-dasharray="4,4"/>
+
+  <!-- ===== BOTTOM: OPTIMIZER ===== -->
+  <rect x="30" y="252" width="840" height="22" rx="6" fill="#22c55e" opacity="0.12"/>
+  <text x="450" y="268" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#22c55e" text-anchor="middle" font-weight="700" letter-spacing="2">LORA OPTIMIZER</text>
+
+  <!-- Pipeline: Model → Optimizer [A+B+C] → Output -->
+  <rect x="100" y="288" width="70" height="30" rx="6" fill="#334155" stroke="#64748b" stroke-width="1"/>
+  <text x="135" y="307" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">Model</text>
+
+  <line x1="170" y1="303" x2="218" y2="303" stroke="#475569" stroke-width="1.5" marker-end="url(#pa)"/>
+
+  <!-- Optimizer box with LoRAs inside -->
+  <rect x="226" y="282" width="320" height="42" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
+  <text x="248" y="300" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#22c55e" font-weight="700">Optimizer</text>
+  <text x="248" y="314" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#64748b">analyze + resolve + merge</text>
+
+  <!-- LoRA chips inside optimizer -->
+  <rect x="370" y="290" width="48" height="16" rx="4" fill="#f87171" opacity="0.2" stroke="#f87171" stroke-width="0.5"/>
+  <text x="394" y="301" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#f87171" text-anchor="middle">A</text>
+  <rect x="424" y="290" width="48" height="16" rx="4" fill="#c084fc" opacity="0.2" stroke="#c084fc" stroke-width="0.5"/>
+  <text x="448" y="301" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#c084fc" text-anchor="middle">B</text>
+  <rect x="478" y="290" width="48" height="16" rx="4" fill="#38bdf8" opacity="0.2" stroke="#38bdf8" stroke-width="0.5"/>
+  <text x="502" y="301" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#38bdf8" text-anchor="middle">C</text>
+
+  <line x1="546" y1="303" x2="594" y2="303" stroke="#22c55e" stroke-width="1.5" marker-end="url(#paG)"/>
+
+  <!-- Output (good) -->
+  <rect x="602" y="288" width="70" height="30" rx="6" fill="#22c55e" opacity="0.15" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="637" y="307" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#22c55e" text-anchor="middle" font-weight="600">Output</text>
+
+  <!-- Balanced bar -->
+  <text x="700" y="296" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64748b">Total effect:</text>
+  <rect x="700" y="301" width="180" height="10" rx="3" fill="#334155"/>
+  <rect x="700" y="301" width="86" height="10" rx="3" fill="#22c55e" opacity="0.6"/>
+  <line x1="786" y1="299" x2="786" y2="313" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="786" y="321" font-family="Segoe UI, Arial, sans-serif" font-size="7" fill="#f59e0b" text-anchor="middle">1.0</text>
+
+  <!-- Three solution cards -->
+  <!-- Card 1: Balanced -->
+  <rect x="40" y="340" width="260" height="120" rx="10" fill="#1e293b" stroke="#22c55e" stroke-width="1"/>
+  <text x="60" y="362" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#22c55e" font-weight="700">Auto-Balanced Strength</text>
+  <text x="60" y="380" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">Computes weight diffs and normalizes per</text>
+  <text x="60" y="393" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">group — total stays within safe range.</text>
+
+  <!-- Visual: balanced bars -->
+  <rect x="60" y="408" width="220" height="6" rx="2" fill="#334155"/>
+  <rect x="60" y="408" width="77" height="6" rx="2" fill="#f87171" opacity="0.6"/>
+  <rect x="60" y="418" width="220" height="6" rx="2" fill="#334155"/>
+  <rect x="60" y="418" width="67" height="6" rx="2" fill="#c084fc" opacity="0.6"/>
+  <rect x="60" y="428" width="220" height="6" rx="2" fill="#334155"/>
+  <rect x="60" y="428" width="57" height="6" rx="2" fill="#38bdf8" opacity="0.6"/>
+  <rect x="60" y="440" width="220" height="8" rx="3" fill="#334155"/>
+  <rect x="60" y="440" width="160" height="8" rx="3" fill="#22c55e" opacity="0.4"/>
+  <text x="62" y="455" font-family="Segoe UI, Arial, sans-serif" font-size="7" fill="#22c55e">Combined — within range</text>
+  <line x1="220" y1="405" x2="220" y2="450" stroke="#f59e0b" stroke-width="1" stroke-dasharray="3,2"/>
+
+  <!-- Card 2: Resolved -->
+  <rect x="320" y="340" width="260" height="120" rx="10" fill="#1e293b" stroke="#22c55e" stroke-width="1"/>
+  <text x="340" y="362" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#22c55e" font-weight="700">Conflict Resolution</text>
+  <text x="340" y="380" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">TIES detects sign conflicts per weight and</text>
+  <text x="340" y="393" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">elects the dominant direction — no cancellation.</text>
+
+  <!-- Visual: conflict resolved -->
+  <rect x="340" y="410" width="60" height="14" rx="4" fill="#f87171" opacity="0.2" stroke="#f87171" stroke-width="0.5"/>
+  <text x="370" y="420" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#f87171" text-anchor="middle">A: +0.8</text>
+  <line x1="405" y1="417" x2="435" y2="417" stroke="#f87171" stroke-width="2"/>
+  <polygon points="435,413 443,417 435,421" fill="#f87171"/>
+
+  <rect x="340" y="430" width="60" height="14" rx="4" fill="#c084fc" opacity="0.1" stroke="#c084fc" stroke-width="0.5" stroke-dasharray="2,2"/>
+  <text x="370" y="440" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#c084fc" text-anchor="middle" opacity="0.4">B: -0.7</text>
+  <line x1="405" y1="437" x2="435" y2="437" stroke="#c084fc" stroke-width="1" opacity="0.3" stroke-dasharray="3,2"/>
+
+  <text x="460" y="424" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#64748b">=</text>
+  <rect x="475" y="410" width="40" height="10" rx="2" fill="#22c55e" opacity="0.5"/>
+  <text x="524" y="419" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#22c55e">+0.8</text>
+  <text x="475" y="440" font-family="Segoe UI, Arial, sans-serif" font-size="7" fill="#64748b">Winner keeps strength</text>
+
+  <!-- Card 3: Isolated -->
+  <rect x="600" y="340" width="260" height="120" rx="10" fill="#1e293b" stroke="#22c55e" stroke-width="1"/>
+  <text x="620" y="362" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#22c55e" font-weight="700">Clean Separation</text>
+  <text x="620" y="380" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">All LoRAs merged in one pass at the weight</text>
+  <text x="620" y="393" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">level — no sequential contamination.</text>
+
+  <!-- Visual: clean separated circles -->
+  <circle cx="680" cy="432" r="22" fill="#f87171" opacity="0.15" stroke="#f87171" stroke-width="1.5"/>
+  <text x="680" y="435" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#f87171" text-anchor="middle">Style</text>
+  <circle cx="730" cy="432" r="22" fill="#c084fc" opacity="0.15" stroke="#c084fc" stroke-width="1.5"/>
+  <text x="730" y="435" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#c084fc" text-anchor="middle">Char</text>
+  <circle cx="780" cy="432" r="22" fill="#38bdf8" opacity="0.15" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="780" y="435" font-family="Segoe UI, Arial, sans-serif" font-size="8" fill="#38bdf8" text-anchor="middle">Pose</text>
+
+  <!-- Bottom tagline -->
+  <text x="450" y="510" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64748b" text-anchor="middle">Analyze all LoRAs together, resolve conflicts per weight group, merge with the optimal strategy for each layer</text>
+</svg>

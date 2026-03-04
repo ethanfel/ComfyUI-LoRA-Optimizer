@@ -19,15 +19,7 @@ A ComfyUI node that **automatically analyzes your LoRA stack** and selects the b
 
 ## The Problem
 
-Stacking LoRAs in ComfyUI adds their effects together. On distilled/turbo models (SDXL-Turbo, LCM, Lightning, Flux-schnell), the accumulated effect exceeds what the model can handle, causing **overexposure, color blowout, and artifacts**.
-
-```
-model += lora1_effect x strength1
-model += lora2_effect x strength2
-total effect = strength1 + strength2  -->  easily exceeds 1.0
-```
-
-The optimizer solves this by computing full weight diffs, detecting sign conflicts per weight group, and merging each group with its optimal strategy.
+<p align="center"><img src="assets/the-problem.png" width="720" alt="The Problem with LoRA Stacking vs the Optimizer"></p>
 
 <p align="center">
   <img src="assets/comparison.png" alt="Before/After Comparison" width="100%">
