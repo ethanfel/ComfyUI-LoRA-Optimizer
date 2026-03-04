@@ -119,16 +119,6 @@ class LoRAStackDynamic:
                            f"'high_conflict': only where this LoRA disagrees."
             })
         inputs["optional"] = {
-            "lora_text": ("STRING", {
-                "multiline": True,
-                "default": "",
-                "placeholder": "Milena_20260216180133:0.8\npath/to/lora.safetensors:0.8:0.5",
-                "pysssss.autocomplete": False,
-                "dynamicPrompts": False,
-                "tooltip": "Type LoRA names or paths, one per line. "
-                           "Short names (e.g. Milena_20260216180133) are matched against installed LoRAs. "
-                           "Format: name (strength 1.0), name:0.8 (both strengths), or name:0.8:0.5 (model:clip)."
-            }),
             "lora_stack": ("LORA_STACK", {"tooltip": "Connect another LoRA Stack node here to add even more LoRAs to the list."}),
             "base_model_filter": (["All"], {
                 "default": "All",
@@ -182,83 +172,37 @@ class LoRAStackDynamic:
 
         logger = logging.getLogger("LoRAOptimizer")
         if len(matches) > 1:
-            logger.warning(f"lora_text: '{name}' matches multiple LoRAs: {matches[:5]}... using first match")
+            logger.warning(f"LoRA name '{name}' matches multiple files: {matches[:5]}... using first match")
             return matches[0]
 
-        logger.warning(f"lora_text: '{name}' not found in installed LoRAs, skipping")
+        logger.warning(f"LoRA name '{name}' not found in installed LoRAs, skipping")
         return None
 
-    @staticmethod
-    def _parse_lora_text(lora_text):
-        """Parse multiline text into LoRA entries with name resolution.
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        # Accept arbitrary strings for lora_name fields (for text node connections)
+        return True
 
-        Formats (one per line):
-          Milena_20260216180133              -> resolved to full path, strength 1.0
-          path/to/lora.safetensors           -> (path, 1.0, 1.0, "all")
-          path/to/lora.safetensors:0.8       -> (path, 0.8, 0.8, "all")
-          path/to/lora.safetensors:0.8:0.5   -> (path, 0.8, 0.5, "all")
-        """
-        if not lora_text or not lora_text.strip():
-            return []
-
-        entries = []
-        for line in lora_text.strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            name = line
-            model_str = 1.0
-            clip_str = 1.0
-
-            # Try 3-part split: path:model_str:clip_str
-            parts = line.rsplit(":", 2)
-            if len(parts) == 3:
-                try:
-                    clip_str = float(parts[2])
-                    model_str = float(parts[1])
-                    name = parts[0].strip()
-                except ValueError:
-                    pass
-
-            # Try 2-part split: path:strength (only if 3-part didn't match)
-            if name == line:
-                parts = line.rsplit(":", 1)
-                if len(parts) == 2:
-                    try:
-                        strength = float(parts[1])
-                        model_str = strength
-                        clip_str = strength
-                        name = parts[0].strip()
-                    except ValueError:
-                        pass
-
-            resolved = LoRAStackDynamic._resolve_lora_name(name)
-            if resolved:
-                entries.append((resolved, model_str, clip_str, "all"))
-
-        return entries
-
-    def build_stack(self, mode, lora_count, lora_text="", lora_stack=None, base_model_filter=None, **kwargs):
+    def build_stack(self, mode, lora_count, lora_stack=None, base_model_filter=None, **kwargs):
         loras = []
-        # 1. COMBO entries (slots 1-N)
         for i in range(1, lora_count + 1):
             name = kwargs.get(f"lora_name_{i}", "None")
             if name == "None":
                 continue
+            # Resolve short names (e.g. "Milena_20260216180133") to full paths
+            resolved = self._resolve_lora_name(name)
+            if not resolved:
+                continue
             conflict_mode = kwargs.get(f"conflict_mode_{i}", "all")
             if mode == "simple":
                 wt = kwargs.get(f"strength_{i}", 1.0)
-                loras.append((name, wt, wt, conflict_mode))
+                loras.append((resolved, wt, wt, conflict_mode))
             else:
                 model_str = kwargs.get(f"model_strength_{i}", 1.0)
                 clip_str = kwargs.get(f"clip_strength_{i}", 1.0)
-                loras.append((name, model_str, clip_str, conflict_mode))
+                loras.append((resolved, model_str, clip_str, conflict_mode))
 
-        # 2. Text entries (from lora_text)
-        loras.extend(self._parse_lora_text(lora_text))
-
-        # 3. Chained lora_stack entries
+        # Chained lora_stack entries
         if lora_stack is not None:
             for l in lora_stack:
                 if isinstance(l, dict):
