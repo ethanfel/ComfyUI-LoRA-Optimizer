@@ -30,6 +30,32 @@ function findWidget(node, name) {
     return node.widgets ? node.widgets.find((w) => w.name === name) : null;
 }
 
+function interceptWidgetValue(widget, onChange) {
+    let widgetValue = widget.value;
+    const desc =
+        Object.getOwnPropertyDescriptor(widget, "value") ||
+        Object.getOwnPropertyDescriptor(
+            Object.getPrototypeOf(widget),
+            "value"
+        );
+
+    Object.defineProperty(widget, "value", {
+        configurable: true,
+        enumerable: true,
+        get() {
+            return desc?.get ? desc.get.call(widget) : widgetValue;
+        },
+        set(newVal) {
+            if (desc?.set) {
+                desc.set.call(widget, newVal);
+            } else {
+                widgetValue = newVal;
+            }
+            onChange(newVal);
+        },
+    });
+}
+
 function updateVisibility(node) {
     const modeWidget = findWidget(node, "mode");
     const countWidget = findWidget(node, "lora_count");
@@ -56,8 +82,9 @@ function updateVisibility(node) {
 
 // --- Base Model Filter (requires ComfyUI-Lora-Manager) ---
 
-const LM_BASE_MODELS_URL = "/api/lm/loras/base-models?limit=100";
 const LM_LORAS_LIST_URL = "/api/lm/loras/list";
+const LM_BASE_MODELS_URL = "/api/lm/loras/base-models?limit=100";
+const PAGE_SIZE = 100;
 
 async function fetchJson(url) {
     const resp = await fetch(url);
@@ -65,11 +92,51 @@ async function fetchJson(url) {
     return resp.json();
 }
 
+/**
+ * Fetch ALL LoRAs from the Lora Manager (paginating through the 100-per-page cap)
+ * and build a Map of relative_path -> base_model for local filtering.
+ */
+async function buildLoraBaseModelMap(fullLoraList) {
+    const map = new Map();
+    let page = 1;
+    let totalPages = 1;
+
+    do {
+        const params = new URLSearchParams({
+            page: String(page),
+            page_size: String(PAGE_SIZE),
+            sort_by: "name",
+        });
+        const data = await fetchJson(`${LM_LORAS_LIST_URL}?${params}`);
+        totalPages = data.total_pages || 1;
+
+        for (const item of data.items || []) {
+            if (!item.file_path || !item.base_model) continue;
+            const apiPath = item.file_path;
+            // Match API absolute path against ComfyUI's relative paths
+            for (const relPath of fullLoraList) {
+                if (relPath === "None") continue;
+                if (
+                    apiPath === relPath ||
+                    apiPath.endsWith("/" + relPath) ||
+                    apiPath.endsWith("\\" + relPath)
+                ) {
+                    map.set(relPath, item.base_model);
+                    break;
+                }
+            }
+        }
+        page++;
+    } while (page <= totalPages);
+
+    return map;
+}
+
 function setComboOptions(widget, options) {
     widget.options.values = options;
-    if (options.length > 0 && !options.includes(widget.value)) {
-        widget.value = options[0];
-    }
+    // Do NOT reset the selected value — preserve it even if not in the filtered list.
+    // ComfyUI COMBO widgets allow values not in the options list; they just can't be
+    // re-selected from the dropdown. This prevents silent data loss when switching filters.
 }
 
 async function initBaseModelFilter(node) {
@@ -79,13 +146,21 @@ async function initBaseModelFilter(node) {
     // Cache the full LoRA list from the first lora_name widget
     const firstLoraWidget = findWidget(node, "lora_name_1");
     if (!firstLoraWidget) return;
-    const fullLoraList = [...(firstLoraWidget.options.values || [])];
+    const loraValues = firstLoraWidget.options?.values;
+    if (!loraValues || loraValues.length <= 1) {
+        // Widget not yet populated, retry
+        setTimeout(() => initBaseModelFilter(node), 500);
+        return;
+    }
+    const fullLoraList = [...loraValues];
 
-    // Try to detect Lora Manager
+    // Try to detect Lora Manager and fetch base models
     let baseModels;
     try {
         const data = await fetchJson(LM_BASE_MODELS_URL);
-        baseModels = (data.base_models || []).map((m) => m.name).filter(Boolean);
+        baseModels = (data.base_models || [])
+            .map((m) => m.name)
+            .filter(Boolean);
     } catch {
         // Lora Manager not installed — hide filter widget
         toggleWidget(node, filterWidget, false);
@@ -99,52 +174,44 @@ async function initBaseModelFilter(node) {
         return;
     }
 
+    // Build the path → base_model map once (handles pagination)
+    let loraBaseModelMap;
+    try {
+        loraBaseModelMap = await buildLoraBaseModelMap(fullLoraList);
+    } catch {
+        toggleWidget(node, filterWidget, false);
+        updateVisibility(node);
+        return;
+    }
+
     // Populate filter dropdown
     const filterOptions = ["All", ...baseModels];
     setComboOptions(filterWidget, filterOptions);
 
-    // Intercept filter changes
-    let filterValue = filterWidget.value;
-    const desc =
-        Object.getOwnPropertyDescriptor(filterWidget, "value") ||
-        Object.getOwnPropertyDescriptor(
-            Object.getPrototypeOf(filterWidget),
-            "value"
-        );
+    // Apply current filter value (handles workflow restore)
+    if (filterWidget.value && filterWidget.value !== "All") {
+        applyLoraFilter(node, filterWidget.value, fullLoraList, loraBaseModelMap);
+    }
 
-    Object.defineProperty(filterWidget, "value", {
-        get() {
-            return desc?.get ? desc.get.call(filterWidget) : filterValue;
-        },
-        set(newVal) {
-            if (desc?.set) {
-                desc.set.call(filterWidget, newVal);
-            } else {
-                filterValue = newVal;
-            }
-            applyLoraFilter(node, newVal, fullLoraList);
-        },
+    // Intercept future filter changes
+    interceptWidgetValue(filterWidget, (newVal) => {
+        applyLoraFilter(node, newVal, fullLoraList, loraBaseModelMap);
     });
 }
 
-async function applyLoraFilter(node, baseModel, fullLoraList) {
+function applyLoraFilter(node, baseModel, fullLoraList, loraBaseModelMap) {
     const MAX = 10;
     let filteredList;
 
     if (baseModel === "All") {
         filteredList = fullLoraList;
     } else {
-        try {
-            const params = new URLSearchParams({
-                base_model: baseModel,
-                page_size: "10000",
-                sort_by: "name",
-            });
-            const data = await fetchJson(`${LM_LORAS_LIST_URL}?${params}`);
-            const paths = (data.items || []).map((item) => item.file_path).filter(Boolean);
-            // Keep "None" at the top, then filtered paths
-            filteredList = ["None", ...paths];
-        } catch {
+        filteredList = fullLoraList.filter(
+            (name) =>
+                name === "None" || loraBaseModelMap.get(name) === baseModel
+        );
+        // If nothing matched, fall back to full list
+        if (filteredList.length <= 1) {
             filteredList = fullLoraList;
         }
     }
@@ -167,37 +234,15 @@ app.registerExtension({
         // Intercept mode and lora_count changes to update visibility
         for (const w of node.widgets || []) {
             if (w.name !== "mode" && w.name !== "lora_count") continue;
-
-            let widgetValue = w.value;
-            const originalDescriptor =
-                Object.getOwnPropertyDescriptor(w, "value") ||
-                Object.getOwnPropertyDescriptor(
-                    Object.getPrototypeOf(w),
-                    "value"
-                );
-
-            Object.defineProperty(w, "value", {
-                get() {
-                    return originalDescriptor?.get
-                        ? originalDescriptor.get.call(w)
-                        : widgetValue;
-                },
-                set(newVal) {
-                    if (originalDescriptor?.set) {
-                        originalDescriptor.set.call(w, newVal);
-                    } else {
-                        widgetValue = newVal;
-                    }
-                    updateVisibility(node);
-                },
-            });
+            interceptWidgetValue(w, () => updateVisibility(node));
         }
 
         // Initial visibility update — delay to ensure widgets are fully initialized
-        setTimeout(() => updateVisibility(node), 100);
-
-        // Initialize base model filter (async, non-blocking)
-        setTimeout(() => initBaseModelFilter(node), 200);
+        setTimeout(() => {
+            updateVisibility(node);
+            // Initialize base model filter after visibility is set
+            initBaseModelFilter(node);
+        }, 100);
     },
 });
 

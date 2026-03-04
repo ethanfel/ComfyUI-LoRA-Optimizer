@@ -133,7 +133,7 @@ class LoRAStackDynamic:
     CATEGORY = "loaders/lora"
     DESCRIPTION = "Dynamic LoRA stacker with adjustable slot count and optional per-LoRA CLIP strength"
 
-    def build_stack(self, mode, lora_count, lora_stack=None, **kwargs):
+    def build_stack(self, mode, lora_count, lora_stack=None, base_model_filter=None, **kwargs):
         loras = []
         for i in range(1, lora_count + 1):
             name = kwargs.get(f"lora_name_{i}", "None")
