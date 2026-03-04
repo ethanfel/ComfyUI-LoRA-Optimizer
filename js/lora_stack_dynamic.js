@@ -64,8 +64,14 @@ function syncLoraValues(node, toText) {
         if (!combo || !text) continue;
 
         if (toText) {
-            // dropdown -> text: copy COMBO value
-            text.value = combo.value || "None";
+            // dropdown -> text: copy filename stem (without path/extension)
+            const val = combo.value || "None";
+            if (val === "None") {
+                text.value = "None";
+            } else {
+                const filename = val.split("/").pop() || val;
+                text.value = filename.replace(/\.[^.]+$/, "");
+            }
         } else {
             // text -> dropdown: try to match text against COMBO options
             const val = (text.value || "").trim();
