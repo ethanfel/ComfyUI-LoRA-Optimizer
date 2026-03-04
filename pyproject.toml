@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-lora-optimizer"
 description = "Auto-optimizer node for combining multiple LoRAs via diff-based merging with TIES conflict resolution"
-version = "1.0.7"
+version = "1.1.0"
 license = { file = "LICENSE" }
 dependencies = []
 
