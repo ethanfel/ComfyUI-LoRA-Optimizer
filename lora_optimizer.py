@@ -2747,9 +2747,11 @@ class LoRAOptimizer(_LoRAMergeBase):
                     for idx, (diff, weight) in enumerate(diffs_list):
                         cm = active_loras[diff_to_lora[idx]].get("conflict_mode", "all")
                         if cm == "low_conflict":
-                            diff = diff * ((diff * majority_sign) > 0).float()
+                            effective_diff = diff if weight >= 0 else -diff
+                            diff = diff * ((effective_diff * majority_sign) > 0).float()
                         elif cm == "high_conflict":
-                            diff = diff * ((diff * majority_sign) < 0).float()
+                            effective_diff = diff if weight >= 0 else -diff
+                            diff = diff * ((effective_diff * majority_sign) < 0).float()
                         masked_diffs.append((diff, weight))
                     diffs_list = masked_diffs
                     del sign_sum, majority_sign
