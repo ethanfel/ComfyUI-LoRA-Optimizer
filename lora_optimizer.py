@@ -2520,9 +2520,12 @@ class LoRAOptimizer(_LoRAMergeBase):
         del all_magnitude_samples
 
         # Apply merge strategy override from Conflict Editor
-        if merge_strategy_override and merge_strategy_override in ("ties", "weighted_average", "weighted_sum"):
-            mode = merge_strategy_override
-            reasoning.append(f"Merge mode overridden to '{mode}' by Conflict Editor")
+        if merge_strategy_override:
+            if merge_strategy_override in ("ties", "weighted_average", "weighted_sum"):
+                mode = merge_strategy_override
+                reasoning.append(f"Merge mode overridden to '{mode}' by Conflict Editor")
+            else:
+                logging.warning(f"[LoRA Optimizer] Invalid merge_strategy_override '{merge_strategy_override}' — ignoring")
 
         logging.info(f"[LoRA Optimizer] Decision: {mode} (conflict {avg_conflict_ratio:.1%} "
                      f"{'>' if avg_conflict_ratio > 0.25 else '<='} 25% threshold)")
