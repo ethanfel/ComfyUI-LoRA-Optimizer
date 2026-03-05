@@ -3996,6 +3996,14 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "default": "disabled",
                     "tooltip": "Makes LoRAs from different training tools compatible."
                 }),
+                "scoring_svd": (["disabled", "enabled"], {
+                    "default": "disabled",
+                    "tooltip": "Enable SVD-based effective rank scoring for candidates. More thorough but much slower on large models."
+                }),
+                "scoring_device": (["cpu", "gpu"], {
+                    "default": "gpu",
+                    "tooltip": "Device for scoring computations. GPU is much faster when SVD scoring is enabled."
+                }),
             },
         }
 
@@ -4011,7 +4019,8 @@ class LoRAAutoTuner(LoRAOptimizer):
     )
 
     def auto_tune(self, model, lora_stack, output_strength, clip=None,
-                  clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled"):
+                  clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
+                  scoring_svd="disabled", scoring_device="gpu"):
         import hashlib, json
 
         # --- Normalize & validate stack ---
@@ -4234,7 +4243,9 @@ class LoRAAutoTuner(LoRAOptimizer):
             # LoRAAdapter patches; _score_merge_result handles both formats)
             m_patches = lora_data["model_patches"] if lora_data else {}
             c_patches = lora_data["clip_patches"] if lora_data else {}
-            measured = _score_merge_result(m_patches, c_patches, compute_svd=False)
+            compute_svd = scoring_svd == "enabled"
+            score_dev = torch.device("cuda") if scoring_device == "gpu" and torch.cuda.is_available() else None
+            measured = _score_merge_result(m_patches, c_patches, compute_svd=compute_svd, score_device=score_dev)
 
             t_elapsed = time.time() - t_merge
             logging.info(f"[LoRA AutoTuner]   Candidate #{rank_idx + 1}: "
@@ -4348,8 +4359,10 @@ class LoRAAutoTuner(LoRAOptimizer):
 
     @classmethod
     def IS_CHANGED(cls, model, lora_stack, output_strength, clip=None,
-                   clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled"):
-        return (id(lora_stack), output_strength, clip_strength_multiplier, top_n, normalize_keys)
+                   clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
+                   scoring_svd="disabled", scoring_device="gpu"):
+        return (id(lora_stack), output_strength, clip_strength_multiplier, top_n,
+                normalize_keys, scoring_svd, scoring_device)
 
 
 class LoRAMergeSelector(LoRAOptimizer):
