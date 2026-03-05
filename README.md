@@ -58,6 +58,8 @@ Single node with adjustable slot count (1–10) — replaces chaining multiple S
 
 Accepts an optional `lora_stack` input to chain with other Stack nodes.
 
+**Key Filter:** Filter which weight keys get merged based on how many LoRAs share them. Useful for Wan T2V/I2V/VACE LoRA compatibility — see [Key Filter](#key-filter) below.
+
 **Outputs:** `LORA_STACK`
 
 ---
@@ -173,6 +175,34 @@ Three quality levels for merge conflict resolution, selectable via the `merge_qu
 | Setting | Default | Options |
 |---------|---------|---------|
 | `merge_quality` | standard | `standard`, `enhanced`, `maximum` |
+
+</details>
+
+<details>
+<summary><b>Key Filter</b></summary>
+
+<a name="key-filter"></a>
+
+Wan T2V, I2V, and VACE models share ~90% of weights, but each variant has unique keys (I2V: `cross_attn.k_img/v_img`, `img_emb`; VACE: `vace_blocks.*`, `vace_patch_embedding`). The `key_filter` dropdown on **LoRA Stack (Dynamic)** lets you filter keys by how many LoRAs in the stack share each key prefix:
+
+| Filter | Behavior | Use Case |
+|--------|----------|----------|
+| `all` (default) | Merge all keys from all LoRAs | Normal merging |
+| `shared_only` | Only merge keys present in 2+ LoRAs | Strip variant-specific keys (I2V/VACE) to make a LoRA T2V-compatible |
+| `unique_only` | Only merge keys present in exactly 1 LoRA | Extract only the variant-specific adapter keys |
+
+**Example — making an I2V LoRA T2V-compatible:**
+1. Stack a T2V LoRA + an I2V LoRA together
+2. Set `key_filter` to `shared_only`
+3. The I2V-only keys (`k_img`, `v_img`, `img_emb`, etc.) are automatically removed since they only appear in 1 LoRA
+4. The merged result contains only the shared T2V-compatible weights
+
+**Example — extracting a lightweight I2V adapter:**
+1. Same stack (T2V + I2V)
+2. Set `key_filter` to `unique_only`
+3. Only the I2V-specific keys remain — a small adapter with just the variant-specific weights
+
+The filter operates between Pass 1 (analysis) and Pass 2 (merge) using the existing `prefix_stats["n_loras"]` count — no extra analysis needed.
 
 </details>
 
