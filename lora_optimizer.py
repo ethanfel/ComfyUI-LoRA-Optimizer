@@ -3962,6 +3962,7 @@ class LoRAAutoTuner(LoRAOptimizer):
     RETURN_TYPES = ("MODEL", "CLIP", "STRING", "TUNER_DATA")
     RETURN_NAMES = ("model", "clip", "report", "tuner_data")
     FUNCTION = "auto_tune"
+    OUTPUT_NODE = True
     CATEGORY = "LoRA Optimizer"
     DESCRIPTION = (
         "Automatically sweeps all merge parameters and finds the best "
@@ -4341,6 +4342,7 @@ class LoRAMergeSelector(LoRAOptimizer):
     RETURN_TYPES = ("MODEL", "CLIP", "STRING")
     RETURN_NAMES = ("model", "clip", "report")
     FUNCTION = "select_merge"
+    OUTPUT_NODE = True
     CATEGORY = "LoRA Optimizer"
     DESCRIPTION = (
         "Applies a specific merge configuration from LoRA AutoTuner results. "
