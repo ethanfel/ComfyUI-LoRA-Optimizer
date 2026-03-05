@@ -911,6 +911,12 @@ class _LoRAMergeBase:
         self.loaded_loras[lora_name] = lora
         return lora
     
+    def _get_model_keys(self, model):
+        """Get LoRA prefix → target key mapping for the model."""
+        if model is None:
+            return {}
+        return comfy.lora.model_lora_keys_unet(model.model, {})
+
     def _get_lora_key_info(self, lora_dict, key_prefix):
         """
         Extracts LoRA information for the given key.
@@ -2895,9 +2901,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         t_start = time.time()
 
         # Get key maps
-        model_keys = {}
-        if model is not None:
-            model_keys = comfy.lora.model_lora_keys_unet(model.model, {})
+        model_keys = self._get_model_keys(model)
 
         clip_keys = {}
         if clip is not None:
@@ -3679,6 +3683,21 @@ class WanVideoLoRAOptimizer(LoRAOptimizer):
         "conflict-aware algorithms (TIES, DARE, auto-strength). "
         "Connect after WanVideoModelLoader, before WanVideoSampler."
     )
+
+    def _get_model_keys(self, model):
+        model_keys = super()._get_model_keys(model)
+        # WanVideo models have ._orig_mod. in state_dict keys from torch.compile.
+        # The core model_lora_keys_unet creates entries WITH _orig_mod, but LoRA
+        # files have prefixes WITHOUT it. Add stripped versions pointing to the
+        # original target keys so prefixes match.
+        augmented = {}
+        for prefix, target in model_keys.items():
+            if '._orig_mod.' in prefix or '._orig_mod' in prefix:
+                stripped = prefix.replace('._orig_mod.', '.').replace('._orig_mod', '')
+                if stripped not in model_keys:
+                    augmented[stripped] = target
+        model_keys.update(augmented)
+        return model_keys
 
     def optimize_merge(self, model, lora_stack, output_strength, **kwargs):
         kwargs.pop("clip", None)
