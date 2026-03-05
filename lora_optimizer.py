@@ -98,6 +98,13 @@ class LoRAStackDynamic:
                 }),
                 "lora_count": ("INT", {"default": 3, "min": 1, "max": cls.MAX_LORAS, "step": 1,
                                        "tooltip": "How many LoRA slots to show. Increase to add more LoRAs."}),
+                "key_filter": (["all", "shared_only", "unique_only"], {
+                    "default": "all",
+                    "tooltip": "Filter which keys to merge. "
+                               "'all': use all keys from all LoRAs (default). "
+                               "'shared_only': only merge keys present in 2+ LoRAs (strips variant-specific keys like I2V or VACE adapters). "
+                               "'unique_only': only merge keys present in exactly 1 LoRA (extracts variant-specific adapters)."
+                }),
             }
         }
         for i in range(1, cls.MAX_LORAS + 1):
@@ -193,8 +200,10 @@ class LoRAStackDynamic:
         logger.warning(f"LoRA name '{name}' not found in installed LoRAs, skipping")
         return None
 
-    def build_stack(self, strength_mode, input_mode, lora_count, lora_stack=None, base_model_filter=None, **kwargs):
+    def build_stack(self, strength_mode, input_mode, lora_count, key_filter="all", lora_stack=None, base_model_filter=None, **kwargs):
         loras = []
+        if key_filter != "all":
+            loras.append({"__key_filter__": key_filter})
         use_text = input_mode == "text"
         for i in range(1, lora_count + 1):
             if use_text:
@@ -1896,21 +1905,29 @@ class LoRAOptimizer(_LoRAMergeBase):
         when nothing changed.
         """
         h = hashlib.sha256()
+        # Extract key_filter metadata and filter it from stack entries
+        key_filter = "all"
         if lora_stack:
-            first = lora_stack[0] if len(lora_stack) > 0 else None
+            filtered_stack = []
+            for item in lora_stack:
+                if isinstance(item, dict) and "__key_filter__" in item:
+                    key_filter = item["__key_filter__"]
+                else:
+                    filtered_stack.append(item)
+            first = filtered_stack[0] if len(filtered_stack) > 0 else None
             entries = []
             if isinstance(first, (tuple, list)):
-                for entry in lora_stack:
+                for entry in filtered_stack:
                     cm = entry[3] if len(entry) > 3 else "all"
                     cs = float(entry[2]) if entry[2] is not None else -1.0
                     entries.append((str(entry[0]), float(entry[1]), cs, cm))
             elif isinstance(first, dict):
-                for item in lora_stack:
+                for item in filtered_stack:
                     cm = item.get("conflict_mode", "all")
                     entries.append((str(item.get("name", "")), float(item.get("strength", 0)), cm))
             entries.sort()
             h.update(json.dumps(entries).encode())
-        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}|cp={compress_patches}|sd={svd_device}|nk={normalize_keys}|sp={sparsification}|spd={sparsification_density}|mso={merge_strategy_override}|mq={merge_quality}".encode())
+        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}|cp={compress_patches}|sd={svd_device}|nk={normalize_keys}|sp={sparsification}|spd={sparsification_density}|mso={merge_strategy_override}|mq={merge_quality}|kf={key_filter}".encode())
         return h.hexdigest()[:16]
 
     @classmethod
@@ -2438,7 +2455,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                       auto_strength_info=None, strategy_counts=None, optimization_mode="global",
                       prefix_decisions=None, detected_arch=None, normalize_keys="disabled",
                       sparsification="disabled", sparsification_density=0.7,
-                      merge_quality="standard"):
+                      merge_quality="standard", key_filter="all"):
         """Format analysis as a multi-line report string."""
         lines = []
         lines.append("=" * 50)
@@ -2457,6 +2474,10 @@ class LoRAOptimizer(_LoRAMergeBase):
             }
             lines.append(f"Architecture: {arch_names.get(detected_arch, detected_arch)} (auto-detected)")
             lines.append(f"Key normalization: enabled")
+            lines.append("")
+
+        if key_filter != "all":
+            lines.append(f"  Key filter: {key_filter}")
             lines.append("")
 
         # Per-LoRA Analysis
@@ -2652,6 +2673,13 @@ class LoRAOptimizer(_LoRAMergeBase):
         if not lora_stack or len(lora_stack) == 0:
             return (model, clip, "No LoRAs in stack.", None)
 
+        # Extract key_filter metadata from stack (embedded by LoRAStackDynamic)
+        key_filter = "all"
+        for item in lora_stack:
+            if isinstance(item, dict) and "__key_filter__" in item:
+                key_filter = item["__key_filter__"]
+        lora_stack = [item for item in lora_stack if not (isinstance(item, dict) and "__key_filter__" in item)]
+
         normalized_stack = self._normalize_stack(lora_stack, normalize_keys=normalize_keys)
         active_loras = [item for item in normalized_stack if item["strength"] != 0]
 
@@ -2843,6 +2871,22 @@ class LoRAOptimizer(_LoRAMergeBase):
             logging.info(f"[LoRA Optimizer]   {stat['name']} ({i+1}/{len(active_loras)}): "
                          f"{stat['key_count']} keys, avg rank {avg_r:.0f}")
         logging.info(f"[LoRA Optimizer]   Total: {prefix_count} prefixes ({time.time() - t_pass1:.1f}s)")
+
+        # Apply key_filter from LoRA Stack
+        if key_filter == "shared_only":
+            filtered = {p for p in all_key_targets if prefix_stats.get(p, {}).get("n_loras", 0) >= 2}
+            removed = len(all_key_targets) - len(filtered)
+            if removed > 0:
+                all_key_targets = {p: all_key_targets[p] for p in filtered}
+                logging.info(f"[LoRA Optimizer] key_filter=shared_only: kept {len(filtered)} shared prefixes, removed {removed} unique prefixes")
+            if len(filtered) == 0:
+                logging.warning("[LoRA Optimizer] key_filter=shared_only removed ALL prefixes (no keys shared by 2+ LoRAs)")
+        elif key_filter == "unique_only":
+            filtered = {p for p in all_key_targets if prefix_stats.get(p, {}).get("n_loras", 0) == 1}
+            removed = len(all_key_targets) - len(filtered)
+            if removed > 0:
+                all_key_targets = {p: all_key_targets[p] for p in filtered}
+                logging.info(f"[LoRA Optimizer] key_filter=unique_only: kept {len(filtered)} unique prefixes, removed {removed} shared prefixes")
 
         # =====================================================================
         # Decision — finalize stats, auto-select params (scalars only)
@@ -3318,6 +3362,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             sparsification=sparsification,
             sparsification_density=sparsification_density,
             merge_quality=merge_quality,
+            key_filter=key_filter,
         )
 
         # Bundle LORA_DATA for optional downstream saving
