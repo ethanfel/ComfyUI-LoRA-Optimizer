@@ -1165,9 +1165,9 @@ class _LoRAMergeBase:
         """Estimate total bytes used by patch tensors in an add_patches-style dict."""
         total = 0
         for v in patches_dict.values():
-            # LoRAAdapter: namedtuple wrapping (set, (mat_up, mat_down, alpha, ...))
+            # LoRAAdapter: .weights = (mat_up, mat_down, alpha, ...)
             # diff patch:  ("diff", (tensor,))
-            data = v.data if hasattr(v, 'data') else v
+            data = v.weights if hasattr(v, 'weights') else v
             if isinstance(data, (tuple, list)):
                 for item in data:
                     if isinstance(item, torch.Tensor):
@@ -1177,6 +1177,41 @@ class _LoRAMergeBase:
                             if isinstance(sub, torch.Tensor):
                                 total += sub.nelement() * sub.element_size()
         return total
+
+    @staticmethod
+    def _estimate_single_patch_bytes(patch):
+        """Estimate byte size of a single patch entry (diff tuple or LoRAAdapter)."""
+        total = 0
+        data = patch.weights if hasattr(patch, 'weights') else patch
+        if isinstance(data, (tuple, list)):
+            for item in data:
+                if isinstance(item, torch.Tensor):
+                    total += item.nelement() * item.element_size()
+                elif isinstance(item, (tuple, list)):
+                    for sub in item:
+                        if isinstance(sub, torch.Tensor):
+                            total += sub.nelement() * sub.element_size()
+        return total
+
+    @staticmethod
+    def _move_patch_to_device(patch, device):
+        """Move all tensors in a patch to the given device. Returns new patch."""
+        if hasattr(patch, 'weights'):
+            # LoRAAdapter: .loaded_keys = set, .weights = (mat_up, mat_down, alpha, ...)
+            inner = patch.weights
+            moved = tuple(
+                t.to(device) if isinstance(t, torch.Tensor) else t
+                for t in inner
+            )
+            return LoRAAdapter(patch.loaded_keys, moved)
+        elif isinstance(patch, tuple) and len(patch) == 2 and isinstance(patch[0], str):
+            # ("diff", (tensor,))
+            moved_inner = tuple(
+                t.to(device) if isinstance(t, torch.Tensor) else t
+                for t in patch[1]
+            )
+            return (patch[0], moved_inner)
+        return patch
 
     @staticmethod
     def _update_model_size(patcher, patches_dict):
@@ -1505,11 +1540,12 @@ class _LoRAMergeBase:
     def _merge_diffs(self, diffs_with_weights, mode, density=0.5, majority_sign_method="frequency",
                      compute_device=None, sparsification="disabled",
                      sparsification_density=0.7, sparsification_generator=None,
-                     merge_quality="standard", dare_dampening=0.0):
+                     merge_quality="standard", dare_dampening=0.0,
+                     keep_on_gpu=False):
         """
         Merges a list of diffs with their weights.
         When compute_device is given, tensors are moved there for faster ops,
-        then the result is returned on CPU.
+        then the result is returned on CPU (unless keep_on_gpu=True).
         """
         if len(diffs_with_weights) == 0:
             return None
@@ -1517,7 +1553,7 @@ class _LoRAMergeBase:
         if len(diffs_with_weights) == 1:
             diff, weight = diffs_with_weights[0]
             result = diff * weight
-            if compute_device is not None and compute_device.type != "cpu" and result.is_cuda:
+            if compute_device is not None and compute_device.type != "cpu" and result.is_cuda and not keep_on_gpu:
                 return result.cpu()
             return result
 
@@ -1525,7 +1561,8 @@ class _LoRAMergeBase:
         ref_diff = diffs_with_weights[0][0]
         dtype = ref_diff.dtype
         dev = compute_device if compute_device is not None else ref_diff.device
-        to_cpu = compute_device is not None and compute_device.type != "cpu"
+        to_cpu = (compute_device is not None and compute_device.type != "cpu"
+                  and not keep_on_gpu)
 
         # DARE/DELLA preprocessing for non-TIES modes
         # (TIES replaces its trim step instead — handled in the ties branch)
@@ -2320,6 +2357,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "default": "disabled",
                     "tooltip": "Frees GPU memory between processing steps. Enable if you're running out of VRAM. Barely affects speed."
                 }),
+                "vram_budget": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Fraction of free VRAM to use for storing merged patches. 0 = all CPU (default), 1.0 = use all free VRAM. Reduces RAM usage on GPU systems."
+                }),
                 "optimization_mode": (["per_prefix", "global", "weighted_sum_only"], {
                     "default": "per_prefix",
                     "tooltip": "How the optimizer decides to combine LoRAs. 'per_prefix' (recommended): automatically picks the best method for each layer. 'global': uses one method everywhere. 'weighted_sum_only': simple addition, no TIES trimming — use this if your stack includes edit, distillation, or DPO LoRAs whose weights must be preserved exactly."
@@ -2425,7 +2466,8 @@ class LoRAOptimizer(_LoRAMergeBase):
     @classmethod
     def IS_CHANGED(cls, model, lora_stack, output_strength, clip=None,
                    clip_strength_multiplier=1.0, auto_strength="disabled",
-                   free_vram_between_passes="disabled", optimization_mode="per_prefix",
+                   free_vram_between_passes="disabled", vram_budget=0.0,
+                   optimization_mode="per_prefix",
                    cache_patches="enabled", compress_patches="non_ties",
                    svd_device="gpu", normalize_keys="disabled",
                    sparsification="disabled", sparsification_density=0.7,
@@ -3227,7 +3269,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         lines.append("=" * 50)
         return "\n".join(lines)
 
-    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", free_vram_between_passes="disabled", optimization_mode="per_prefix", cache_patches="enabled", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_quality="standard", behavior_profile="v1.2", architecture_preset="auto", _analysis_cache=None, _skip_report=False):
+    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_quality="standard", behavior_profile="v1.2", architecture_preset="auto", _analysis_cache=None, _skip_report=False):
         """
         Main entry point. Two-pass streaming architecture:
         Pass 1: Compute diffs per-prefix, sample conflicts + magnitudes, discard diffs
@@ -3617,8 +3659,21 @@ class LoRAOptimizer(_LoRAMergeBase):
         strategy_counts = {"weighted_sum": 0, "weighted_average": 0, "slerp": 0, "ties": 0, "consensus": 0}
         prefix_decisions = []  # list of (prefix, mode, conflict_ratio, n_loras) for block map
 
+        # VRAM budget for patch storage
+        vram_budget_bytes = 0
+        gpu_patch_bytes = 0
+        if vram_budget > 0 and use_gpu:
+            free_vram = comfy.model_management.get_free_memory(compute_device)
+            safety_margin = 256 * 1024 * 1024  # 256MB headroom
+            usable = max(0, free_vram - safety_margin)
+            vram_budget_bytes = int(usable * vram_budget)
+            logging.info(f"[LoRA Optimizer] VRAM patch budget: {vram_budget_bytes // (1024**2)}MB "
+                         f"({vram_budget*100:.0f}% of {usable // (1024**2)}MB free)")
+
         def _merge_one_prefix(lora_prefix, target_key, is_clip_key):
             """Recompute diffs for one prefix, merge, return patch or None."""
+            nonlocal gpu_patch_bytes
+            should_keep = vram_budget_bytes > 0 and gpu_patch_bytes < vram_budget_bytes
             offset = None
             if isinstance(target_key, tuple):
                 actual_key = target_key[0]
@@ -3701,6 +3756,11 @@ class LoRAOptimizer(_LoRAMergeBase):
                     # Bake eff_strength into alpha so ComfyUI applies it correctly
                     alpha_scaled = alpha * eff_strength
                     patch = LoRAAdapter(set(), (mat_up, mat_down, alpha_scaled, mid, None, None))
+                    if should_keep:
+                        p_bytes = self._estimate_single_patch_bytes(patch)
+                        if gpu_patch_bytes + p_bytes <= vram_budget_bytes:
+                            patch = self._move_patch_to_device(patch, compute_device)
+                            gpu_patch_bytes += p_bytes
                     return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), False, 0.0, 0.0)
                 return None
 
@@ -3836,6 +3896,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 sparsification_generator=sp_gen,
                 merge_quality=merge_quality,
                 dare_dampening=dare_dampening,
+                keep_on_gpu=should_keep,
             )
             merged_norm = merged_diff.float().norm().item() if merged_diff is not None else 0.0
             diffs_list.clear()  # Free input diffs from GPU
@@ -3856,6 +3917,13 @@ class LoRAOptimizer(_LoRAMergeBase):
             else:
                 patch = ("diff", (merged_diff,))
                 is_compressed = False
+            if should_keep:
+                p_bytes = self._estimate_single_patch_bytes(patch)
+                if gpu_patch_bytes + p_bytes <= vram_budget_bytes:
+                    patch = self._move_patch_to_device(patch, compute_device)
+                    gpu_patch_bytes += p_bytes
+                else:
+                    patch = self._move_patch_to_device(patch, torch.device("cpu"))
             return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), is_compressed, input_norms_mean, merged_norm)
 
         lowrank_count = 0
@@ -3914,6 +3982,26 @@ class LoRAOptimizer(_LoRAMergeBase):
             logging.info(f"[LoRA Optimizer]   SVD-compressed: {compressed_count} patches "
                          f"(rank {compress_rank}), passthrough: {passthrough_count}, "
                          f"full-rank: {fullrank_count}")
+        if vram_budget_bytes > 0:
+            gpu_count = 0
+            cpu_count = 0
+            for p in list(model_patches.values()) + list(clip_patches.values()):
+                data = p.weights if hasattr(p, 'weights') else p
+                if isinstance(data, (tuple, list)):
+                    for item in data:
+                        if isinstance(item, torch.Tensor):
+                            gpu_count += 1 if item.is_cuda else 0
+                            cpu_count += 1 if not item.is_cuda else 0
+                            break
+                        elif isinstance(item, (tuple, list)):
+                            for sub in item:
+                                if isinstance(sub, torch.Tensor):
+                                    gpu_count += 1 if sub.is_cuda else 0
+                                    cpu_count += 1 if not sub.is_cuda else 0
+                                    break
+                            break
+            logging.info(f"[LoRA Optimizer]   VRAM budget: {gpu_count} patches on GPU "
+                         f"({gpu_patch_bytes // (1024**2)}MB), {cpu_count} on CPU")
 
         suggested_max_strength = None
         if total_merged_energy > 0 and total_input_energy > 0:
@@ -4065,6 +4153,7 @@ class LoRAOptimizerSimple(LoRAOptimizer):
     _SIMPLE_DEFAULTS = dict(
         auto_strength="enabled",
         free_vram_between_passes="disabled",
+        vram_budget=0.0,
         optimization_mode="per_prefix",
         cache_patches="enabled",
         compress_patches="non_ties",
@@ -4185,7 +4274,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 model, lora_stack, output_strength,
                 clip=clip, clip_strength_multiplier=clip_strength_multiplier,
                 normalize_keys=normalize_keys, behavior_profile="v1.2",
-                architecture_preset=architecture_preset,
+                architecture_preset=architecture_preset, vram_budget=0.0,
             )
             return (merged_model, merged_clip,
                     "Single LoRA detected -- no parameters to tune.\n\n" + report, None, lora_data)
@@ -4397,6 +4486,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 merge_quality=config["merge_quality"],
                 merge_strategy_override=config["merge_mode"],
                 free_vram_between_passes="disabled",
+                vram_budget=0.0,
                 cache_patches="disabled",
                 compress_patches="disabled",
                 svd_device="gpu",
@@ -4674,6 +4764,10 @@ class LoRAMergeSelector(LoRAOptimizer):
                     "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
                     "tooltip": "Multiplier for CLIP LoRA strengths."
                 }),
+                "vram_budget": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Fraction of free VRAM to use for storing merged patches. 0 = all CPU (default), 1.0 = use all free VRAM. Reduces RAM usage on GPU systems."
+                }),
             },
         }
 
@@ -4688,7 +4782,8 @@ class LoRAMergeSelector(LoRAOptimizer):
     )
 
     def select_merge(self, model, lora_stack, tuner_data, selection,
-                     output_strength, clip=None, clip_strength_multiplier=1.0):
+                     output_strength, clip=None, clip_strength_multiplier=1.0,
+                     vram_budget=0.0):
         import hashlib, json
 
         if tuner_data is None or "top_n" not in tuner_data:
@@ -4730,6 +4825,7 @@ class LoRAMergeSelector(LoRAOptimizer):
             merge_quality=config["merge_quality"],
             merge_strategy_override=config["merge_mode"],
             free_vram_between_passes="disabled",
+            vram_budget=vram_budget,
             cache_patches="enabled",
             compress_patches="non_ties",
             svd_device="gpu",
@@ -4755,7 +4851,8 @@ class LoRAMergeSelector(LoRAOptimizer):
 
     @classmethod
     def IS_CHANGED(cls, model, lora_stack, tuner_data, selection,
-                   output_strength, clip=None, clip_strength_multiplier=1.0):
+                   output_strength, clip=None, clip_strength_multiplier=1.0,
+                   vram_budget=0.0):
         return (id(tuner_data), selection, output_strength, clip_strength_multiplier)
 
 
