@@ -4141,6 +4141,10 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "default": "auto",
                     "tooltip": "Architecture-aware threshold tuning. 'auto' detects from LoRA keys."
                 }),
+                "record_dataset": (["disabled", "enabled"], {
+                    "default": "disabled",
+                    "tooltip": "Record analysis metrics and scored configs to a JSONL dataset file for threshold tuning research. Saved to lora_optimizer_reports/autotuner_dataset.jsonl."
+                }),
             },
         }
 
@@ -4158,7 +4162,7 @@ class LoRAAutoTuner(LoRAOptimizer):
     def auto_tune(self, model, lora_stack, output_strength, clip=None,
                   clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
                   scoring_svd="disabled", scoring_device="gpu",
-                  architecture_preset="auto"):
+                  architecture_preset="auto", record_dataset="disabled"):
         import hashlib, json
 
         # --- Normalize & validate stack ---
@@ -4466,11 +4470,81 @@ class LoRAAutoTuner(LoRAOptimizer):
             } for r in results],
         }
 
+        # Save dataset entry for threshold tuning (opt-in)
+        if record_dataset == "enabled":
+            self._save_tuner_dataset_entry(
+                tuner_data, active_loras, prefix_stats,
+                getattr(self, '_detected_arch', None))
+
         # Build report
         report = self._build_autotuner_report(
             results, tuner_data["analysis_summary"], output_strength)
 
         return (best["merged_model"], best["merged_clip"], report, tuner_data)
+
+    def _save_tuner_dataset_entry(self, tuner_data, active_loras, prefix_stats,
+                                  detected_arch):
+        """
+        Append one JSONL entry to the AutoTuner dataset for threshold tuning.
+        Each entry records: analysis metrics, per-prefix stats distribution,
+        detected architecture, all scored configs with measured quality.
+        Failures are silently logged — never blocks the merge.
+        """
+        try:
+            user_dir = folder_paths.get_user_directory()
+            dataset_dir = os.path.join(user_dir, "lora_optimizer_reports")
+            os.makedirs(dataset_dir, exist_ok=True)
+            dataset_path = os.path.join(dataset_dir, "autotuner_dataset.jsonl")
+
+            # Summarize per-prefix conflict/cosine distributions
+            conflict_ratios = []
+            cos_sims = []
+            mag_ratios = []
+            for pf in prefix_stats.values():
+                if pf.get("n_loras", 0) > 1:
+                    conflict_ratios.append(pf["conflict_ratio"])
+                    cos_sims.append(pf.get("avg_cos_sim", 0.0))
+                    mag_ratios.append(pf.get("magnitude_ratio", 1.0))
+
+            entry = {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "detected_arch": detected_arch,
+                "architecture_preset": tuner_data.get("architecture_preset", "auto"),
+                "lora_hash": tuner_data.get("lora_hash", ""),
+                "lora_names": [l["name"] for l in active_loras],
+                "analysis": tuner_data["analysis_summary"],
+                "prefix_distributions": {
+                    "conflict_ratios": {
+                        "min": min(conflict_ratios) if conflict_ratios else 0,
+                        "max": max(conflict_ratios) if conflict_ratios else 0,
+                        "mean": sum(conflict_ratios) / len(conflict_ratios) if conflict_ratios else 0,
+                        "std": (sum((x - sum(conflict_ratios) / len(conflict_ratios)) ** 2
+                                    for x in conflict_ratios) / len(conflict_ratios)) ** 0.5
+                               if len(conflict_ratios) > 1 else 0,
+                        "n": len(conflict_ratios),
+                    },
+                    "cos_sims": {
+                        "min": min(cos_sims) if cos_sims else 0,
+                        "max": max(cos_sims) if cos_sims else 0,
+                        "mean": sum(cos_sims) / len(cos_sims) if cos_sims else 0,
+                        "n": len(cos_sims),
+                    },
+                    "mag_ratios": {
+                        "min": min(mag_ratios) if mag_ratios else 1,
+                        "max": max(mag_ratios) if mag_ratios else 1,
+                        "mean": sum(mag_ratios) / len(mag_ratios) if mag_ratios else 1,
+                        "n": len(mag_ratios),
+                    },
+                },
+                "top_n": tuner_data["top_n"],
+            }
+
+            with open(dataset_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+
+            logging.info(f"[LoRA AutoTuner] Dataset entry saved to: {dataset_path}")
+        except Exception as e:
+            logging.warning(f"[LoRA AutoTuner] Failed to save dataset entry: {e}")
 
     def _build_autotuner_report(self, results, analysis_summary, output_strength):
         """Build the ranked report for AutoTuner results."""
@@ -4523,7 +4597,7 @@ class LoRAAutoTuner(LoRAOptimizer):
     def IS_CHANGED(cls, model, lora_stack, output_strength, clip=None,
                    clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
                    scoring_svd="disabled", scoring_device="gpu",
-                   architecture_preset="auto"):
+                   architecture_preset="auto", record_dataset="disabled"):
         return (id(lora_stack), output_strength, clip_strength_multiplier, top_n,
                 normalize_keys, scoring_svd, scoring_device, architecture_preset)
 
