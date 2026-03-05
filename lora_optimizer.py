@@ -3707,6 +3707,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             # FULL-RANK PATH: compute diffs on GPU, merge
             diffs_list = []
             diff_to_lora = []  # maps diffs_list index -> active_loras index
+            storage_dtype = None  # native weight dtype before float32 upcast
             raw_n = prefix_stats.get(lora_prefix, {}).get("n_loras", 0)
             for i, item in enumerate(active_loras):
                 lora_info = self._get_lora_key_info(item["lora"], lora_prefix)
@@ -3720,6 +3721,8 @@ class LoRAOptimizer(_LoRAMergeBase):
 
                 mat_up, mat_down, alpha, mid = lora_info
                 rank = mat_down.shape[0]
+                if storage_dtype is None:
+                    storage_dtype = mat_up.dtype
 
                 if use_gpu:
                     mat_up = mat_up.to(compute_device)
@@ -3842,6 +3845,10 @@ class LoRAOptimizer(_LoRAMergeBase):
             # non_ties: skip compression on TIES prefixes (lossy); all: compress everything
             should_compress = (compress_rank > 0 and
                                (compress_patches == "all" or pf_mode != "ties"))
+            # Downcast from float32 to native weight dtype (e.g. fp16/bf16)
+            # to halve memory — ComfyUI handles dtype conversion when applying
+            if storage_dtype is not None and merged_diff.dtype != storage_dtype:
+                merged_diff = merged_diff.to(storage_dtype)
             if should_compress:
                 patch = self._compress_to_lowrank(merged_diff, compress_rank, svd_device=resolved_svd_device)
                 del merged_diff
@@ -4495,7 +4502,19 @@ class LoRAAutoTuner(LoRAOptimizer):
         report = self._build_autotuner_report(
             results, tuner_data["analysis_summary"], output_strength)
 
-        return (best["merged_model"], best["merged_clip"], report, tuner_data)
+        # Extract return values, then free heavy intermediates
+        ret_model = best["merged_model"]
+        ret_clip = best["merged_clip"]
+        for r in results:
+            r.pop("merged_model", None)
+            r.pop("merged_clip", None)
+            r.pop("lora_data", None)
+        del results, best, best_model, best_clip, best_lora_data, active_loras
+        gc.collect()
+        if use_gpu:
+            torch.cuda.empty_cache()
+
+        return (ret_model, ret_clip, report, tuner_data)
 
     def _save_tuner_dataset_entry(self, tuner_data, active_loras, prefix_stats,
                                   detected_arch):
