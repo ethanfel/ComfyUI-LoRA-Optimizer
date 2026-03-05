@@ -2840,6 +2840,11 @@ class LoRAOptimizer(_LoRAMergeBase):
             lines.append(f"  Skipped keys: {merge_summary['skipped_keys']} (shape mismatch, e.g. sliced weights)")
         lines.append(f"  Output strength: {merge_summary['output_strength']}")
         lines.append(f"  CLIP strength: {merge_summary['clip_strength']}")
+        if merge_summary.get('suggested_max_strength') is not None:
+            sms = merge_summary['suggested_max_strength']
+            lines.append(f"  Suggested max output_strength: {sms:.2f}")
+            if sms >= 3.0:
+                lines.append(f"    (capped at 3.0 — actual headroom may be higher)")
 
         lines.append("")
         lines.append("=" * 50)
@@ -3298,7 +3303,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     # Bake eff_strength into alpha so ComfyUI applies it correctly
                     alpha_scaled = alpha * eff_strength
                     patch = LoRAAdapter(set(), (mat_up, mat_down, alpha_scaled, mid, None, None))
-                    return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), False)
+                    return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), False, 0.0, 0.0)
                 return None
 
             # FULL-RANK PATH: compute diffs on GPU, merge
@@ -3418,6 +3423,9 @@ class LoRAOptimizer(_LoRAMergeBase):
                 sp_gen = torch.Generator(device=gen_device)
                 sp_gen.manual_seed(seed)
 
+            input_norms_mean = (sum(d.float().norm().item() * abs(w) for d, w in diffs_list)
+                                / len(diffs_list)) if diffs_list else 0.0
+
             merged_diff = self._merge_diffs(
                 diffs_list, pf_mode,
                 density=pf_density, majority_sign_method=pf_sign,
@@ -3428,6 +3436,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 merge_quality=merge_quality,
                 dare_dampening=dare_dampening,
             )
+            merged_norm = merged_diff.float().norm().item() if merged_diff is not None else 0.0
             diffs_list.clear()  # Free input diffs from GPU
             if merged_diff is None:
                 return None
@@ -3442,15 +3451,20 @@ class LoRAOptimizer(_LoRAMergeBase):
             else:
                 patch = ("diff", (merged_diff,))
                 is_compressed = False
-            return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), is_compressed)
+            return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), is_compressed, input_norms_mean, merged_norm)
 
         lowrank_count = 0
+        total_input_energy = 0.0
+        total_merged_energy = 0.0
 
         def _collect_merge_result(result):
             nonlocal processed_keys, lowrank_count, compressed_count
+            nonlocal total_input_energy, total_merged_energy
             if result is None:
                 return
-            target_key, is_clip_key, patch, used_mode, prefix, conflict, n_loras, is_compressed = result
+            target_key, is_clip_key, patch, used_mode, prefix, conflict, n_loras, is_compressed, inp_norm, mrg_norm = result
+            total_input_energy += inp_norm
+            total_merged_energy += mrg_norm
             if is_clip_key:
                 clip_patches[target_key] = patch
             else:
@@ -3495,6 +3509,12 @@ class LoRAOptimizer(_LoRAMergeBase):
             logging.info(f"[LoRA Optimizer]   SVD-compressed: {compressed_count} patches "
                          f"(rank {compress_rank}), passthrough: {passthrough_count}, "
                          f"full-rank: {fullrank_count}")
+
+        suggested_max_strength = None
+        if total_merged_energy > 0 and total_input_energy > 0:
+            norm_ratio = total_merged_energy / total_input_energy
+            if norm_ratio < 1.0:
+                suggested_max_strength = min(1.0 / norm_ratio, 3.0)
 
         # Free analysis data no longer needed
         prefix_stats.clear()
@@ -3545,6 +3565,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             "skipped_keys": skipped_keys,
             "output_strength": output_strength,
             "clip_strength": clip_strength_out,
+            "suggested_max_strength": suggested_max_strength,
         }
 
         report = self._build_report(
