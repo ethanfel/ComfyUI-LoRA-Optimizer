@@ -5010,7 +5010,7 @@ class SaveMergedLoRA:
             save_dir = folder_paths.get_folder_paths("loras")[0]
             base = filename if filename.endswith('.safetensors') else f"{filename}.safetensors"
             save_path = os.path.join(save_dir, base)
-        os.makedirs(save_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
         model_patches = lora_data["model_patches"]
         clip_patches = lora_data["clip_patches"]
