@@ -2224,14 +2224,17 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True, score_dev
                 gram_down = torch.mm(down_flat, down_flat.T)
                 fro_norm = (torch.trace(gram_up @ gram_down).clamp(min=0) ** 0.5 * abs(scale)).item()
                 norms.append(fro_norm)
-                # Sparsity from factors: fraction of near-zero row norms in each factor
-                up_row_norms = up_flat.norm(dim=1)
-                down_row_norms = down_flat.norm(dim=1)
-                all_norms = torch.cat([up_row_norms, down_row_norms])
-                threshold = all_norms.max().item() * 0.01
+                # Estimate element-wise sparsity by sampling columns of the product
+                n_cols = down_flat.shape[1]
+                sample_k = min(64, n_cols)
+                col_idx = torch.randperm(n_cols, device=down_flat.device)[:sample_k]
+                sampled = torch.mm(up_flat, down_flat[:, col_idx]) * scale
+                max_val = sampled.abs().max().item()
+                threshold = max_val * 0.01
                 if threshold > 0:
-                    sparsity = (all_norms < threshold).float().mean().item()
+                    sparsity = (sampled.abs() < threshold).float().mean().item()
                     sparsities.append(sparsity)
+                del sampled
             continue
         else:
             continue
