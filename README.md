@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="LoRA Optimizer" width="100%">
+  <a href="assets/banner.png"><img src="assets/banner.svg" alt="LoRA Optimizer" width="100%"></a>
 </p>
 
 <p align="center">
@@ -74,7 +74,7 @@ Uses a **two-pass streaming architecture** for low memory usage:
 
 Peak memory is ~one prefix at a time (~260MB) regardless of LoRA count or model size. GPU-accelerated on both passes.
 
-<p align="center"><img src="assets/optimizer-pipeline.svg" alt="Optimizer Pipeline" width="100%"></p>
+<p align="center"><a href="assets/optimizer-pipeline.png"><img src="assets/optimizer-pipeline.svg" alt="Optimizer Pipeline" width="100%"></a></p>
 
 <details>
 <summary><b>What It Analyzes</b></summary>
@@ -107,14 +107,14 @@ Instead of picking one global strategy (which either wastes TIES trimming on non
 
 This means non-overlapping regions keep 100% of their LoRA's effect, while genuinely conflicting regions get proper TIES resolution.
 
-<p align="center"><img src="assets/merge-strategies.svg" alt="Merge Strategies Comparison" width="100%"></p>
+<p align="center"><a href="assets/merge-strategies.png"><img src="assets/merge-strategies.svg" alt="Merge Strategies Comparison" width="100%"></a></p>
 
 <details>
 <summary><b>TIES Merging</b></summary>
 
 The optimizer automatically selects TIES-Merging (Trim, Elect Sign, Disjoint Merge — [Yadav et al., NeurIPS 2023](https://arxiv.org/abs/2306.01708)) on prefixes where sign conflicts are detected between LoRAs.
 
-<p align="center"><img src="assets/ties-diagram.svg" alt="TIES Merging Pipeline" width="100%"></p>
+<p align="center"><a href="assets/ties-diagram.png"><img src="assets/ties-diagram.svg" alt="TIES Merging Pipeline" width="100%"></a></p>
 
 </details>
 
@@ -123,7 +123,7 @@ The optimizer automatically selects TIES-Merging (Trim, Elect Sign, Disjoint Mer
 
 DARE and DELLA **sparsify each LoRA's diff before merging**, reducing parameter interference between LoRAs. Available in two modes: **standard** (drops weights everywhere) and **conflict-aware** (only drops weights where LoRAs actually interfere).
 
-<p align="center"><img src="assets/sparsification-diagram.svg" alt="DARE / DELLA Sparsification" width="100%"></p>
+<p align="center"><a href="assets/sparsification-diagram.png"><img src="assets/sparsification-diagram.svg" alt="DARE / DELLA Sparsification" width="100%"></a></p>
 
 | Method | How It Works |
 |--------|-------------|
@@ -150,7 +150,7 @@ DARE and DELLA **sparsify each LoRA's diff before merging**, reducing parameter 
 
 Three quality levels for merge conflict resolution, selectable via the `merge_quality` dropdown:
 
-<p align="center"><img src="assets/merge-quality-diagram.svg" alt="Merge Quality Pipeline" width="100%"></p>
+<p align="center"><a href="assets/merge-quality-diagram.png"><img src="assets/merge-quality-diagram.svg" alt="Merge Quality Pipeline" width="100%"></a></p>
 
 | Level | What It Adds | Cost |
 |-------|-------------|------|
@@ -207,7 +207,7 @@ Different LoRA trainers (Kohya, AI-Toolkit, LyCORIS, diffusers/PEFT) produce LoR
 
 Key normalization auto-detects the model architecture from LoRA key patterns and remaps all keys to a canonical format, enabling correct overlap detection and conflict analysis across trainer formats.
 
-<p align="center"><img src="assets/key-normalization.svg" alt="Architecture-Aware Key Normalization" width="100%"></p>
+<p align="center"><a href="assets/key-normalization.png"><img src="assets/key-normalization.svg" alt="Architecture-Aware Key Normalization" width="100%"></a></p>
 
 | Architecture | Detected From | Normalization |
 |-------------|--------------|---------------|
@@ -516,7 +516,7 @@ Restart ComfyUI. Nodes appear under the `loaders` category.
 <details>
 <summary><b>Development Timeline</b></summary>
 
-<p align="center"><img src="assets/timeline.svg" alt="Development Timeline" width="720"></p>
+<p align="center"><a href="assets/timeline.png"><img src="assets/timeline.svg" alt="Development Timeline" width="720"></a></p>
 
 </details>
 

@@ -52,6 +52,9 @@
   <rect x="474" y="162" width="130" height="24" rx="12" fill="#c026d3" opacity="0.12"/>
   <text x="539" y="178" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#c026d3" text-anchor="middle" font-weight="600">Per-Prefix Adaptive</text>
 
+  <rect x="612" y="162" width="120" height="24" rx="12" fill="#38bdf8" opacity="0.12"/>
+  <text x="672" y="178" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#38bdf8" text-anchor="middle" font-weight="600">Merge Quality</text>
+
   <!-- ComfyUI badge -->
   <text x="862" y="26" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64748b" text-anchor="end" font-weight="600">ComfyUI</text>
 </svg>
