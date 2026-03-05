@@ -79,6 +79,7 @@ _ARCH_PRESETS = {
 _ARCH_TO_PRESET = {
     "sdxl": "sd_unet", "unknown": "sd_unet",
     "flux": "dit", "wan": "dit", "zimage": "dit", "ltx": "dit",
+    "acestep": "dit",
     "qwen_image": "llm",
 }
 
@@ -343,7 +344,7 @@ class _LoRAMergeBase:
     def _detect_architecture(lora_sd):
         """
         Detect model architecture from LoRA key patterns.
-        Returns: 'zimage', 'flux', 'wan', 'sdxl', 'ltx', 'qwen_image', or 'unknown'.
+        Returns: 'zimage', 'flux', 'wan', 'acestep', 'sdxl', 'ltx', 'qwen_image', or 'unknown'.
         """
         keys = list(lora_sd.keys())
         keys_str = ' '.join(k.lower() for k in keys)
@@ -378,6 +379,12 @@ class _LoRAMergeBase:
                any(x in k for x in ['self_attn', 'cross_attn', 'ffn'])
                for k in keys):
             return 'wan'
+
+        # ACE-Step: layers.N with self_attn/cross_attn using q_proj/k_proj/v_proj
+        if any('layers.' in k and ('self_attn' in k or 'cross_attn' in k)
+               and any(x in k for x in ['q_proj', 'k_proj', 'v_proj', 'o_proj'])
+               for k in keys):
+            return 'acestep'
 
         # LTX Video: transformer_blocks with attn1/attn2 and adaln_single
         if any('adaln_single' in k for k in keys):
@@ -3046,6 +3053,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     'zimage': 'Z-Image Turbo (Lumina2)',
                     'flux': 'FLUX',
                     'wan': 'Wan 2.1/2.2',
+                    'acestep': 'ACE-Step',
                     'sdxl': 'SDXL',
                     'ltx': 'LTX Video',
                     'qwen_image': 'Qwen-Image',
