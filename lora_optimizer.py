@@ -4412,7 +4412,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 }),
                 "diff_cache_ram_pct": ("FLOAT", {
                     "default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05,
-                    "tooltip": "Fraction of free system RAM to use for diff cache in 'auto' mode. 0.5 = use up to 50%% of available RAM before spilling to disk."
+                    "tooltip": "Fraction of free system RAM to use for diff cache in 'auto' mode. 0.5 = use up to 50% of available RAM before spilling to disk."
                 }),
                 "vram_budget": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
