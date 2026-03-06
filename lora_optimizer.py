@@ -2321,22 +2321,35 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
         else:
             score += 0.10
 
+    # --- Effective conflict (used by sparsification and quality scoring) ---
+    # When LoRAs are orthogonal, high conflict ratio is base-rate noise, not real
+    # conflict. Heavy processing fights noise and can amplify artifacts.
+    is_orthogonal = abs(avg_cos_sim) < ortho_cos
+    effective_conflict = avg_conflict_ratio * min(abs(avg_cos_sim) / ortho_cos, 1.0) if is_orthogonal else avg_conflict_ratio
+
     # --- Sparsification fit (0-0.15) ---
     if spars != "disabled":
-        conflict_benefit = min(avg_conflict_ratio / 0.5, 1.0) * 0.10
+        conflict_benefit = min(effective_conflict / 0.5, 1.0) * 0.10
         score += conflict_benefit
         density_penalty = abs(density - ideal_density) * 0.05
         score += 0.05 - density_penalty
+        # Conflict-aware variants (dare_conflict, della_conflict) benefit from
+        # high conflict variance across prefixes — they adapt masking per-prefix.
+        if "_conflict" in spars and prefix_stats:
+            conflict_ratios = [ps["conflict_ratio"] for ps in prefix_stats.values()
+                               if ps.get("n_loras", 0) > 1]
+            if conflict_ratios and len(conflict_ratios) > 1:
+                variance = max(conflict_ratios) - min(conflict_ratios)
+                score += variance * 0.05  # up to ~0.05 bonus for high variance
+        # DELLA uses magnitude-aware masking — benefits when LoRAs have uneven norms
+        if spars in ("della", "della_conflict"):
+            if magnitude_ratio > mag_thresh:
+                score += 0.03
     else:
-        if avg_conflict_ratio < consensus_conf:
+        if effective_conflict < consensus_conf:
             score += 0.10
 
     # --- Quality fit (0-0.15) ---
-    # When LoRAs are orthogonal, high conflict ratio is base-rate noise, not real
-    # conflict. Heavy processing (KnOTS, DO-orthogonalize) fights noise and can
-    # amplify artifacts ("burned" look). Use effective conflict instead.
-    is_orthogonal = abs(avg_cos_sim) < ortho_cos
-    effective_conflict = avg_conflict_ratio * min(abs(avg_cos_sim) / ortho_cos, 1.0) if is_orthogonal else avg_conflict_ratio
     if quality == "maximum":
         conflict_benefit = min(effective_conflict / 0.3, 1.0) * 0.10
         score += 0.05 + conflict_benefit
