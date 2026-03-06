@@ -2241,17 +2241,22 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
 
     # --- Mode fit score (0-0.4) ---
     if opt_mode == "per_prefix":
-        # Per-prefix auto-selects the best mode per layer — always a good fit.
-        # Score based on how much the data benefits from per-prefix decisions.
-        if prefix_stats:
+        # Per-prefix auto-selects the best mode per layer.
+        # Key advantage: detects orthogonal LoRAs (high conflict + low cos_sim)
+        # where TIES would be wrong but per-prefix correctly uses weighted_avg/SLERP.
+        if abs(avg_cos_sim) < ortho_cos and avg_conflict_ratio > ties_thresh:
+            # Orthogonal LoRAs with high conflict — per-prefix is critical here.
+            # Global would pick TIES (wrong), per-prefix detects orthogonality.
+            score += 0.40
+        elif prefix_stats:
             conflict_ratios = [ps["conflict_ratio"] for ps in prefix_stats.values()
                                if ps.get("n_loras", 0) > 1]
             if conflict_ratios and max(conflict_ratios) - min(conflict_ratios) > 0.15:
                 score += 0.35  # high variance = per-prefix shines
             else:
-                score += 0.25  # uniform conflict = per-prefix still fine
+                score += 0.30  # uniform conflict = per-prefix still good
         else:
-            score += 0.25
+            score += 0.30
     elif mode == "consensus":
         if avg_cos_sim > consensus_cos and avg_conflict_ratio < consensus_conf:
             score += 0.4
@@ -2275,7 +2280,12 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
             score += 0.10
     elif mode == "ties":
         if avg_conflict_ratio > ties_thresh:
-            score += 0.35
+            if abs(avg_cos_sim) < ortho_cos:
+                # High conflict BUT orthogonal LoRAs — conflict is noise, not real.
+                # TIES would aggressively prune, losing important information.
+                score += 0.15
+            else:
+                score += 0.35
         elif avg_conflict_ratio > ties_thresh * 0.6:
             score += 0.20
         else:
