@@ -3089,7 +3089,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             return meaningful[0]
         return prefix[:30]
 
-    def _auto_select_params(self, avg_conflict_ratio, magnitude_ratio, all_key_diffs=None, magnitude_samples=None, avg_cos_sim=0.0, behavior_profile="v1.2", arch_preset=None):
+    def _auto_select_params(self, avg_conflict_ratio, magnitude_ratio, all_key_diffs=None, magnitude_samples=None, avg_cos_sim=0.0, behavior_profile="v1.2", arch_preset=None, precomputed_density=None):
         """
         Decision logic for auto-selecting merge parameters.
         Returns (mode, density, sign_method, reasoning_lines).
@@ -3146,6 +3146,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                 density = self._estimate_density_from_samples(magnitude_samples, arch_preset=arch_preset)
             elif all_key_diffs is not None:
                 density = self._estimate_density(all_key_diffs, arch_preset=arch_preset)
+            elif precomputed_density is not None:
+                density = precomputed_density
             else:
                 density = 0.5
             reasoning.append(f"Auto-density estimated at {density:.2f} from magnitude distribution")
@@ -3870,7 +3872,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                         magnitude_samples=pf.get("magnitude_samples"),
                         avg_cos_sim=pf.get("avg_cos_sim", 0.0),
                         behavior_profile=behavior_profile,
-                        arch_preset=arch_preset
+                        arch_preset=arch_preset,
+                        precomputed_density=pf.get("precomputed_density"),
                     )
                     # Upgrade weighted_average → slerp for 2+ LoRAs
                     # SLERP preserves magnitude better (no cancellation from opposing vectors)
@@ -4661,10 +4664,16 @@ class LoRAAutoTuner(LoRAOptimizer):
                          f"{' +' + c['sparsification'] if c['sparsification'] != 'disabled' else ''}"
                          f" auto_str={c['auto_strength']} {c['optimization_mode']}")
 
-        # Free magnitude samples — only needed for Phase 1 density estimation
-        _analysis_cache["all_magnitude_samples"] = []
+        # Pre-compute per-prefix density from magnitude samples before freeing them.
+        # Phase 2's per-prefix auto_select_params needs density but magnitude_samples
+        # are large — store the scalar result and free the raw samples.
         for pf in prefix_stats.values():
+            samples = pf.get("magnitude_samples")
+            if samples and pf.get("n_loras", 0) > 1:
+                pf["precomputed_density"] = self._estimate_density_from_samples(
+                    samples, arch_preset=tuner_arch_preset)
             pf.pop("magnitude_samples", None)
+        _analysis_cache["all_magnitude_samples"] = []
         gc.collect()
 
         # --- Phase 2: Merge top-N and measure ---
@@ -4773,7 +4782,6 @@ class LoRAAutoTuner(LoRAOptimizer):
             del _diff_cache
         del all_magnitude_samples
         del _analysis_cache
-        prefix_stats.clear()
         self.loaded_loras.clear()
         gc.collect()
         if use_gpu:
@@ -4816,6 +4824,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             self._save_tuner_dataset_entry(
                 tuner_data, active_loras, prefix_stats,
                 getattr(self, '_detected_arch', None))
+        prefix_stats.clear()
 
         # Build report
         suggested_max = best_lora_data.get("suggested_max_strength") if best_lora_data else None
@@ -4966,9 +4975,12 @@ class LoRAAutoTuner(LoRAOptimizer):
                    clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
                    scoring_svd="disabled", scoring_device="gpu",
                    architecture_preset="auto", record_dataset="disabled",
+                   cache_patches="enabled",
+                   diff_cache_mode="disabled", diff_cache_ram_pct=0.5,
                    vram_budget=0.0):
         return (id(lora_stack), output_strength, clip_strength_multiplier, top_n,
-                normalize_keys, scoring_svd, scoring_device, architecture_preset)
+                normalize_keys, scoring_svd, scoring_device, architecture_preset,
+                vram_budget, record_dataset)
 
 
 class LoRAMergeSelector(LoRAOptimizer):
