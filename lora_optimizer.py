@@ -342,6 +342,7 @@ class _DiffCache:
         self._ram_bytes = 0
         self._ram_limit = None
         self._cache_dir = None
+        self._disk_failed = False
         if mode in ("disk", "auto"):
             import tempfile
             self._cache_dir = tempfile.mkdtemp(prefix="lora_diff_cache_")
@@ -407,6 +408,8 @@ class _DiffCache:
         cached = tensor.detach().half().cpu()
         tensor_bytes = cached.nelement() * cached.element_size()
         if self._use_disk(tensor_bytes):
+            if self._disk_failed:
+                return  # Disk writes already failed, skip silently
             try:
                 import hashlib, numpy as np
                 name_hash = hashlib.sha256(f"{key[0]}_{key[1]}".encode()).hexdigest()[:16]
@@ -414,7 +417,8 @@ class _DiffCache:
                 np.save(path, cached.numpy())
                 self._disk_store[key] = path
             except Exception as e:
-                logging.warning(f"[DiffCache] Failed to write cache file: {e}")
+                self._disk_failed = True
+                logging.warning(f"[DiffCache] Disk cache disabled — {e}")
         else:
             self._ram_store[key] = cached if self.mode != "ram" else cached.clone()
             self._ram_bytes += tensor_bytes
