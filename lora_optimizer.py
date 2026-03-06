@@ -4163,6 +4163,24 @@ class LoRAOptimizer(_LoRAMergeBase):
                     _collect_merge_result(future.result())
 
         fullrank_count = processed_keys - lowrank_count
+        # DEBUG: hash model patches to compare AutoTuner vs direct runs
+        _patch_hash = 0.0
+        _patch_bytes = 0
+        for _pk in sorted(model_patches.keys(), key=str):
+            _pv = model_patches[_pk]
+            if isinstance(_pv, tuple) and len(_pv) >= 2 and isinstance(_pv[1], tuple):
+                for _t in _pv[1]:
+                    if isinstance(_t, torch.Tensor):
+                        _patch_hash += _t.float().sum().item()
+                        _patch_bytes += _t.nelement() * _t.element_size()
+            elif hasattr(_pv, 'weights'):
+                for _t in _pv.weights:
+                    if isinstance(_t, torch.Tensor):
+                        _patch_hash += _t.float().sum().item()
+                        _patch_bytes += _t.nelement() * _t.element_size()
+        logging.info(f"[LoRA Optimizer]   DEBUG patch fingerprint: sum={_patch_hash:.6f}, "
+                     f"bytes={_patch_bytes}, keys={len(model_patches)}, "
+                     f"cached={'yes' if _analysis_cache is not None else 'no'}")
         logging.info(f"[LoRA Optimizer]   Model patches: {len(model_patches)}, "
                      f"CLIP patches: {len(clip_patches)} ({time.time() - t_pass2:.1f}s)")
         if lowrank_count > 0:
