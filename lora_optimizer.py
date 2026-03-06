@@ -2332,13 +2332,18 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
             score += 0.10
 
     # --- Quality fit (0-0.15) ---
+    # When LoRAs are orthogonal, high conflict ratio is base-rate noise, not real
+    # conflict. Heavy processing (KnOTS, DO-orthogonalize) fights noise and can
+    # amplify artifacts ("burned" look). Use effective conflict instead.
+    is_orthogonal = abs(avg_cos_sim) < ortho_cos
+    effective_conflict = avg_conflict_ratio * min(abs(avg_cos_sim) / ortho_cos, 1.0) if is_orthogonal else avg_conflict_ratio
     if quality == "maximum":
-        conflict_benefit = min(avg_conflict_ratio / 0.3, 1.0) * 0.10
+        conflict_benefit = min(effective_conflict / 0.3, 1.0) * 0.10
         score += 0.05 + conflict_benefit
     elif quality == "enhanced":
-        score += 0.08 + min(avg_conflict_ratio / 0.3, 1.0) * 0.07
+        score += 0.08 + min(effective_conflict / 0.3, 1.0) * 0.07
     else:
-        if avg_conflict_ratio < 0.10:
+        if effective_conflict < 0.10:
             score += 0.10
         else:
             score += 0.05
