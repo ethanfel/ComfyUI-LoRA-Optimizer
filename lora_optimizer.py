@@ -1329,6 +1329,31 @@ class _LoRAMergeBase:
         return total
 
     @staticmethod
+    def _expand_patch_to_diff(patch):
+        """Expand a patch (diff tuple or LoRAAdapter) to a float32 diff tensor."""
+        if isinstance(patch, tuple) and patch[0] == "diff":
+            return patch[1][0].float()
+        elif hasattr(patch, 'weights'):
+            w = patch.weights
+            mat_up, mat_down, alpha = w[0], w[1], w[2]
+            mid = w[3]
+            rank = mat_down.shape[0]
+            if isinstance(alpha, torch.Tensor):
+                alpha = alpha.item()
+            if mid is not None:
+                final_shape = [mat_down.shape[1], mat_down.shape[0], mid.shape[2], mid.shape[3]]
+                mat_down = torch.mm(
+                    mat_down.transpose(0, 1).flatten(start_dim=1).float(),
+                    mid.transpose(0, 1).flatten(start_dim=1).float(),
+                ).reshape(final_shape).transpose(0, 1)
+            diff = torch.mm(
+                mat_up.flatten(start_dim=1).float(),
+                mat_down.flatten(start_dim=1).float(),
+            )
+            return diff * (alpha / rank)
+        raise ValueError(f"Unknown patch format: {type(patch)}")
+
+    @staticmethod
     def _move_patch_to_device(patch, device):
         """Move all tensors in a patch to the given device. Returns new patch."""
         if hasattr(patch, 'weights'):
@@ -3537,6 +3562,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                         prefix = key[:-len(suffix)]
                         all_lora_prefixes.add(prefix)
                         break
+        all_lora_prefixes = sorted(all_lora_prefixes)  # deterministic iteration order
 
         compute_device = self._get_compute_device()
         use_gpu = compute_device.type != "cpu"
@@ -3553,42 +3579,6 @@ class LoRAOptimizer(_LoRAMergeBase):
             pairs = [(i, j) for i in range(len(active_loras))
                              for j in range(i + 1, len(active_loras))]
             logging.info(f"[LoRA Optimizer] Using cached analysis ({prefix_count} prefixes, skipping Pass 1)")
-
-            # DEBUG: Verify cached all_key_targets matches fresh model_keys
-            _mismatches = 0
-            _checked = 0
-            for _dbg_prefix, (_dbg_cached_target, _dbg_cached_clip) in list(all_key_targets.items())[:5]:
-                _checked += 1
-                _dbg_fresh_target = model_keys.get(_dbg_prefix)
-                if _dbg_fresh_target != _dbg_cached_target:
-                    _mismatches += 1
-                    logging.info(f"[LoRA Optimizer] DEBUG MISMATCH prefix={_dbg_prefix}: "
-                                 f"cached_target={_dbg_cached_target}, fresh_target={_dbg_fresh_target}")
-                elif _checked <= 2:
-                    logging.info(f"[LoRA Optimizer] DEBUG MATCH prefix={_dbg_prefix}: target={_dbg_cached_target}")
-            # Check total key count differences
-            _cached_prefixes = set(all_key_targets.keys())
-            _fresh_model_prefixes = set(model_keys.keys())
-            _fresh_clip_prefixes = set(clip_keys.keys()) if clip_keys else set()
-            _fresh_all = _fresh_model_prefixes | _fresh_clip_prefixes
-            _only_in_cache = _cached_prefixes - _fresh_all
-            _only_in_fresh = (_fresh_all - _cached_prefixes)
-            logging.info(f"[LoRA Optimizer] DEBUG cache_keys={len(_cached_prefixes)}, "
-                         f"fresh_model_keys={len(_fresh_model_prefixes)}, "
-                         f"fresh_clip_keys={len(_fresh_clip_prefixes)}, "
-                         f"mismatches={_mismatches}/{_checked}, "
-                         f"only_in_cache={len(_only_in_cache)}, "
-                         f"only_in_fresh={len(_only_in_fresh)}")
-            if _only_in_cache:
-                logging.info(f"[LoRA Optimizer] DEBUG only_in_cache (first 3): {list(_only_in_cache)[:3]}")
-            # Check active_loras consistency
-            logging.info(f"[LoRA Optimizer] DEBUG active_loras: {[(a['name'], a['strength']) for a in active_loras]}")
-            # Check first LoRA mat dtype
-            for _la in active_loras[:1]:
-                for _lk, _lv in list(_la['lora'].items())[:3]:
-                    if hasattr(_lv, 'dtype'):
-                        logging.info(f"[LoRA Optimizer] DEBUG lora_weight_dtype: key={_lk}, dtype={_lv.dtype}")
-                        break
 
         else:
             # =====================================================================
@@ -3698,20 +3688,6 @@ class LoRAOptimizer(_LoRAMergeBase):
                 logging.info(f"[LoRA Optimizer]   {stat['name']} ({i+1}/{len(active_loras)}): "
                              f"{stat['key_count']} keys, avg rank {avg_r:.0f}")
             logging.info(f"[LoRA Optimizer]   Total: {prefix_count} prefixes ({time.time() - t_pass1:.1f}s)")
-
-            # DEBUG: Log fresh all_key_targets info for comparison
-            _checked = 0
-            for _dbg_prefix, (_dbg_target, _dbg_clip) in list(all_key_targets.items())[:2]:
-                _checked += 1
-                logging.info(f"[LoRA Optimizer] DEBUG FRESH prefix={_dbg_prefix}: target={_dbg_target}")
-            logging.info(f"[LoRA Optimizer] DEBUG fresh_keys={len(all_key_targets)}, "
-                         f"model_keys={len(model_keys)}")
-            logging.info(f"[LoRA Optimizer] DEBUG active_loras: {[(a['name'], a['strength']) for a in active_loras]}")
-            for _la in active_loras[:1]:
-                for _lk, _lv in list(_la['lora'].items())[:3]:
-                    if hasattr(_lv, 'dtype'):
-                        logging.info(f"[LoRA Optimizer] DEBUG lora_weight_dtype: key={_lk}, dtype={_lv.dtype}")
-                        break
 
         # =====================================================================
         # Decision — finalize stats, auto-select params (scalars only)
@@ -3953,16 +3929,6 @@ class LoRAOptimizer(_LoRAMergeBase):
                     and merge_strategy_override in ("ties", "weighted_average", "weighted_sum", "consensus", "slerp")):
                 pf_mode = merge_strategy_override
 
-            # DEBUG: log path decision for first 3 prefixes
-            if processed_keys < 3:
-                _pf_raw_n = prefix_stats.get(lora_prefix, {}).get("n_loras", 0)
-                logging.info(f"[LoRA Optimizer] DEBUG PATH prefix={lora_prefix}: "
-                             f"opt_mode={optimization_mode}, pf_mode={pf_mode}, "
-                             f"pf_n_loras={pf_n_loras}, raw_n={_pf_raw_n}, "
-                             f"low_rank={pf_mode == 'weighted_sum' and pf_n_loras <= 1}, "
-                             f"target_key={target_key}, offset={offset}, "
-                             f"cached={'yes' if _analysis_cache is not None else 'no'}")
-
             # LOW-RANK PATH: single-LoRA weighted_sum — keep low-rank matrices
             # instead of expanding to full-rank diff. Saves ~128x memory per key.
             # ComfyUI applies "lora" patches as: up @ down * (alpha/rank) * strength
@@ -4141,15 +4107,6 @@ class LoRAOptimizer(_LoRAMergeBase):
             input_norms_mean = (sum(d.float().norm().item() * abs(w) for d, w in diffs_list)
                                 / len(diffs_list)) if diffs_list else 0.0
 
-            # DEBUG: log diff count per prefix for first 3 prefixes
-            if processed_keys < 3:
-                logging.info(f"[LoRA Optimizer] DEBUG prefix={lora_prefix}: "
-                             f"n_diffs={len(diffs_list)}, "
-                             f"dtypes={[d.dtype for d,w in diffs_list]}, "
-                             f"shapes={[list(d.shape) for d,w in diffs_list]}, "
-                             f"weights={[w for d,w in diffs_list]}, "
-                             f"mode={pf_mode}, target={target_key}")
-
             merged_diff = self._merge_diffs(
                 diffs_list, pf_mode,
                 density=pf_density, majority_sign_method=pf_sign,
@@ -4162,12 +4119,6 @@ class LoRAOptimizer(_LoRAMergeBase):
                 keep_on_gpu=should_keep,
             )
             merged_norm = merged_diff.float().norm().item() if merged_diff is not None else 0.0
-            # DEBUG: log merged diff info for first 3 prefixes
-            if processed_keys < 3:
-                logging.info(f"[LoRA Optimizer] DEBUG merged: dtype={merged_diff.dtype}, "
-                             f"shape={list(merged_diff.shape)}, "
-                             f"sum={merged_diff.float().sum().item():.4f}, "
-                             f"storage_dtype={storage_dtype}")
             diffs_list.clear()  # Free input diffs from GPU
             if merged_diff is None:
                 return None
@@ -4211,21 +4162,31 @@ class LoRAOptimizer(_LoRAMergeBase):
             target_key, is_clip_key, patch, used_mode, prefix, conflict, n_loras, is_compressed, inp_norm, mrg_norm = result
             total_input_energy += inp_norm
             total_merged_energy += mrg_norm
-            if is_clip_key:
-                if target_key in clip_patches:
-                    _overwrite_count += 1
-                    if len(_overwrite_examples) < 3:
-                        _overwrite_examples.append(f"CLIP {prefix} -> {target_key}")
-                clip_patches[target_key] = patch
+
+            target_dict = clip_patches if is_clip_key else model_patches
+            if target_key in target_dict:
+                # Target-key collision: accumulate diffs instead of overwriting
+                _overwrite_count += 1
+                existing = target_dict[target_key]
+                existing_diff = self._expand_patch_to_diff(existing)
+                new_diff = self._expand_patch_to_diff(patch)
+                accumulated = existing_diff + new_diff
+                # Use the smaller dtype to save memory
+                store_dt = existing_diff.dtype if existing_diff.dtype != torch.float32 else new_diff.dtype
+                if store_dt != torch.float32:
+                    accumulated = accumulated.to(store_dt)
+                target_dict[target_key] = ("diff", (accumulated,))
+                # Fix lowrank_count if existing was LoRAAdapter (now replaced by diff)
+                if isinstance(existing, LoRAAdapter):
+                    lowrank_count -= 1
+                if len(_overwrite_examples) < 3:
+                    _overwrite_examples.append(f"{'CLIP' if is_clip_key else 'MODEL'} {prefix} -> {target_key}")
             else:
-                if target_key in model_patches:
-                    _overwrite_count += 1
-                    if len(_overwrite_examples) < 3:
-                        _overwrite_examples.append(f"MODEL {prefix} -> {target_key}")
-                model_patches[target_key] = patch
+                target_dict[target_key] = patch
+                if isinstance(patch, LoRAAdapter):
+                    lowrank_count += 1
+
             processed_keys += 1
-            if isinstance(patch, LoRAAdapter):
-                lowrank_count += 1
             if is_compressed:
                 compressed_count += 1
             strategy_counts[used_mode] = strategy_counts.get(used_mode, 0) + 1
@@ -4251,32 +4212,9 @@ class LoRAOptimizer(_LoRAMergeBase):
                     _collect_merge_result(future.result())
 
         fullrank_count = processed_keys - lowrank_count
-        # DEBUG: report target_key overwrites (patches silently lost)
         if _overwrite_count > 0:
-            logging.warning(f"[LoRA Optimizer] DEBUG OVERWRITE: {_overwrite_count} patches were overwritten! "
-                            f"(different LoRA prefixes mapped to the same target key)")
-            for ex in _overwrite_examples:
-                logging.warning(f"[LoRA Optimizer] DEBUG OVERWRITE example: {ex}")
-        else:
-            logging.info(f"[LoRA Optimizer] DEBUG: No target_key overwrites detected (processed={processed_keys}, patches={len(model_patches) + len(clip_patches)})")
-        # DEBUG: hash model patches to compare AutoTuner vs direct runs
-        _patch_hash = 0.0
-        _patch_bytes = 0
-        for _pk in sorted(model_patches.keys(), key=str):
-            _pv = model_patches[_pk]
-            if isinstance(_pv, tuple) and len(_pv) >= 2 and isinstance(_pv[1], tuple):
-                for _t in _pv[1]:
-                    if isinstance(_t, torch.Tensor):
-                        _patch_hash += _t.float().sum().item()
-                        _patch_bytes += _t.nelement() * _t.element_size()
-            elif hasattr(_pv, 'weights'):
-                for _t in _pv.weights:
-                    if isinstance(_t, torch.Tensor):
-                        _patch_hash += _t.float().sum().item()
-                        _patch_bytes += _t.nelement() * _t.element_size()
-        logging.info(f"[LoRA Optimizer]   DEBUG patch fingerprint: sum={_patch_hash:.6f}, "
-                     f"bytes={_patch_bytes}, keys={len(model_patches)}, "
-                     f"cached={'yes' if _analysis_cache is not None else 'no'}")
+            logging.info(f"[LoRA Optimizer] {_overwrite_count} target-key collisions resolved "
+                         f"(different LoRA key formats targeting the same model weight — diffs accumulated)")
         logging.info(f"[LoRA Optimizer]   Model patches: {len(model_patches)}, "
                      f"CLIP patches: {len(clip_patches)} ({time.time() - t_pass2:.1f}s)")
         if lowrank_count > 0:
