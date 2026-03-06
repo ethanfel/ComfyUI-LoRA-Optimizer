@@ -324,6 +324,49 @@ class LoRAStackDynamic:
         return (loras,)
 
 
+class _DiffCache:
+    """Cache for raw LoRA diffs across AutoTuner candidates."""
+
+    def __init__(self, mode="ram"):
+        self.mode = mode
+        self._store = {}
+        self._cache_dir = None
+        if mode == "disk":
+            import tempfile
+            self._cache_dir = tempfile.mkdtemp(prefix="lora_diff_cache_")
+
+    def get(self, key, device=None):
+        if key not in self._store:
+            return None
+        val = self._store[key]
+        if self.mode == "disk":
+            return torch.load(val, map_location=device or "cpu",
+                              weights_only=True, mmap=True)
+        else:
+            return val.to(device) if device is not None else val.clone()
+
+    def put(self, key, tensor):
+        if key in self._store:
+            return
+        if self.mode == "disk":
+            prefix_str = key[0].replace(".", "_").replace("/", "_")
+            path = os.path.join(self._cache_dir, f"{prefix_str}_{key[1]}.pt")
+            torch.save(tensor.cpu(), path)
+            self._store[key] = path
+        else:
+            self._store[key] = tensor.cpu()
+
+    def clear(self):
+        self._store.clear()
+        if self._cache_dir is not None:
+            import shutil
+            shutil.rmtree(self._cache_dir, ignore_errors=True)
+            self._cache_dir = None
+
+    def __contains__(self, key):
+        return key in self._store
+
+
 class _LoRAMergeBase:
     """
     Base class for diff-based LoRA merging.
@@ -3796,6 +3839,27 @@ class LoRAOptimizer(_LoRAMergeBase):
                 if kf == "unique_only" and raw_n != 1:
                     continue
 
+                # Check diff cache
+                cache_key = (lora_prefix, i)
+                if _diff_cache is not None and cache_key in _diff_cache:
+                    diff = _diff_cache.get(cache_key,
+                                           device=compute_device if use_gpu else None).float()
+                    if storage_dtype is None:
+                        lora_info_for_dtype = self._get_lora_key_info(item["lora"], lora_prefix)
+                        if lora_info_for_dtype is not None:
+                            storage_dtype = lora_info_for_dtype[0].dtype
+
+                    if is_clip_key and item["clip_strength"] is not None:
+                        eff_strength = item["clip_strength"]
+                    else:
+                        eff_strength = item["strength"]
+                        if scale_ratios:
+                            eff_strength *= scale_ratios.get(i, 1.0)
+
+                    diffs_list.append((diff, eff_strength))
+                    diff_to_lora.append(i)
+                    continue
+
                 mat_up, mat_down, alpha, mid = lora_info
                 rank = mat_down.shape[0]
                 if storage_dtype is None:
@@ -3830,6 +3894,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                     continue
 
                 diff = diff * (alpha / rank)
+
+                # Store in diff cache for subsequent candidates
+                if _diff_cache is not None:
+                    _diff_cache.put((lora_prefix, i), diff)
 
                 if is_clip_key and item["clip_strength"] is not None:
                     eff_strength = item["clip_strength"]
