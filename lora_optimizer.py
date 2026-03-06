@@ -4260,6 +4260,10 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "default": "disabled",
                     "tooltip": "Record analysis metrics and scored configs to a JSONL dataset file for threshold tuning research. Saved to lora_optimizer_reports/autotuner_dataset.jsonl."
                 }),
+                "diff_cache_mode": (["ram", "disk", "disabled"], {
+                    "default": "ram",
+                    "tooltip": "Cache raw LoRA diffs across candidates to avoid redundant computation. 'ram' is fastest (uses ~3-12GB RAM). 'disk' uses temp files with memory-mapping (slower but low RAM). 'disabled' recomputes diffs each time."
+                }),
                 "vram_budget": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Fraction of free VRAM to use for storing merged patches. 0 = all CPU (default), 1.0 = use all free VRAM. Reduces RAM usage on GPU systems."
@@ -4281,7 +4285,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                   clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
                   scoring_svd="disabled", scoring_device="gpu",
                   architecture_preset="auto", record_dataset="disabled",
-                  vram_budget=0.0):
+                  diff_cache_mode="ram", vram_budget=0.0):
         import hashlib, json
 
         # --- Normalize & validate stack ---
