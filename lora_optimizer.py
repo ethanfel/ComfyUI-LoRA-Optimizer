@@ -4199,17 +4199,29 @@ class LoRAOptimizer(_LoRAMergeBase):
         total_input_energy = 0.0
         total_merged_energy = 0.0
 
+        _overwrite_count = 0
+        _overwrite_examples = []
+
         def _collect_merge_result(result):
             nonlocal processed_keys, lowrank_count, compressed_count
             nonlocal total_input_energy, total_merged_energy
+            nonlocal _overwrite_count
             if result is None:
                 return
             target_key, is_clip_key, patch, used_mode, prefix, conflict, n_loras, is_compressed, inp_norm, mrg_norm = result
             total_input_energy += inp_norm
             total_merged_energy += mrg_norm
             if is_clip_key:
+                if target_key in clip_patches:
+                    _overwrite_count += 1
+                    if len(_overwrite_examples) < 3:
+                        _overwrite_examples.append(f"CLIP {prefix} -> {target_key}")
                 clip_patches[target_key] = patch
             else:
+                if target_key in model_patches:
+                    _overwrite_count += 1
+                    if len(_overwrite_examples) < 3:
+                        _overwrite_examples.append(f"MODEL {prefix} -> {target_key}")
                 model_patches[target_key] = patch
             processed_keys += 1
             if isinstance(patch, LoRAAdapter):
@@ -4239,6 +4251,14 @@ class LoRAOptimizer(_LoRAMergeBase):
                     _collect_merge_result(future.result())
 
         fullrank_count = processed_keys - lowrank_count
+        # DEBUG: report target_key overwrites (patches silently lost)
+        if _overwrite_count > 0:
+            logging.warning(f"[LoRA Optimizer] DEBUG OVERWRITE: {_overwrite_count} patches were overwritten! "
+                            f"(different LoRA prefixes mapped to the same target key)")
+            for ex in _overwrite_examples:
+                logging.warning(f"[LoRA Optimizer] DEBUG OVERWRITE example: {ex}")
+        else:
+            logging.info(f"[LoRA Optimizer] DEBUG: No target_key overwrites detected (processed={processed_keys}, patches={len(model_patches) + len(clip_patches)})")
         # DEBUG: hash model patches to compare AutoTuner vs direct runs
         _patch_hash = 0.0
         _patch_bytes = 0
