@@ -349,11 +349,14 @@ class _DiffCache:
         if key in self._store:
             return
         if self.mode == "disk":
-            import hashlib
-            name_hash = hashlib.sha256(f"{key[0]}_{key[1]}".encode()).hexdigest()[:16]
-            path = os.path.join(self._cache_dir, f"{name_hash}.pt")
-            torch.save(tensor.detach().half().cpu(), path)
-            self._store[key] = path
+            try:
+                import hashlib
+                name_hash = hashlib.sha256(f"{key[0]}_{key[1]}".encode()).hexdigest()[:16]
+                path = os.path.join(self._cache_dir, f"{name_hash}.pt")
+                torch.save(tensor.detach().half().cpu(), path)
+                self._store[key] = path
+            except Exception as e:
+                logging.warning(f"[DiffCache] Failed to write cache file: {e}")
         else:
             self._store[key] = tensor.detach().clone().half().cpu()
 
