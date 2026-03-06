@@ -10,13 +10,14 @@
   <img src="https://img.shields.io/badge/KnOTS_%7C_Column--wise_%7C_TALL--masks-Merge_Quality-a78bfa?style=flat-square" alt="Merge Quality">
   <img src="https://img.shields.io/badge/SVD_Patch-Compression-64ffda?style=flat-square" alt="SVD">
   <img src="https://img.shields.io/badge/Architecture--Aware-Key_Normalization-22c55e?style=flat-square" alt="Key Normalization">
-  <img src="https://img.shields.io/badge/Flux_%7C_SDXL_%7C_Wan_%7C_LTX_%7C_Z--Image-Compatible-22c55e?style=flat-square" alt="Compatible">
+  <img src="https://img.shields.io/badge/AutoTuner-Parameter_Sweep-e94560?style=flat-square" alt="AutoTuner">
+  <img src="https://img.shields.io/badge/Flux_%7C_SDXL_%7C_Wan_%7C_LTX_%7C_Z--Image_%7C_ACE--Step-Compatible-22c55e?style=flat-square" alt="Compatible">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="MIT">
 </p>
 
 ---
 
-A ComfyUI node that **automatically analyzes your LoRA stack** and selects the best merge strategy per weight group — diff-based merging, TIES conflict resolution, DARE/DELLA sparsification, per-prefix adaptive decisions, SVD patch compression, architecture-aware key normalization, enhanced merge quality (KnOTS alignment, column-wise voting, TALL-mask protection), and auto-tuned parameters. Two nodes: **LoRA Stack** (build input) and **LoRA Optimizer** (analyze + merge).
+A ComfyUI node suite that **automatically analyzes your LoRA stack** and selects the best merge strategy per weight group — diff-based merging, TIES conflict resolution, DARE/DELLA sparsification, per-prefix adaptive decisions, SVD patch compression, architecture-aware key normalization, enhanced merge quality (KnOTS alignment, column-wise voting, TALL-mask protection), and auto-tuned parameters. Core nodes: **LoRA Stack** (build input), **LoRA Optimizer** (analyze + merge), and **LoRA AutoTuner** (sweep all parameters automatically and find the best config).
 
 ## The Problem
 
@@ -253,6 +254,7 @@ Key normalization auto-detects the model architecture from LoRA key patterns and
 | **Wan** 2.1/2.2 | `blocks.N` with `self_attn`/`cross_attn`/`ffn` | LyCORIS / diffusers / Musubi Tuner unified, RS-LoRA alpha fix |
 | **SDXL** | `lora_te1_`/`lora_te2_`, `input_blocks`/`down_blocks` | Text encoder + UNet key unification |
 | **LTX Video** | `adaln_single`, `transformer_blocks` with `attn1`/`attn2` | Trainer format unification |
+| **ACE-Step** | `layers.N` with `self_attn`/`cross_attn` and `q_proj`/`k_proj`/`v_proj` | Attention key unification |
 | **Qwen-Image** | `transformer_blocks` with `img_mlp`/`txt_mlp`/`img_mod`/`txt_mod` | Dual-stream key unification |
 
 **Z-Image QKV handling:** Z-Image LoRAs often fuse Q, K, V projections into a single `attention.qkv` weight. The normalizer splits these into separate `to_q`/`to_k`/`to_v` components for per-component conflict analysis, then **re-fuses** them back to the native format after merging.
@@ -445,6 +447,74 @@ Connect the `STRING` output to a **Show Text** node to see the report in ComfyUI
 
 ---
 
+### LoRA AutoTuner
+
+Automatically sweeps all merge parameters (mode, sparsification, density, dampening, quality level) and finds the best configuration for your LoRA stack. Runs Pass 1 analysis once, scores all parameter combinations via heuristic, then merges the top-N candidates and measures output quality. Outputs the best merge directly as `MODEL`/`CLIP`, plus a ranked report and `TUNER_DATA` for exploring alternatives via a **Merge Selector** node.
+
+**Inputs:** `MODEL`, `LORA_STACK`, output strength, optional `CLIP`, top_n (how many configs to evaluate), normalize_keys, scoring_svd, architecture_preset, diff_cache_mode, vram_budget.
+
+**Outputs:** `MODEL`, `CLIP`, `STRING` (ranked report), `TUNER_DATA` (for Merge Selector / Save Tuner Data), `LORA_DATA` (for Save Merged LoRA)
+
+<details>
+<summary><b>Diff Cache</b></summary>
+
+During the parameter sweep, each candidate recomputes raw LoRA diffs (A@B matmul) from scratch — even though diffs depend only on LoRA content, not merge config. The diff cache stores these diffs after the first candidate and reuses them for subsequent candidates, eliminating redundant computation.
+
+| Mode | Behavior |
+|------|----------|
+| `disabled` (default) | Recomputes diffs each time. No extra memory |
+| `auto` | Uses RAM up to `diff_cache_ram_pct` of free memory, then spills to disk. Recommended for most setups |
+| `ram` | All diffs in RAM. Fastest, but uses ~1.5 GB (SDXL) to ~6 GB (Flux) |
+| `disk` | All diffs to temp files with memory-mapping. Slowest cache mode, but minimal RAM |
+
+When `auto` mode runs out of disk space, it falls back to RAM automatically.
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `diff_cache_mode` | disabled | Cache mode selection |
+| `diff_cache_ram_pct` | 0.5 | Fraction of free system RAM for `auto` mode (0.1–0.9) |
+
+</details>
+
+<details>
+<summary><b>VRAM Budget</b></summary>
+
+The `vram_budget` slider (0.0–1.0) controls what fraction of free VRAM to use for storing merged patches on GPU. Default is 0 (all patches on CPU). Setting it higher keeps patches on GPU, reducing RAM usage on systems with enough VRAM. Available on both LoRA Optimizer and LoRA AutoTuner.
+
+</details>
+
+---
+
+### Merge Selector
+
+Applies a specific configuration from AutoTuner results without re-running the sweep. Connect `TUNER_DATA` from a LoRA AutoTuner (or Load Tuner Data) node and set the `selection` index to choose which ranked configuration to apply (1 = best, 2 = second best, etc.).
+
+**Inputs:** `MODEL`, `LORA_STACK`, `TUNER_DATA`, selection (1–10), output strength, optional `CLIP`, vram_budget.
+
+**Outputs:** `MODEL`, `CLIP`, `STRING` (report), `LORA_DATA`
+
+**Workflow:**
+```
+LoRA AutoTuner → TUNER_DATA → Merge Selector (selection=2) → try the 2nd-best config
+                      ↓
+              Save Tuner Data → (reload later) → Load Tuner Data → Merge Selector
+```
+
+---
+
+<details>
+<summary><b>Save / Load Tuner Data</b></summary>
+
+Two utility nodes for persisting AutoTuner results to disk:
+
+**Save Tuner Data** — Saves `TUNER_DATA` as a JSON file. Plain filename saves to `models/tuner_data/`, absolute path saves to that location. `OUTPUT_NODE = True`.
+
+**Load Tuner Data** — Dropdown of saved tuner data files. Outputs `TUNER_DATA` ready for Merge Selector. Auto-reloads when the file changes on disk.
+
+</details>
+
+---
+
 <details>
 <summary><b>Save Merged LoRA</b></summary>
 
@@ -549,7 +619,7 @@ Restart ComfyUI. Nodes appear under the `loaders` category.
 <details>
 <summary><b>Compatibility</b></summary>
 
-- **Models:** SD 1.5, SDXL, Flux, Z-Image (Lumina2), Wan 2.1/2.2, LTX Video, Qwen-Image, and other architectures supported by ComfyUI
+- **Models:** SD 1.5, SDXL, Flux, Z-Image (Lumina2), Wan 2.1/2.2, LTX Video, ACE-Step, Qwen-Image, and other architectures supported by ComfyUI
 - **LoRA formats:** Standard LoRA, LoCon, LyCORIS, diffusers/PEFT formats
 - **Trainers:** Kohya, AI-Toolkit, LyCORIS, Musubi Tuner, diffusers — auto-normalized when `normalize_keys` is enabled
 - **Flux sliced weights:** Handled correctly (linear1_qkv offsets)

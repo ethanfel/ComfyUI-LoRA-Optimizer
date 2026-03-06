@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 1550" width="720" height="1550">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 1840" width="720" height="1840">
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" style="stop-color:#0f172a"/>
@@ -19,14 +19,14 @@
     </filter>
   </defs>
 
-  <rect width="720" height="1550" fill="url(#bg)" rx="16"/>
+  <rect width="720" height="1840" fill="url(#bg)" rx="16"/>
 
   <!-- Title -->
   <text x="360" y="44" font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="-0.5">LoRA Optimizer</text>
   <text x="360" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle" letter-spacing="2">DEVELOPMENT TIMELINE</text>
 
   <!-- Central timeline line -->
-  <line x1="360" y1="84" x2="360" y2="1490" stroke="url(#line-grad)" stroke-width="3" opacity="0.5"/>
+  <line x1="360" y1="84" x2="360" y2="1770" stroke="url(#line-grad)" stroke-width="3" opacity="0.5"/>
 
   <!-- === 1: Initial Release === LEFT -->
   <circle cx="360" cy="112" r="8" fill="#e94560" filter="url(#glow)"/>
@@ -196,24 +196,64 @@
   <rect x="596" y="1322" width="64" height="16" rx="8" fill="#38bdf8" opacity="0.15"/>
   <text x="628" y="1334" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#38bdf8" text-anchor="middle" font-weight="600">NODE</text>
 
+  <!-- === 19: LoRA AutoTuner === LEFT -->
+  <circle cx="360" cy="1408" r="8" fill="#e94560" filter="url(#glow)"/>
+  <circle cx="360" cy="1408" r="3" fill="#fff"/>
+  <rect x="50" y="1390" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="1408" x2="352" y2="1408" stroke="#e94560" stroke-width="2"/>
+  <text x="64" y="1406" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#e94560">LoRA AutoTuner</text>
+  <text x="64" y="1420" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Full parameter sweep, ranked candidates</text>
+  <rect x="248" y="1394" width="74" height="16" rx="8" fill="#e94560" opacity="0.15"/>
+  <text x="285" y="1406" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#e94560" text-anchor="middle" font-weight="600">NODE</text>
+
+  <!-- === 20: Merge Selector + Save/Load === RIGHT -->
+  <circle cx="360" cy="1480" r="8" fill="#38bdf8" filter="url(#glow)"/>
+  <circle cx="360" cy="1480" r="3" fill="#fff"/>
+  <rect x="388" y="1460" width="282" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="1480" x2="388" y2="1480" stroke="#38bdf8" stroke-width="2"/>
+  <text x="402" y="1478" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#38bdf8">Merge Selector + Save/Load</text>
+  <text x="402" y="1494" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Try alternatives, persist tuner results</text>
+  <rect x="596" y="1464" width="64" height="16" rx="8" fill="#38bdf8" opacity="0.15"/>
+  <text x="628" y="1476" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#38bdf8" text-anchor="middle" font-weight="600">NODE</text>
+
+  <!-- === 21: Diff Cache === LEFT -->
+  <circle cx="360" cy="1552" r="8" fill="#c026d3" filter="url(#glow)"/>
+  <circle cx="360" cy="1552" r="3" fill="#fff"/>
+  <rect x="50" y="1534" width="282" height="36" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="1552" x2="352" y2="1552" stroke="#c026d3" stroke-width="2"/>
+  <text x="64" y="1550" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#c026d3">Diff Cache</text>
+  <text x="64" y="1564" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Auto/RAM/disk caching for AutoTuner speed</text>
+  <rect x="248" y="1538" width="74" height="16" rx="8" fill="#c026d3" opacity="0.15"/>
+  <text x="285" y="1550" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#c026d3" text-anchor="middle" font-weight="600">PERF</text>
+
+  <!-- === 22: VRAM Budget === RIGHT -->
+  <circle cx="360" cy="1624" r="8" fill="#22c55e" filter="url(#glow)"/>
+  <circle cx="360" cy="1624" r="3" fill="#fff"/>
+  <rect x="388" y="1608" width="282" height="32" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="1624" x2="388" y2="1624" stroke="#22c55e" stroke-width="2"/>
+  <text x="402" y="1628" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#22c55e">VRAM Budget</text>
+  <text x="536" y="1628" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">GPU patch storage</text>
+  <rect x="596" y="1612" width="64" height="16" rx="8" fill="#22c55e" opacity="0.15"/>
+  <text x="628" y="1624" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#22c55e" text-anchor="middle" font-weight="600">OPTIMIZE</text>
+
   <!-- End dot -->
-  <circle cx="360" cy="1410" r="5" fill="#a78bfa" opacity="0.6"/>
-  <circle cx="360" cy="1410" r="2" fill="#fff" opacity="0.8"/>
+  <circle cx="360" cy="1696" r="5" fill="#a78bfa" opacity="0.6"/>
+  <circle cx="360" cy="1696" r="2" fill="#fff" opacity="0.8"/>
 
   <!-- Legend -->
-  <rect x="80" y="1514" width="560" height="24" rx="12" fill="#0f172a" stroke="#334155" stroke-width="1"/>
-  <circle cx="115" cy="1526" r="5" fill="#e94560"/>
-  <text x="125" y="1530" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Feature</text>
-  <circle cx="182" cy="1526" r="5" fill="#c026d3"/>
-  <text x="192" y="1530" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Perf</text>
-  <circle cx="228" cy="1526" r="5" fill="#a78bfa"/>
-  <text x="238" y="1530" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Strategy</text>
-  <circle cx="305" cy="1526" r="5" fill="#22c55e"/>
-  <text x="315" y="1530" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Optimize</text>
-  <circle cx="385" cy="1526" r="5" fill="#64ffda"/>
-  <text x="395" y="1530" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Compat</text>
-  <circle cx="455" cy="1526" r="5" fill="#f59e0b"/>
-  <text x="465" y="1530" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Preprocess</text>
-  <circle cx="545" cy="1526" r="5" fill="#38bdf8"/>
-  <text x="555" y="1530" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Node</text>
+  <rect x="80" y="1800" width="560" height="24" rx="12" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <circle cx="115" cy="1812" r="5" fill="#e94560"/>
+  <text x="125" y="1816" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Feature</text>
+  <circle cx="182" cy="1812" r="5" fill="#c026d3"/>
+  <text x="192" y="1816" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Perf</text>
+  <circle cx="228" cy="1812" r="5" fill="#a78bfa"/>
+  <text x="238" y="1816" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Strategy</text>
+  <circle cx="305" cy="1812" r="5" fill="#22c55e"/>
+  <text x="315" y="1816" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Optimize</text>
+  <circle cx="385" cy="1812" r="5" fill="#64ffda"/>
+  <text x="395" y="1816" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Compat</text>
+  <circle cx="455" cy="1812" r="5" fill="#f59e0b"/>
+  <text x="465" y="1816" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Preprocess</text>
+  <circle cx="545" cy="1812" r="5" fill="#38bdf8"/>
+  <text x="555" y="1816" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Node</text>
 </svg>

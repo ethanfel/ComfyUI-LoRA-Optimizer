@@ -42,6 +42,9 @@
   <rect x="446" y="134" width="140" height="24" rx="12" fill="#e94560" opacity="0.12"/>
   <text x="516" y="150" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#e94560" text-anchor="middle" font-weight="600">SVD Compression</text>
 
+  <rect x="594" y="134" width="108" height="24" rx="12" fill="#f59e0b" opacity="0.12"/>
+  <text x="648" y="150" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f59e0b" text-anchor="middle" font-weight="600">AutoTuner</text>
+
   <!-- Tags row 2 -->
   <rect x="180" y="162" width="120" height="24" rx="12" fill="#64ffda" opacity="0.12"/>
   <text x="240" y="178" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64ffda" text-anchor="middle" font-weight="600">Auto-Params</text>
