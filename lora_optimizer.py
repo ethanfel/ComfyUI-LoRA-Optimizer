@@ -4709,17 +4709,24 @@ class LoRAAutoTuner(LoRAOptimizer):
                                 sort_keys=True)
         lora_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
-        # Check AutoTuner cache
+        # Check AutoTuner cache (output_mode excluded so mode switches reuse cached sweep)
         at_cache_key = hashlib.sha256(
             f"{lora_hash}|os={output_strength}|csm={clip_strength_multiplier}"
             f"|top_n={top_n}|nk={normalize_keys}|ss={scoring_svd}"
             f"|ap={architecture_preset}|vb={vram_budget}"
-            f"|spd={scoring_speed}|om={output_mode}".encode()
+            f"|spd={scoring_speed}".encode()
         ).hexdigest()[:16]
         if cache_patches == "enabled" and hasattr(self, '_autotuner_cache') and at_cache_key in self._autotuner_cache:
-            cached = self._autotuner_cache[at_cache_key]
-            logging.info(f"[LoRA AutoTuner] Using cached result")
-            return cached
+            cached_result, cached_mode = self._autotuner_cache[at_cache_key]
+            if output_mode == "tuning_only":
+                # Return base model + cached tuner_data (no merge needed)
+                logging.info("[LoRA AutoTuner] Using cached result (tuning_only passthrough)")
+                return (model, clip, cached_result[2], "", cached_result[4], None)
+            elif cached_mode == "merge":
+                # Cached has merged model, return as-is
+                logging.info("[LoRA AutoTuner] Using cached result")
+                return cached_result
+            # else: cached was tuning_only but now need merge — fall through to re-run
 
         # --- Pass 1: Analysis (run once, reuse for all configs) ---
         model_keys = self._get_model_keys(model)
@@ -5139,7 +5146,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             logging.info("[LoRA AutoTuner] tuning_only mode — returning base model (no merge)")
             result = (model, clip, report, "", tuner_data, None)
             if cache_patches == "enabled":
-                self._autotuner_cache = {at_cache_key: result}
+                self._autotuner_cache = {at_cache_key: (result, "tuning_only")}
             else:
                 self._autotuner_cache = {}
             return result
@@ -5160,7 +5167,7 @@ class LoRAAutoTuner(LoRAOptimizer):
 
         result = (ret_model, ret_clip, report, ret_analysis_report, tuner_data, ret_lora_data)
         if cache_patches == "enabled":
-            self._autotuner_cache = {at_cache_key: result}
+            self._autotuner_cache = {at_cache_key: (result, "merge")}
         else:
             self._autotuner_cache = {}
             logging.info("[LoRA AutoTuner] Patch cache disabled — RAM freed after merge")
