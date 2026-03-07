@@ -6252,9 +6252,10 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
             active_loras, groups, group_info, lora_stats, pairwise_conflicts,
             collection_stats, warnings, detected_arch, prefix_count)
 
-        # --- Generate heatmap ---
-        lora_names = [item["name"] for item in active_loras]
-        heatmap = self._generate_heatmap(compat_matrix, lora_names, groups)
+        # --- Generate heatmap (use raw compat without baseline for visual differentiation) ---
+        raw_matrix = self._compute_raw_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras)
+        display_names = [os.path.splitext(os.path.basename(item["name"]))[0] for item in active_loras]
+        heatmap = self._generate_heatmap(raw_matrix, display_names, groups)
 
         return (report, heatmap)
 
@@ -6280,6 +6281,21 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
             compat = cos_sim * (1.0 - conflict_ratio)
             if cos_sim > -0.1:
                 compat += 0.1  # non-opposing LoRAs are safe to merge
+            matrix[i][j] = compat
+            matrix[j][i] = compat
+        return matrix
+
+    @staticmethod
+    def _compute_raw_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras):
+        """Compute N×N raw compatibility matrix without baseline (for heatmap display)."""
+        conflict_by_pair = {}
+        for pc in pairwise_conflicts:
+            conflict_by_pair[(pc["i"], pc["j"])] = pc["ratio"]
+
+        matrix = [[0.0] * n_loras for _ in range(n_loras)]
+        for (i, j), cos_sim in pairwise_similarities.items():
+            conflict_ratio = conflict_by_pair.get((i, j), 0.0)
+            compat = cos_sim * (1.0 - conflict_ratio)
             matrix[i][j] = compat
             matrix[j][i] = compat
         return matrix
@@ -6323,7 +6339,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
     @staticmethod
     def _generate_heatmap(compat_matrix, lora_names, groups):
         """Generate N×N heatmap as torch IMAGE tensor using PIL."""
-        from PIL import Image, ImageDraw
+        from PIL import Image, ImageDraw, ImageFont
         import numpy as np
 
         n = len(compat_matrix)
@@ -6336,10 +6352,17 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
             display_order.extend(g)
 
         cell_size = 80
-        margin = 150
-        img_size = margin + n * cell_size
 
-        img = Image.new("RGB", (img_size, img_size), (30, 30, 30))
+        # Compute margin from longest label
+        tmp_img = Image.new("RGB", (1, 1))
+        tmp_draw = ImageDraw.Draw(tmp_img)
+        max_label_w = max(tmp_draw.textlength(name) for name in lora_names) if lora_names else 100
+        margin = int(max_label_w) + 20  # padding
+        col_header_h = margin  # same space for rotated column headers
+        img_w = margin + n * cell_size
+        img_h = col_header_h + n * cell_size
+
+        img = Image.new("RGB", (img_w, img_h), (30, 30, 30))
         draw = ImageDraw.Draw(img)
 
         # Color mapping: continuous red (-0.4) → yellow (0.05) → green (+0.5)
@@ -6365,7 +6388,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                 orig_i = display_order[row]
                 orig_j = display_order[col]
                 x = margin + col * cell_size
-                y = margin + row * cell_size
+                y = col_header_h + row * cell_size
                 if orig_i == orig_j:
                     color = (80, 80, 80)
                     val_text = "-"
@@ -6386,24 +6409,35 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                 text_color = (0, 0, 0) if brightness > 128 else (255, 255, 255)
                 draw.text((tx, ty), val_text, fill=text_color)
 
-        # Draw labels (using reordered indices, truncated to 20 chars)
+        # Draw row labels (full name, right-aligned against grid)
         for pos in range(n):
-            label = lora_names[display_order[pos]][:20]
-            # Row labels (left)
-            y = margin + pos * cell_size + cell_size // 2 - 5
+            label = lora_names[display_order[pos]]
+            y = col_header_h + pos * cell_size + cell_size // 2 - 5
             draw.text((5, y), label, fill=(220, 220, 220))
-            # Column labels (top, horizontal)
-            x = margin + pos * cell_size + 5
-            draw.text((x, margin - 15), label[:10], fill=(220, 220, 220))
+
+        # Draw column labels (rotated 90° for readability)
+        for pos in range(n):
+            label = lora_names[display_order[pos]]
+            # Render text onto a temporary image, rotate, paste
+            bbox = tmp_draw.textbbox((0, 0), label)
+            tw = bbox[2] - bbox[0] + 4
+            th = bbox[3] - bbox[1] + 4
+            txt_img = Image.new("RGBA", (tw, th), (30, 30, 30, 255))
+            txt_draw = ImageDraw.Draw(txt_img)
+            txt_draw.text((2, 2), label, fill=(220, 220, 220, 255))
+            rotated = txt_img.rotate(90, expand=True)
+            paste_x = margin + pos * cell_size + (cell_size - rotated.width) // 2
+            paste_y = col_header_h - rotated.height - 5
+            img.paste(rotated.convert("RGB"), (paste_x, max(0, paste_y)))
 
         # Draw group borders (contiguous after reordering)
         pos = 0
         for group in groups:
             if len(group) > 1:
                 x0 = margin + pos * cell_size - 1
-                y0 = margin + pos * cell_size - 1
+                y0 = col_header_h + pos * cell_size - 1
                 x1 = margin + (pos + len(group)) * cell_size
-                y1 = margin + (pos + len(group)) * cell_size
+                y1 = col_header_h + (pos + len(group)) * cell_size
                 for offset in range(3):
                     draw.rectangle([x0 - offset, y0 - offset, x1 + offset, y1 + offset],
                                    outline=(255, 255, 255))
