@@ -532,6 +532,10 @@ LoRA AutoTuner → TUNER_DATA → Merge Selector (selection=2) → try the 2nd-b
 
 Chain the AutoTuner and Optimizer in a **single model line** for a "find best, then tweak" workflow. Only one node merges at a time — the other passes the model through. A single switch controls which is active, and the two nodes stay in sync automatically.
 
+<p align="center">
+  <img src="assets/bridge-workflow.svg" alt="AutoTuner ↔ Optimizer Bridge workflow" width="700">
+</p>
+
 ```
 [Load Model] → [AutoTuner] → model → [Optimizer] → MODEL → sampler
 [LoRA Stack]  → [AutoTuner]
