@@ -10,7 +10,27 @@ import { app } from "/scripts/app.js";
  *    an Optimizer, their mode switches stay in sync as opposites:
  *      Optimizer "from_autotuner" ↔ AutoTuner "merge"
  *      Optimizer "manual"         ↔ AutoTuner "tuning_only"
+ *
+ * 3. Conditional visibility: settings_source (Optimizer) and output_mode
+ *    (AutoTuner) are hidden until tuner_data is connected.
  */
+
+const HIDDEN_TAG = "loraopt_bridge_hidden";
+const _origProps = {};
+
+function toggleWidget(node, widget, show) {
+    if (!widget) return;
+    const key = node.id + ":" + widget.name;
+    if (!_origProps[key]) {
+        _origProps[key] = {
+            origType: widget.type,
+            origComputeSize: widget.computeSize,
+        };
+    }
+    widget.hidden = !show;
+    widget.type = show ? _origProps[key].origType : HIDDEN_TAG;
+    widget.computeSize = show ? _origProps[key].origComputeSize : () => [0, -4];
+}
 
 const BRIDGE_WIDGETS = [
     "optimization_mode",
@@ -75,6 +95,48 @@ function findConnectedOptimizer(autotunerNode) {
         }
     }
     return null;
+}
+
+/**
+ * Check if the Optimizer's tuner_data input slot is connected.
+ */
+function isTunerDataInputConnected(optimizerNode) {
+    if (!optimizerNode.inputs) return false;
+    for (const input of optimizerNode.inputs) {
+        if (input.name === "tuner_data" && input.link != null) return true;
+    }
+    return false;
+}
+
+/**
+ * Check if the AutoTuner's tuner_data output slot has any connections.
+ */
+function isTunerDataOutputConnected(autotunerNode) {
+    if (!autotunerNode.outputs) return false;
+    for (const output of autotunerNode.outputs) {
+        if (output.name === "tuner_data" && output.links && output.links.length > 0) return true;
+    }
+    return false;
+}
+
+function updateOptimizerVisibility(node) {
+    const w = findWidget(node, "settings_source");
+    if (!w) return;
+    const connected = isTunerDataInputConnected(node);
+    toggleWidget(node, w, connected);
+    if (!connected) w.value = "manual";
+    node.setSize(node.computeSize());
+    app.canvas?.setDirty?.(true, true);
+}
+
+function updateAutoTunerVisibility(node) {
+    const w = findWidget(node, "output_mode");
+    if (!w) return;
+    const connected = isTunerDataOutputConnected(node);
+    toggleWidget(node, w, connected);
+    if (!connected) w.value = "merge";
+    node.setSize(node.computeSize());
+    app.canvas?.setDirty?.(true, true);
 }
 
 // Guard against infinite recursion during sync
@@ -144,6 +206,17 @@ app.registerExtension({
                 syncOppositeSwitch(settingsWidget, node, findConnectedAutoTuner, OPTIMIZER_TO_AUTOTUNER);
             };
         }
+
+        // Hide settings_source until tuner_data is connected
+        updateOptimizerVisibility(node);
+        const origOnConnChange = node.onConnectionsChange;
+        node.onConnectionsChange = function (side, slot, connected, linkInfo, ioSlot) {
+            if (origOnConnChange) origOnConnChange.apply(this, arguments);
+            // side 1 = input; check if it's the tuner_data slot
+            if (side === 1 && this.inputs?.[slot]?.name === "tuner_data") {
+                updateOptimizerVisibility(this);
+            }
+        };
     },
 });
 
@@ -162,5 +235,16 @@ app.registerExtension({
                 syncOppositeSwitch(outputModeWidget, node, findConnectedOptimizer, AUTOTUNER_TO_OPTIMIZER);
             };
         }
+
+        // Hide output_mode until tuner_data output is connected
+        updateAutoTunerVisibility(node);
+        const origOnConnChange = node.onConnectionsChange;
+        node.onConnectionsChange = function (side, slot, connected, linkInfo, ioSlot) {
+            if (origOnConnChange) origOnConnChange.apply(this, arguments);
+            // side 2 = output; check if it's the tuner_data slot
+            if (side === 2 && this.outputs?.[slot]?.name === "tuner_data") {
+                updateAutoTunerVisibility(this);
+            }
+        };
     },
 });
