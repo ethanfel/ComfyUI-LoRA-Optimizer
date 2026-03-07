@@ -5818,7 +5818,6 @@ class SaveMergedLoRA:
         unmapped_keys = []
         nan_keys = []
         zero_keys = []
-        shape_info = []
         for is_clip, patches in [(False, model_patches), (True, clip_patches)]:
             for target_key, patch in patches.items():
                 direct = key_map.get(target_key)
@@ -5854,6 +5853,44 @@ class SaveMergedLoRA:
         prefixes = sorted(set(k.rsplit('.lora_', 1)[0] for k in state_dict if '.lora_' in k))
         if prefixes:
             logging.info(f"[Save Merged LoRA] Sample prefixes: {prefixes[:3]} ... ({len(prefixes)} total)")
+
+        # Roundtrip SVD quality check: compare reconstructed diffs against originals
+        svd_errors = []
+        for is_clip, patches in [(False, model_patches), (True, clip_patches)]:
+            for target_key, patch in patches.items():
+                lora_prefix = key_map.get(target_key)
+                if lora_prefix is None:
+                    continue
+                up_key = f"{lora_prefix}.lora_up.weight"
+                down_key = f"{lora_prefix}.lora_down.weight"
+                alpha_key = f"{lora_prefix}.alpha"
+                if up_key not in state_dict:
+                    continue
+                # Reconstruct diff from saved up/down
+                saved_up = state_dict[up_key].float()
+                saved_down = state_dict[down_key].float()
+                saved_alpha = state_dict[alpha_key].item()
+                rank = saved_down.shape[0]
+                scale = saved_alpha / rank
+                reconstructed = torch.mm(saved_up, saved_down) * scale
+                # Get original diff for comparison
+                if isinstance(patch, tuple) and patch[0] == "diff":
+                    orig_diff = patch[1][0].float()
+                    strength = clip_strength if is_clip else output_strength
+                    if bake_strength:
+                        orig_with_strength = orig_diff * strength
+                    else:
+                        orig_with_strength = orig_diff
+                    orig_norm = orig_with_strength.norm().item()
+                    if orig_norm > 0:
+                        error = (reconstructed - orig_with_strength).norm().item() / orig_norm
+                        svd_errors.append(error)
+        if svd_errors:
+            avg_err = sum(svd_errors) / len(svd_errors)
+            max_err = max(svd_errors)
+            logging.info(f"[Save Merged LoRA] SVD reconstruction error: "
+                         f"avg={avg_err:.4f}, max={max_err:.4f} "
+                         f"({len(svd_errors)} diffs checked)")
 
         save_file(state_dict, save_path)
         logging.info(f"[Save Merged LoRA] Saved {n_keys} LoRA keys to {save_path}")
