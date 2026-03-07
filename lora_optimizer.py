@@ -6422,6 +6422,10 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
         n_loras = len(active_loras)
         lines = []
 
+        def _dn(name):
+            """Display name: strip .safetensors extension."""
+            return name.removesuffix(".safetensors")
+
         lines.append("=" * 55)
         lines.append("  LoRA Compatibility Analysis")
         lines.append("=" * 55)
@@ -6451,7 +6455,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
             lines.append(f"Group {group_num} -- {label} (compatibility: {confidence})")
             for idx in indices:
                 strength = gi["strengths"].get(idx, active_loras[idx]["strength"])
-                name = active_loras[idx]["name"]
+                name = _dn(active_loras[idx]["name"])
                 lines.append(f"  * {name:<28s} strength {strength:.2f}")
             lines.append(f"  Avg cosine sim: {gi['avg_cos_sim']:.2f} | "
                         f"Avg conflict: {gi['avg_conflict']:.0%}")
@@ -6462,11 +6466,11 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
             lines.append("Solo -- Use independently")
             for gi in solo_entries:
                 idx = gi["indices"][0]
-                name = active_loras[idx]["name"]
+                name = _dn(active_loras[idx]["name"])
                 strength = gi["strength"]
                 lines.append(f"  * {name:<28s} strength {strength:.2f}")
                 if gi["opposing"]:
-                    opp_strs = [f"{oname} (cos: {cs:.2f})" for oname, cs in gi["opposing"][:3]]
+                    opp_strs = [f"{_dn(oname)} (cos: {cs:.2f})" for oname, cs in gi["opposing"][:3]]
                     lines.append(f"    Opposes: {', '.join(opp_strs)}")
             lines.append("")
 
@@ -6476,17 +6480,17 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
             lines.append("")
             for w in warnings:
                 if w["type"] == "opposing":
-                    lines.append(f"! {w['name_i']} vs {w['name_j']}: Opposing (cos_sim: {w['cos_sim']:.2f})")
+                    lines.append(f"! {_dn(w['name_i'])} vs {_dn(w['name_j'])}: Opposing (cos_sim: {w['cos_sim']:.2f})")
                     lines.append(f"  These cancel each other out -- using both will degrade quality.")
                     lines.append("")
                 elif w["type"] == "magnitude_group":
-                    lines.append(f"! {w['stronger']} ({w['avg_ratio']:.1f}x avg) overshadows:")
-                    lines.append(f"  {', '.join(w['weaker_list'])}")
+                    lines.append(f"! {_dn(w['stronger'])} ({w['avg_ratio']:.1f}x avg) overshadows:")
+                    lines.append(f"  {', '.join(_dn(n) for n in w['weaker_list'])}")
                     lines.append(f"  Consider lowering its strength or raising weaker LoRAs.")
                     lines.append("")
                 elif w["type"] == "magnitude":
-                    lines.append(f"! {w['stronger']} is {w['ratio']:.1f}x stronger than {w['weaker']}")
-                    lines.append(f"  {w['weaker']} may be overshadowed at equal strengths.")
+                    lines.append(f"! {_dn(w['stronger'])} is {w['ratio']:.1f}x stronger than {_dn(w['weaker'])}")
+                    lines.append(f"  {_dn(w['weaker'])} may be overshadowed at equal strengths.")
                     lines.append("")
 
         # --- Pairwise Compatibility Table ---
@@ -6495,7 +6499,10 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
 
         # Sort by compat score descending
         sorted_pairs = sorted(pairwise_conflicts, key=lambda p: p["cosine_sim"] * (1.0 - p["ratio"]), reverse=True)
-        for pc in sorted_pairs:
+        # Compute max pair label width for right-aligned columns
+        pair_labels = [_dn(pc["pair"]) for pc in sorted_pairs]
+        max_pair_w = max((len(p) for p in pair_labels), default=45)
+        for pc, pair_label in zip(sorted_pairs, pair_labels):
             conflict = pc["ratio"]
             cos = round(pc["cosine_sim"], 2) + 0.0  # avoid -0.00
             compat = round(pc["cosine_sim"] * (1.0 - conflict), 2) + 0.0  # avoid -0.00
@@ -6506,7 +6513,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                 indicator = " [!!]"
             if pc.get("shared_prefixes", 1) == 0:
                 indicator += " (no shared keys)"
-            lines.append(f"  {pc['pair']:<45s}  "
+            lines.append(f"  {pair_label:<{max_pair_w}s}  "
                         f"cos:{cos:6.2f}  conflict:{conflict:5.0%}  compat:{compat:6.2f}{indicator}")
         lines.append("")
         lines.append("=" * 55)
