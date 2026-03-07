@@ -5700,10 +5700,13 @@ class SaveMergedLoRA:
 
     @classmethod
     def INPUT_TYPES(cls):
+        lora_folders = folder_paths.get_folder_paths("loras")
+        folder_choices = lora_folders if lora_folders else [os.path.join(folder_paths.models_dir, "loras")]
         return {
             "required": {
                 "lora_data": ("LORA_DATA", {"tooltip": "Connect the lora_data output from LoRA Optimizer here."}),
-                "filename": ("STRING", {"default": "merged_lora", "tooltip": "Name or path for the saved file. Plain name (e.g. 'merged_lora') saves to your ComfyUI loras folder. Absolute path (e.g. '/path/to/my_lora') saves to that location. Extension .safetensors is added automatically."}),
+                "save_folder": (folder_choices, {"tooltip": "Which loras folder to save into. Lists all configured lora paths (from extra_model_paths.yaml and defaults)."}),
+                "filename": ("STRING", {"default": "merged_lora", "tooltip": "Name for the saved file. Subdirectories allowed (e.g. 'merged/my_lora'). Extension .safetensors is added automatically."}),
                 "save_rank": ("INT", {
                     "default": 0, "min": 0, "max": 1024, "step": 4,
                     "tooltip": "0 = auto (uses each layer's existing rank from the merge — recommended). Non-zero = force this rank for any layers that need compression. Higher values = more accurate but larger file."
@@ -5722,13 +5725,13 @@ class SaveMergedLoRA:
     OUTPUT_NODE = True
     DESCRIPTION = "Saves merged LoRA data as a standalone .safetensors file that can be loaded by any standard LoRA loader."
 
-    def save_lora(self, lora_data, filename, save_rank=0, bake_strength=True):
+    def save_lora(self, lora_data, save_folder, filename, save_rank=0, bake_strength=True):
         if lora_data is None:
             logging.warning("[Save Merged LoRA] No lora_data received (optimizer may have returned early). Nothing to save.")
             return ("",)
 
-        # Determine save path — subdirectories allowed, but must stay inside loras/
-        save_dir = folder_paths.get_folder_paths("loras")[0]
+        # Determine save path — subdirectories allowed, but must stay inside chosen folder
+        save_dir = save_folder
         base = filename if filename.endswith('.safetensors') else f"{filename}.safetensors"
         save_path = os.path.join(save_dir, base)
         if not os.path.realpath(save_path).startswith(os.path.realpath(save_dir) + os.sep):
