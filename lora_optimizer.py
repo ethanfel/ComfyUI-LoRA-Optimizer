@@ -2242,6 +2242,7 @@ class _LoRAMergeBase:
         pairs = [(i, j) for i in range(len(active_loras))
                          for j in range(i + 1, len(active_loras))]
         pair_accum = {(i, j): [0, 0, 0.0, 0.0, 0.0] for i, j in pairs}
+        pair_shared_prefixes = {(i, j): 0 for i, j in pairs}
         all_magnitude_samples = []
         prefix_count = 0
         prefix_stats = {}
@@ -2265,6 +2266,7 @@ class _LoRAMergeBase:
                 pair_accum[(i, j)][2] += dot
                 pair_accum[(i, j)][3] += na_sq
                 pair_accum[(i, j)][4] += nb_sq
+                pair_shared_prefixes[(i, j)] += 1
             all_magnitude_samples.extend(mag_samples)
 
             if len(partial_stats) > 0:
@@ -2315,6 +2317,7 @@ class _LoRAMergeBase:
             "all_key_targets": all_key_targets,
             "per_lora_stats": per_lora_stats,
             "pair_accum": pair_accum,
+            "pair_shared_prefixes": pair_shared_prefixes,
             "all_magnitude_samples": all_magnitude_samples,
             "prefix_count": prefix_count,
             "prefix_stats": prefix_stats,
@@ -6049,6 +6052,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
         # --- Finalize stats ---
         per_lora_stats = analysis["per_lora_stats"]
         pair_accum = analysis["pair_accum"]
+        pair_shared_prefixes = analysis["pair_shared_prefixes"]
         pairs = analysis["pairs"]
 
         lora_stats = []
@@ -6091,6 +6095,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                 "conflicts": pair_conflict,
                 "ratio": ratio,
                 "cosine_sim": cos_sim,
+                "shared_prefixes": pair_shared_prefixes[(i, j)],
             })
 
         avg_conflict_ratio = total_conflict / total_overlap if total_overlap > 0 else 0
@@ -6203,7 +6208,17 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                     "name_j": nb,
                     "cos_sim": pc["cosine_sim"],
                 })
-        # Magnitude imbalance warnings
+        # Magnitude imbalance warnings — consolidated per strong LoRA
+        # Compute per-LoRA average magnitude ratio vs all others
+        lora_avg_ratios = {}  # idx -> avg ratio relative to mean
+        if len(l2_means) >= 2:
+            valid_l2 = [m for m in l2_means if m > 0]
+            mean_l2 = sum(valid_l2) / len(valid_l2) if valid_l2 else 1.0
+            for idx, l2 in enumerate(l2_means):
+                if l2 > 0 and mean_l2 > 0:
+                    lora_avg_ratios[idx] = l2 / mean_l2
+
+        strong_loras = {}  # strong_idx -> [(weak_name, ratio)]
         for pc in pairwise_conflicts:
             i, j = pc["i"], pc["j"]
             l2_i = l2_means[i]
@@ -6211,15 +6226,23 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
             if l2_i > 0 and l2_j > 0:
                 ratio = max(l2_i, l2_j) / min(l2_i, l2_j)
                 if ratio > 3.0:
-                    na, nb = _disambiguate(i, j)
-                    stronger = na if l2_i > l2_j else nb
-                    weaker = nb if l2_i > l2_j else na
-                    warnings.append({
-                        "type": "magnitude",
-                        "stronger": stronger,
-                        "weaker": weaker,
-                        "ratio": ratio,
-                    })
+                    strong_idx = i if l2_i > l2_j else j
+                    weak_idx = j if l2_i > l2_j else i
+                    weak_name = active_loras[weak_idx]["name"]
+                    if strong_idx not in strong_loras:
+                        strong_loras[strong_idx] = []
+                    if weak_name not in [w for w, _ in strong_loras[strong_idx]]:
+                        strong_loras[strong_idx].append((weak_name, ratio))
+        for strong_idx in sorted(strong_loras.keys()):
+            weak_list = strong_loras[strong_idx]
+            strong_name = active_loras[strong_idx]["name"]
+            avg_ratio = lora_avg_ratios.get(strong_idx, 0.0)
+            warnings.append({
+                "type": "magnitude_group",
+                "stronger": strong_name,
+                "avg_ratio": avg_ratio,
+                "weaker_list": [w for w, _ in weak_list],
+            })
 
         elapsed = time.time() - t_start
         logging.info(f"[Compatibility Analyzer] Analysis complete ({elapsed:.1f}s)")
@@ -6242,7 +6265,11 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
 
     @staticmethod
     def _compute_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras):
-        """Compute N×N compatibility matrix: compat[i][j] = cos_sim * (1 - conflict_ratio)."""
+        """Compute N×N compatibility matrix: compat[i][j] = cos_sim * (1 - conflict_ratio) + baseline.
+
+        Non-opposing LoRAs (cos_sim > -0.1) get a +0.1 baseline because orthogonal
+        LoRAs are safe to merge — they don't interfere with each other.
+        """
         conflict_by_pair = {}
         for pc in pairwise_conflicts:
             conflict_by_pair[(pc["i"], pc["j"])] = pc["ratio"]
@@ -6251,6 +6278,8 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
         for (i, j), cos_sim in pairwise_similarities.items():
             conflict_ratio = conflict_by_pair.get((i, j), 0.0)
             compat = cos_sim * (1.0 - conflict_ratio)
+            if cos_sim > -0.1:
+                compat += 0.1  # non-opposing LoRAs are safe to merge
             matrix[i][j] = compat
             matrix[j][i] = compat
         return matrix
@@ -6418,7 +6447,8 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
 
             group_num += 1
             confidence = gi["confidence"]
-            lines.append(f"Group {group_num} -- Merge together (compatibility: {confidence})")
+            label = "Safe to combine" if confidence == "Low" else "Merge together"
+            lines.append(f"Group {group_num} -- {label} (compatibility: {confidence})")
             for idx in indices:
                 strength = gi["strengths"].get(idx, active_loras[idx]["strength"])
                 name = active_loras[idx]["name"]
@@ -6449,6 +6479,11 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                     lines.append(f"! {w['name_i']} vs {w['name_j']}: Opposing (cos_sim: {w['cos_sim']:.2f})")
                     lines.append(f"  These cancel each other out -- using both will degrade quality.")
                     lines.append("")
+                elif w["type"] == "magnitude_group":
+                    lines.append(f"! {w['stronger']} ({w['avg_ratio']:.1f}x avg) overshadows:")
+                    lines.append(f"  {', '.join(w['weaker_list'])}")
+                    lines.append(f"  Consider lowering its strength or raising weaker LoRAs.")
+                    lines.append("")
                 elif w["type"] == "magnitude":
                     lines.append(f"! {w['stronger']} is {w['ratio']:.1f}x stronger than {w['weaker']}")
                     lines.append(f"  {w['weaker']} may be overshadowed at equal strengths.")
@@ -6461,14 +6496,16 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
         # Sort by compat score descending
         sorted_pairs = sorted(pairwise_conflicts, key=lambda p: p["cosine_sim"] * (1.0 - p["ratio"]), reverse=True)
         for pc in sorted_pairs:
-            cos = pc["cosine_sim"]
+            cos = pc["cosine_sim"] + 0.0  # avoid -0.0
             conflict = pc["ratio"]
-            compat = cos * (1.0 - conflict)
+            compat = cos * (1.0 - conflict) + 0.0  # avoid -0.0
             indicator = ""
             if compat > 0.2:
                 indicator = " [OK]"
             elif compat < -0.05:
                 indicator = " [!!]"
+            if pc.get("shared_prefixes", 1) == 0:
+                indicator += " (no shared keys)"
             lines.append(f"  {pc['pair']:<45s}  "
                         f"cos:{cos:6.2f}  conflict:{conflict:5.0%}  compat:{compat:6.2f}{indicator}")
         lines.append("")
