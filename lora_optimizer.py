@@ -4609,10 +4609,12 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         # Build reverse key map: target_key → lora_prefix
         # (used by SaveMergedLoRA to reconstruct standard LoRA key names)
+        # Use the FULL target_key (including offset tuple) as the dict key so
+        # split Q/K/V patches targeting different slices of the same fused weight
+        # don't overwrite each other (e.g., Z-Image fused QKV).
         reverse_key_map = {}
         for lora_prefix, (target_key, is_clip) in all_key_targets.items():
-            tkey = target_key[0] if isinstance(target_key, tuple) else target_key
-            reverse_key_map[tkey] = lora_prefix
+            reverse_key_map[target_key] = lora_prefix
 
         # Auto output strength: -1 = use suggested max strength
         auto_output_strength = False
@@ -5776,8 +5778,12 @@ class SaveMergedLoRA:
 
         for is_clip, patches in [(False, model_patches), (True, clip_patches)]:
             for target_key, patch in patches.items():
-                tkey = target_key[0] if isinstance(target_key, tuple) else target_key
-                lora_prefix = key_map.get(tkey, tkey)
+                # Look up by full target_key first (preserves offset info for split
+                # Q/K/V patches), then fall back to base key string for non-tuple keys.
+                lora_prefix = key_map.get(target_key)
+                if lora_prefix is None:
+                    tkey = target_key[0] if isinstance(target_key, tuple) else target_key
+                    lora_prefix = key_map.get(tkey, tkey)
 
                 if isinstance(patch, (LoKrAdapter, LoHaAdapter)):
                     # Expand LoKr/LoHa to full diff and compress to standard LoRA format
