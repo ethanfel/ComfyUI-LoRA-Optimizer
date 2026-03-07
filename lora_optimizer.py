@@ -4653,7 +4653,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "tooltip": "Controls how many prefixes Phase 2 scores per candidate. "
                                "All candidates are scored on the same subset so ranking stays fair.\n\n"
                                "• full — Score every prefix. Best accuracy, slowest. Use when merging very different LoRAs (e.g. style + character + concept) where block behavior varies a lot.\n"
-                               "• fast — Every 2nd prefix (~50%% faster). Good default for most merges.\n"
+                               "• fast — Every 2nd prefix (~50%% faster). Higher accuracy than turbo, still much faster than full.\n"
                                "• turbo — Every 3rd prefix (~67%% faster). Works well when your LoRAs have similar conflict across blocks (e.g. multiple characters from the same trainer).\n"
                                "• turbo+ — Every 4th prefix (~75%% faster). Best for large models (DiT/Flux/WAN) or when iterating quickly. May miss subtle block-level differences on SD/SDXL."
                 }),
