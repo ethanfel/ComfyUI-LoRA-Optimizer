@@ -2549,8 +2549,8 @@ class LoRAOptimizer(_LoRAMergeBase):
             "required": {
                 "model": ("MODEL", {"tooltip": "Your base model (e.g. SDXL, Flux). The merged LoRAs will be applied to it."}),
                 "lora_stack": ("LORA_STACK", {"tooltip": "Connect a LoRA Stack node here. This is the list of LoRAs you want to merge together."}),
-                "output_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                                              "tooltip": "Master volume for the merged result. 1.0 = full effect, 0.5 = half, 0 = no effect. Start at 1.0 and lower if the result looks too strong."}),
+                "output_strength": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 10.0, "step": 0.05,
+                                              "tooltip": "Master volume for the merged result. 1.0 = full effect, 0.5 = half, 0 = disabled. Set to -1 for auto: uses the suggested max strength (compensates for energy lost during merge)."}),
             },
             "optional": {
                 "clip": ("CLIP", {"tooltip": "The text encoder. Connect this so LoRAs can also affect how your prompts are understood. Leave empty for video models that don't use CLIP."}),
@@ -3487,9 +3487,14 @@ class LoRAOptimizer(_LoRAMergeBase):
         lines.append(f"  CLIP patches: {merge_summary['clip_patches']}")
         if merge_summary.get('skipped_keys', 0) > 0:
             lines.append(f"  Skipped keys: {merge_summary['skipped_keys']} (shape mismatch, e.g. sliced weights)")
-        lines.append(f"  Output strength: {merge_summary['output_strength']}")
+        os_val = merge_summary['output_strength']
+        auto_os = merge_summary.get('auto_output_strength', False)
+        if auto_os:
+            lines.append(f"  Output strength: {os_val:.2f} (auto — suggested max)")
+        else:
+            lines.append(f"  Output strength: {os_val}")
         lines.append(f"  CLIP strength: {merge_summary['clip_strength']}")
-        if merge_summary.get('suggested_max_strength') is not None:
+        if not auto_os and merge_summary.get('suggested_max_strength') is not None:
             sms = merge_summary['suggested_max_strength']
             lines.append(f"  Suggested max output_strength: {sms:.2f}")
             if sms >= 3.0:
@@ -3641,11 +3646,18 @@ class LoRAOptimizer(_LoRAMergeBase):
         cache_key = f"{cache_key}|mid={id(model)}"
         if cache_patches == "enabled" and cache_key in self._merge_cache:
             model_patches, clip_patches, report, clip_strength_out, lora_data = self._merge_cache[cache_key]
+            # Resolve auto output_strength from cached suggested_max_strength
+            cached_os = output_strength
+            if cached_os < 0 and lora_data and lora_data.get("suggested_max_strength") is not None:
+                cached_os = lora_data["suggested_max_strength"]
+                clip_strength_out = cached_os * clip_strength_multiplier
+            elif cached_os < 0:
+                cached_os = 1.0
             new_model = model
             new_clip = clip
             if model is not None and len(model_patches) > 0:
                 new_model = model.clone()
-                new_model.add_patches(model_patches, output_strength)
+                new_model.add_patches(model_patches, cached_os)
                 self._update_model_size(new_model, model_patches)
             if clip is not None and len(clip_patches) > 0:
                 new_clip = clip.clone()
@@ -4419,6 +4431,16 @@ class LoRAOptimizer(_LoRAMergeBase):
             tkey = target_key[0] if isinstance(target_key, tuple) else target_key
             reverse_key_map[tkey] = lora_prefix
 
+        # Auto output strength: -1 = use suggested max strength
+        auto_output_strength = False
+        if output_strength < 0 and suggested_max_strength is not None:
+            output_strength = suggested_max_strength
+            auto_output_strength = True
+            logging.info(f"[LoRA Optimizer] Auto output_strength: {output_strength:.2f} (suggested max)")
+        elif output_strength < 0:
+            output_strength = 1.0
+            logging.info("[LoRA Optimizer] Auto output_strength: no suggestion available, using 1.0")
+
         # Apply patches
         new_model = model
         new_clip = clip
@@ -4450,6 +4472,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             "output_strength": output_strength,
             "clip_strength": clip_strength_out,
             "suggested_max_strength": suggested_max_strength,
+            "auto_output_strength": auto_output_strength,
         }
 
         report = self._build_report(
@@ -4520,8 +4543,8 @@ class LoRAOptimizerSimple(LoRAOptimizer):
                     "tooltip": "LoRA stack from a LoRA Stack node."
                 }),
                 "output_strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Global multiplier applied after merging."
+                    "default": 1.0, "min": -1.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Global multiplier applied after merging. Set to -1 for auto (uses suggested max strength)."
                 }),
             },
             "optional": {
@@ -4598,8 +4621,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "tooltip": "LoRA stack from a LoRA Stack node."
                 }),
                 "output_strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Master volume for the merged result."
+                    "default": 1.0, "min": -1.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Master volume for the merged result. Set to -1 for auto (uses suggested max strength)."
                 }),
             },
             "optional": {
@@ -5332,8 +5355,8 @@ class LoRAMergeSelector(LoRAOptimizer):
                     "tooltip": "Which ranked configuration to apply (1 = best, 2 = second best, etc.)."
                 }),
                 "output_strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Master volume for the merged result."
+                    "default": 1.0, "min": -1.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Master volume for the merged result. Set to -1 for auto (uses suggested max strength)."
                 }),
             },
             "optional": {
