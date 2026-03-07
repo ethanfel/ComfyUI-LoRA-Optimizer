@@ -5627,14 +5627,13 @@ class SaveMergedLoRA:
             logging.warning("[Save Merged LoRA] No lora_data received (optimizer may have returned early). Nothing to save.")
             return ("",)
 
-        # Determine save path — always constrained to the loras directory
+        # Determine save path — subdirectories allowed, but must stay inside loras/
         save_dir = folder_paths.get_folder_paths("loras")[0]
-        base = os.path.basename(filename)
-        base = base if base.endswith('.safetensors') else f"{base}.safetensors"
+        base = filename if filename.endswith('.safetensors') else f"{filename}.safetensors"
         save_path = os.path.join(save_dir, base)
-        # Verify resolved path stays inside the loras directory
-        if not os.path.realpath(save_path).startswith(os.path.realpath(save_dir)):
+        if not os.path.realpath(save_path).startswith(os.path.realpath(save_dir) + os.sep):
             raise ValueError(f"[Save Merged LoRA] Path escapes loras directory: {filename}")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
         model_patches = lora_data["model_patches"]
         clip_patches = lora_data["clip_patches"]
@@ -5715,12 +5714,11 @@ class SaveTunerData:
     def save_tuner_data(self, tuner_data, filename):
         if tuner_data is None:
             return ("",)
-        base = os.path.basename(filename)
-        base = base if base.endswith(".json") else f"{base}.json"
+        base = filename if filename.endswith(".json") else f"{filename}.json"
         save_path = os.path.join(TUNER_DATA_DIR, base)
-        # Verify resolved path stays inside the tuner_data directory
-        if not os.path.realpath(save_path).startswith(os.path.realpath(TUNER_DATA_DIR)):
+        if not os.path.realpath(save_path).startswith(os.path.realpath(TUNER_DATA_DIR) + os.sep):
             raise ValueError(f"[Save Tuner Data] Path escapes tuner_data directory: {filename}")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with open(save_path, "w") as f:
             json.dump(tuner_data, f, indent=2)
         logging.info(f"[Save Tuner Data] Saved to: {save_path}")
