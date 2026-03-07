@@ -5989,7 +5989,13 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
     RETURN_NAMES = ("report", "compatibility_map")
     FUNCTION = "analyze"
     CATEGORY = "LoRA Optimizer"
+    OUTPUT_NODE = True
     DESCRIPTION = "Analyzes pairwise LoRA compatibility and recommends merge groups. No merge is performed — use this to plan which LoRAs to combine before merging."
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        """Always re-execute — analysis-only node, no caching."""
+        return float("NaN")
 
     def analyze(self, model, lora_stack, clip=None):
         if not lora_stack or len(lora_stack) == 0:
