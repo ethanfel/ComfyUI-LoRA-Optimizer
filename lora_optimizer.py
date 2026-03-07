@@ -2585,8 +2585,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "tooltip": "Where to run compression math. GPU is much faster (10-50x). Switch to CPU only if you get out-of-memory errors during the merge."
                 }),
                 "normalize_keys": (["disabled", "enabled"], {
-                    "default": "disabled",
-                    "tooltip": "Makes LoRAs from different training tools compatible with each other. Enable if your LoRAs were trained with different software (e.g. Kohya vs AI-Toolkit vs PEFT) or if merging fails without it."
+                    "default": "enabled",
+                    "tooltip": "Remaps LoRA keys to a canonical format so LoRAs from different training tools (Kohya, AI-Toolkit, PEFT, Musubi Tuner) can be merged correctly. Also splits fused QKV into separate Q/K/V for per-component conflict analysis. Recommended to keep enabled — disable only if it causes issues with unusual LoRA formats."
                 }),
                 "sparsification": (["disabled", "dare", "della", "dare_conflict", "della_conflict"], {
                     "default": "disabled",
