@@ -19,6 +19,8 @@ import comfy.utils
 import comfy.sd
 import comfy.lora
 from comfy.weight_adapter.lora import LoRAAdapter
+from comfy.weight_adapter.lokr import LoKrAdapter
+from comfy.weight_adapter.loha import LoHaAdapter
 from safetensors.torch import save_file
 
 TUNER_DATA_DIR = os.path.join(folder_paths.models_dir, "tuner_data")
@@ -1057,14 +1059,14 @@ class _LoRAMergeBase:
                     fused_key = fused_key_str
 
                 # Handle different patch formats
-                if isinstance(q_patch, tuple) and q_patch[0] == "diff":
+                if all(isinstance(p, tuple) and p[0] == "diff" for p in [q_patch, k_patch, v_patch]):
                     # Full-rank diff patch: ("diff", (tensor,))
                     q_diff = q_patch[1][0]
                     k_diff = k_patch[1][0]
                     v_diff = v_patch[1][0]
                     fused_diff = torch.cat([q_diff, k_diff, v_diff], dim=0)
                     fused[fused_key] = ("diff", (fused_diff,))
-                elif isinstance(q_patch, LoRAAdapter):
+                elif all(isinstance(p, LoRAAdapter) for p in [q_patch, k_patch, v_patch]):
                     q_data = q_patch.weights
                     k_data = k_patch.weights
                     v_data = v_patch.weights
@@ -1090,6 +1092,13 @@ class _LoRAMergeBase:
                             parts.append(diff)
                         fused_diff = torch.cat(parts, dim=0)
                         fused[fused_key] = ("diff", (fused_diff,))
+                elif any(hasattr(p, 'weights') for p in [q_patch, k_patch, v_patch]):
+                    # LoKr/LoHa or mixed adapter types: expand to diff, then fuse
+                    parts = []
+                    for comp_patch in [q_patch, k_patch, v_patch]:
+                        parts.append(self._expand_patch_to_diff(comp_patch))
+                    fused_diff = torch.cat(parts, dim=0)
+                    fused[fused_key] = ("diff", (fused_diff,))
                 else:
                     # Unknown patch format — pass through unfused
                     for comp_key, comp_patch in [(q_key, q_patch), (k_key, k_patch), (v_key, v_patch)]:
@@ -1325,10 +1334,63 @@ class _LoRAMergeBase:
 
     @staticmethod
     def _expand_patch_to_diff(patch):
-        """Expand a patch (diff tuple or LoRAAdapter) to a float32 diff tensor."""
+        """Expand a patch (diff tuple, LoRAAdapter, LoKrAdapter, LoHaAdapter) to a float32 diff tensor."""
         if isinstance(patch, tuple) and patch[0] == "diff":
             return patch[1][0].float()
+        elif isinstance(patch, LoKrAdapter):
+            v = patch.weights
+            # weights = (w1, w2, alpha, w1_a, w1_b, w2_a, w2_b, t2, dora_scale)
+            w1, w2, alpha = v[0], v[1], v[2]
+            w1_a, w1_b = v[3], v[4]
+            w2_a, w2_b, t2 = v[5], v[6], v[7]
+            if isinstance(alpha, torch.Tensor):
+                alpha = alpha.item()
+            dim = None
+            if w1 is None:
+                dim = w1_b.shape[0]
+                w1 = torch.mm(w1_a.float(), w1_b.float())
+            else:
+                w1 = w1.float()
+            if w2 is None:
+                dim = w2_b.shape[0]
+                if t2 is None:
+                    w2 = torch.mm(w2_a.float(), w2_b.float())
+                else:
+                    w2 = torch.einsum(
+                        "i j k l, j r, i p -> p r k l",
+                        t2.float(), w2_b.float(), w2_a.float(),
+                    )
+            else:
+                w2 = w2.float()
+            if len(w2.shape) == 4:
+                w1 = w1.unsqueeze(2).unsqueeze(2)
+            scale = alpha / dim if (alpha is not None and dim is not None) else 1.0
+            return torch.kron(w1, w2) * scale
+        elif isinstance(patch, LoHaAdapter):
+            v = patch.weights
+            # weights = (w1a, w1b, alpha, w2a, w2b, t1, t2, dora_scale)
+            w1a, w1b, alpha = v[0], v[1], v[2]
+            w2a, w2b = v[3], v[4]
+            t1, t2 = v[5], v[6]
+            if isinstance(alpha, torch.Tensor):
+                alpha = alpha.item()
+            rank = w1b.shape[0]
+            if t1 is not None:
+                m1 = torch.einsum(
+                    "i j k l, j r, i p -> p r k l",
+                    t1.float(), w1b.float(), w1a.float(),
+                )
+                m2 = torch.einsum(
+                    "i j k l, j r, i p -> p r k l",
+                    t2.float(), w2b.float(), w2a.float(),
+                )
+            else:
+                m1 = torch.mm(w1a.float(), w1b.float())
+                m2 = torch.mm(w2a.float(), w2b.float())
+            scale = alpha / rank if alpha is not None else 1.0
+            return (m1 * m2) * scale
         elif hasattr(patch, 'weights'):
+            # LoRAAdapter fallback
             w = patch.weights
             mat_up, mat_down, alpha = w[0], w[1], w[2]
             mid = w[3]
@@ -1352,12 +1414,15 @@ class _LoRAMergeBase:
     def _move_patch_to_device(patch, device):
         """Move all tensors in a patch to the given device. Returns new patch."""
         if hasattr(patch, 'weights'):
-            # LoRAAdapter: .loaded_keys = set, .weights = (mat_up, mat_down, alpha, ...)
             inner = patch.weights
             moved = tuple(
                 t.to(device) if isinstance(t, torch.Tensor) else t
                 for t in inner
             )
+            if isinstance(patch, LoKrAdapter):
+                return LoKrAdapter(patch.loaded_keys, moved)
+            elif isinstance(patch, LoHaAdapter):
+                return LoHaAdapter(patch.loaded_keys, moved)
             return LoRAAdapter(patch.loaded_keys, moved)
         elif isinstance(patch, tuple) and len(patch) == 2 and isinstance(patch[0], str):
             # ("diff", (tensor,))
@@ -2416,6 +2481,41 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True, score_dev
             continue
         if isinstance(patch, tuple) and len(patch) >= 2:
             tensor = patch[1][0] if isinstance(patch[1], tuple) else patch[1]
+        elif isinstance(patch, LoKrAdapter):
+            # LoKr norm: ||kron(A,B)||_F = ||A||_F * ||B||_F — avoids materializing full diff
+            v = patch.weights
+            w1, w2, alpha = v[0], v[1], v[2]
+            w1_a, w1_b, w2_a, w2_b, t2 = v[3], v[4], v[5], v[6], v[7]
+            dim = None
+            if w1 is None:
+                dim = w1_b.shape[0]
+                w1 = torch.mm(w1_a.float(), w1_b.float())
+            if w2 is None:
+                dim = w2_b.shape[0]
+                if t2 is None:
+                    w2 = torch.mm(w2_a.float(), w2_b.float())
+                else:
+                    w2 = torch.einsum("i j k l, j r, i p -> p r k l", t2.float(), w2_b.float(), w2_a.float())
+            if isinstance(alpha, torch.Tensor):
+                alpha = alpha.item()
+            scale = alpha / dim if (alpha is not None and dim is not None) else 1.0
+            fro_norm = (w1.float().norm().item() * w2.float().norm().item() * abs(scale))
+            norms.append(fro_norm)
+            del w1, w2
+            continue
+        elif isinstance(patch, LoHaAdapter):
+            # LoHa: must expand to diff — Hadamard product has no cheap norm identity
+            diff = _LoRAMergeBase._expand_patch_to_diff(patch)
+            if score_device is not None:
+                diff = diff.to(score_device)
+            norms.append(diff.norm().item())
+            max_val = diff.abs().max().item()
+            threshold = max_val * 0.01
+            if threshold > 0:
+                sparsity = (diff.abs() < threshold).float().mean().item()
+                sparsities.append(sparsity)
+            del diff
+            continue
         elif isinstance(patch, LoRAAdapter):
             # Low-rank patch: compute norm from factors without materializing full diff
             mat_up, mat_down, alpha, mid, _, _ = patch.weights
@@ -4362,14 +4462,14 @@ class LoRAOptimizer(_LoRAMergeBase):
                 if store_dt != torch.float32:
                     accumulated = accumulated.to(store_dt)
                 target_dict[target_key] = ("diff", (accumulated,))
-                # Fix lowrank_count if existing was LoRAAdapter (now replaced by diff)
-                if isinstance(existing, LoRAAdapter):
+                # Fix lowrank_count if existing was a low-rank adapter (now replaced by diff)
+                if isinstance(existing, (LoRAAdapter, LoKrAdapter, LoHaAdapter)):
                     lowrank_count -= 1
                 if len(_overwrite_examples) < 3:
                     _overwrite_examples.append(f"{'CLIP' if is_clip_key else 'MODEL'} {prefix} -> {target_key}")
             else:
                 target_dict[target_key] = patch
-                if isinstance(patch, LoRAAdapter):
+                if isinstance(patch, (LoRAAdapter, LoKrAdapter, LoHaAdapter)):
                     lowrank_count += 1
 
             processed_keys += 1
@@ -5650,6 +5750,8 @@ class SaveMergedLoRA:
             for patch in list(model_patches.values()) + list(clip_patches.values()):
                 if isinstance(patch, LoRAAdapter):
                     existing_ranks.append(patch.weights[1].shape[0])  # mat_down rows = rank
+                # LoKr/LoHa factor ranks (1-8) are not comparable to LoRA ranks —
+                # skip them so the 128 fallback kicks in instead
             # Use the most common rank, or 128 as a safe default
             if existing_ranks:
                 fallback_rank = max(set(existing_ranks), key=existing_ranks.count)
@@ -5665,7 +5767,14 @@ class SaveMergedLoRA:
                 tkey = target_key[0] if isinstance(target_key, tuple) else target_key
                 lora_prefix = key_map.get(tkey, tkey)
 
-                if isinstance(patch, LoRAAdapter):
+                if isinstance(patch, (LoKrAdapter, LoHaAdapter)):
+                    # Expand LoKr/LoHa to full diff and compress to standard LoRA format
+                    diff_tensor = _LoRAMergeBase._expand_patch_to_diff(patch)
+                    rank = fallback_rank if auto_rank else save_rank
+                    compressed = LoRAOptimizer._compress_to_lowrank(diff_tensor, rank)
+                    mat_up, mat_down, alpha, mid, _, _ = compressed.weights
+                    alpha = float(alpha)
+                elif isinstance(patch, LoRAAdapter):
                     mat_up, mat_down, alpha, mid, _, _ = patch.weights
                     alpha = float(alpha) if alpha is not None else float(mat_down.shape[0])
                 elif isinstance(patch, tuple) and len(patch) == 2 and patch[0] == "diff":
