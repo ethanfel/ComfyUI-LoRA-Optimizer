@@ -34,12 +34,13 @@
   <rect x="340" y="68" width="170" height="10" fill="#1e293b"/>
   <text x="425" y="70" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#a78bfa" text-anchor="middle" font-weight="700">AUTO-SELECT</text>
 
-  <text x="425" y="98" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">Per prefix decision:</text>
-  <text x="425" y="116" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">conflict > 25% → TIES</text>
-  <text x="425" y="132" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">conflict ≤ 25% → weighted_avg</text>
-  <text x="425" y="148" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">1 LoRA → weighted_sum</text>
-  <text x="425" y="168" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">+ density, sign method</text>
-  <text x="425" y="184" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">+ auto strength (optional)</text>
+  <text x="425" y="95" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">Per prefix decision:</text>
+  <text x="425" y="110" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">1 LoRA → weighted_sum</text>
+  <text x="425" y="124" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">conflict > 25% → TIES</text>
+  <text x="425" y="138" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">low conflict → avg / SLERP</text>
+  <text x="425" y="152" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">high agreement → consensus</text>
+  <text x="425" y="166" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">orthogonal → weighted_avg</text>
+  <text x="425" y="184" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">+ density, strength, sign</text>
 
   <!-- Arrow Decision → Pass 2 -->
   <line x1="510" y1="128" x2="538" y2="128" stroke="#94a3b8" stroke-width="1.5"/>
@@ -96,6 +97,9 @@
   <rect x="660" y="274" width="55" height="22" rx="11" fill="#f59e0b" opacity="0.12"/>
   <text x="687" y="289" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f59e0b" text-anchor="middle" font-weight="600">all</text>
 
+  <rect x="725" y="274" width="80" height="22" rx="11" fill="#f59e0b" opacity="0.12"/>
+  <text x="765" y="289" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#f59e0b" text-anchor="middle" font-weight="600">disabled</text>
+
   <!-- Merge quality tags -->
   <rect x="175" y="304" width="120" height="22" rx="11" fill="#a78bfa" opacity="0.12"/>
   <text x="235" y="319" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#a78bfa" text-anchor="middle" font-weight="600">standard (default)</text>
@@ -108,5 +112,5 @@
 
   <text x="600" y="319" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64748b" text-anchor="middle">merge_quality</text>
 
-  <text x="450" y="354" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64748b" text-anchor="middle">Compatible with Flux, SDXL, SD 1.5, and all LoRA formats including LoCon</text>
+  <text x="450" y="354" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64748b" text-anchor="middle">Compatible with Z-Image, Flux, Wan, SDXL, LTX Video, ACE-Step, Qwen-Image, SD 1.5, and LoCon</text>
 </svg>

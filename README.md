@@ -261,7 +261,7 @@ Key normalization auto-detects the model architecture from LoRA key patterns and
 
 | Setting | Default | Effect |
 |---------|---------|--------|
-| `normalize_keys` | disabled | `disabled` or `enabled`. Enable when mixing LoRAs from different trainers or for Z-Image QKV fusion. |
+| `normalize_keys` | enabled | `disabled` or `enabled`. Recommended — makes LoRAs from different trainers compatible and enables Z-Image QKV splitting. |
 
 </details>
 
@@ -345,7 +345,7 @@ The analysis report includes a visual block-by-block map showing what strategy w
 
 #### Inputs / Outputs
 
-**Inputs (Advanced):** `MODEL`, `CLIP` (optional), `LORA_STACK`, output strength, clip strength multiplier, auto strength, optimization mode, merge quality, behavior profile, architecture preset, cache patches, compress patches, SVD device, free VRAM between passes, normalize keys, sparsification, sparsification density, DARE dampening.
+**Inputs (Advanced):** `MODEL`, `CLIP` (optional), `LORA_STACK`, output strength, clip strength multiplier, auto strength, optimization mode, merge quality, behavior profile, architecture preset, cache patches, compress patches, SVD device, free VRAM between passes, normalize keys, sparsification, sparsification density, DARE dampening, `TUNER_DATA` (optional — for bridge workflow), settings_source.
 
 **Outputs:** `MODEL`, `CLIP`, `STRING` (analysis report), `LORA_DATA` (for Save Merged LoRA / Merged LoRA to Hook)
 
@@ -449,11 +449,37 @@ Connect the `STRING` output to a **Show Text** node to see the report in ComfyUI
 
 ### LoRA AutoTuner
 
-Automatically sweeps all merge parameters (mode, sparsification, density, dampening, quality level) and finds the best configuration for your LoRA stack. Runs Pass 1 analysis once, scores all parameter combinations via heuristic, then merges the top-N candidates and measures output quality. Outputs the best merge directly as `MODEL`/`CLIP`, plus a ranked report and `TUNER_DATA` for exploring alternatives via a **Merge Selector** node.
+Automatically sweeps all merge parameters (mode, sparsification, density, dampening, quality level) and finds the best configuration for your LoRA stack. Runs Pass 1 analysis once, scores all parameter combinations via heuristic, then merges the top-N candidates and measures output quality. Outputs the best merge directly as `MODEL`/`CLIP`, plus a ranked report and `TUNER_DATA` for exploring alternatives via a **Merge Selector** node or fine-tuning via the **AutoTuner → Optimizer Bridge**.
 
-**Inputs:** `MODEL`, `LORA_STACK`, output strength, optional `CLIP`, top_n (how many configs to evaluate), normalize_keys, scoring_svd, architecture_preset, diff_cache_mode, vram_budget.
+**Inputs:** `MODEL`, `LORA_STACK`, output strength, optional `CLIP`, top_n, normalize_keys, scoring_svd, scoring_speed, architecture_preset, diff_cache_mode, vram_budget, output_mode.
 
-**Outputs:** `MODEL`, `CLIP`, `STRING` (ranked report), `TUNER_DATA` (for Merge Selector / Save Tuner Data), `LORA_DATA` (for Save Merged LoRA)
+**Outputs:** `MODEL`, `CLIP`, `STRING` (ranked report), `STRING` (analysis report), `TUNER_DATA` (for Merge Selector / Optimizer Bridge / Save Tuner Data), `LORA_DATA` (for Save Merged LoRA)
+
+<details>
+<summary><b>Scoring Speed</b></summary>
+
+Controls how many prefixes Phase 2 scores per candidate. All candidates are scored on the same subset so ranking stays fair. High-conflict prefixes are prioritized when subsampling.
+
+| Speed | Prefixes scored | Best for |
+|-------|----------------|----------|
+| `full` | Every prefix | Very different LoRA combinations (style + character + concept) |
+| `fast` | Every 2nd (~50% faster) | Higher accuracy than turbo, still much faster than full |
+| `turbo` (default) | Every 3rd (~67% faster) | LoRAs with similar conflict patterns |
+| `turbo+` | Every 4th (~75% faster) | Large models (Flux/WAN) or quick iteration |
+
+</details>
+
+<details>
+<summary><b>Output Mode</b></summary>
+
+| Mode | Behavior |
+|------|----------|
+| `merge` (default) | Full sweep + final merge — outputs the best merged model |
+| `tuning_only` | Full sweep but skips the final merge — outputs the base model unchanged. Use when chaining with a downstream LoRA Optimizer via the bridge workflow |
+
+In `tuning_only` mode, `TUNER_DATA` still contains the full ranked results. Switching between modes is instant when cache is enabled — the sweep results are reused.
+
+</details>
 
 <details>
 <summary><b>Diff Cache</b></summary>
@@ -462,8 +488,8 @@ During the parameter sweep, each candidate recomputes raw LoRA diffs (A@B matmul
 
 | Mode | Behavior |
 |------|----------|
-| `disabled` (default) | Recomputes diffs each time. No extra memory |
-| `auto` | Uses RAM up to `diff_cache_ram_pct` of free memory, then spills to disk. Recommended for most setups |
+| `disabled` | Recomputes diffs each time. No extra memory |
+| `auto` (default) | Uses RAM up to `diff_cache_ram_pct` of free memory, then spills to disk. Recommended for most setups |
 | `ram` | All diffs in RAM. Fastest, but uses ~1.5 GB (SDXL) to ~6 GB (Flux) |
 | `disk` | All diffs to temp files with memory-mapping. Slowest cache mode, but minimal RAM |
 
@@ -471,7 +497,7 @@ When `auto` mode runs out of disk space, it falls back to RAM automatically.
 
 | Setting | Default | Effect |
 |---------|---------|--------|
-| `diff_cache_mode` | disabled | Cache mode selection |
+| `diff_cache_mode` | auto | Cache mode selection |
 | `diff_cache_ram_pct` | 0.5 | Fraction of free system RAM for `auto` mode (0.1–0.9) |
 
 </details>
@@ -499,6 +525,36 @@ LoRA AutoTuner → TUNER_DATA → Merge Selector (selection=2) → try the 2nd-b
                       ↓
               Save Tuner Data → (reload later) → Load Tuner Data → Merge Selector
 ```
+
+---
+
+### AutoTuner → Optimizer Bridge
+
+Chain the AutoTuner and Optimizer in a **single model line** for a "find best, then tweak" workflow. Only one node merges at a time — the other passes the model through. A single switch controls which is active, and the two nodes stay in sync automatically.
+
+<p align="center">
+  <img src="assets/bridge-workflow.svg" alt="AutoTuner ↔ Optimizer Bridge workflow" width="700">
+</p>
+
+```
+[Load Model] → [AutoTuner] → model → [Optimizer] → MODEL → sampler
+[LoRA Stack]  → [AutoTuner]
+[LoRA Stack]  → [Optimizer]
+               [AutoTuner] → tuner_data → [Optimizer]
+```
+
+| Optimizer `settings_source` | AutoTuner `output_mode` | What happens |
+|----|----|----|
+| `from_autotuner` | `merge` (auto-synced) | AutoTuner merges → Optimizer passes through. Optimizer widgets show the winning config. |
+| `manual` | `tuning_only` (auto-synced) | AutoTuner passes base model through → Optimizer merges with its widget settings. |
+
+**Typical flow:**
+1. Start with `from_autotuner` — let the AutoTuner find the best config
+2. Inspect the Optimizer's widgets to see what won
+3. Switch to `manual` — the Optimizer takes over, starting from the AutoTuner's recommendation
+4. Tweak settings (merge_quality, sparsification, etc.) and re-run
+
+Switching between modes is instant — the AutoTuner reuses its cached sweep results.
 
 ---
 

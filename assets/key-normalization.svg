@@ -67,28 +67,31 @@
   <!-- Supported architectures row -->
   <text x="450" y="232" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle" font-weight="600">Supported Architectures</text>
 
-  <rect x="70"  y="246" width="105" height="28" rx="14" fill="#22c55e" opacity="0.12"/>
-  <text x="122" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#22c55e" text-anchor="middle" font-weight="600">Z-Image</text>
+  <rect x="30"  y="246" width="95" height="28" rx="14" fill="#22c55e" opacity="0.12"/>
+  <text x="77" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#22c55e" text-anchor="middle" font-weight="600">Z-Image</text>
 
-  <rect x="188" y="246" width="80" height="28" rx="14" fill="#a78bfa" opacity="0.12"/>
-  <text x="228" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#a78bfa" text-anchor="middle" font-weight="600">FLUX</text>
+  <rect x="133" y="246" width="70" height="28" rx="14" fill="#a78bfa" opacity="0.12"/>
+  <text x="168" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#a78bfa" text-anchor="middle" font-weight="600">FLUX</text>
 
-  <rect x="281" y="246" width="80" height="28" rx="14" fill="#f59e0b" opacity="0.12"/>
-  <text x="321" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#f59e0b" text-anchor="middle" font-weight="600">Wan</text>
+  <rect x="211" y="246" width="65" height="28" rx="14" fill="#f59e0b" opacity="0.12"/>
+  <text x="243" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#f59e0b" text-anchor="middle" font-weight="600">Wan</text>
 
-  <rect x="374" y="246" width="80" height="28" rx="14" fill="#e94560" opacity="0.12"/>
-  <text x="414" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e94560" text-anchor="middle" font-weight="600">SDXL</text>
+  <rect x="284" y="246" width="70" height="28" rx="14" fill="#e94560" opacity="0.12"/>
+  <text x="319" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#e94560" text-anchor="middle" font-weight="600">SDXL</text>
 
-  <rect x="467" y="246" width="100" height="28" rx="14" fill="#3b82f6" opacity="0.12"/>
-  <text x="517" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#3b82f6" text-anchor="middle" font-weight="600">LTX Video</text>
+  <rect x="362" y="246" width="90" height="28" rx="14" fill="#3b82f6" opacity="0.12"/>
+  <text x="407" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#3b82f6" text-anchor="middle" font-weight="600">LTX Video</text>
 
-  <rect x="580" y="246" width="120" height="28" rx="14" fill="#c084fc" opacity="0.12"/>
-  <text x="640" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#c084fc" text-anchor="middle" font-weight="600">Qwen-Image</text>
+  <rect x="460" y="246" width="90" height="28" rx="14" fill="#38bdf8" opacity="0.12"/>
+  <text x="505" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#38bdf8" text-anchor="middle" font-weight="600">ACE-Step</text>
 
-  <rect x="713" y="246" width="115" height="28" rx="14" fill="#64748b" opacity="0.12"/>
-  <text x="770" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64748b" text-anchor="middle" font-weight="600">SD 1.5 / others</text>
+  <rect x="558" y="246" width="110" height="28" rx="14" fill="#c084fc" opacity="0.12"/>
+  <text x="613" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#c084fc" text-anchor="middle" font-weight="600">Qwen-Image</text>
+
+  <rect x="676" y="246" width="115" height="28" rx="14" fill="#64748b" opacity="0.12"/>
+  <text x="733" y="264" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64748b" text-anchor="middle" font-weight="600">SD 1.5 / others</text>
 
   <!-- Bottom notes -->
-  <text x="450" y="300" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle">Enable with <tspan font-family="monospace" fill="#22c55e">normalize_keys: enabled</tspan> when mixing LoRAs from different trainers</text>
+  <text x="450" y="300" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle">Enabled by default (<tspan font-family="monospace" fill="#22c55e">normalize_keys: enabled</tspan>). Essential when mixing LoRAs from different trainers.</text>
   <text x="450" y="320" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64748b" text-anchor="middle">Auto-detects architecture from LoRA key patterns. No manual configuration needed.</text>
 </svg>

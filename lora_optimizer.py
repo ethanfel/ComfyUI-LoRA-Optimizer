@@ -46,6 +46,7 @@ _ARCH_PRESETS = {
         "magnitude_ratio_total_sign": 2.0,
         "alignment_threshold": 0.1,
         "suggested_max_strength_cap": 3.0,
+        "auto_strength_orthogonal_floor": 0.85,
         "display_name": "SD/SDXL UNet",
     },
     "dit": {
@@ -61,6 +62,7 @@ _ARCH_PRESETS = {
         "magnitude_ratio_total_sign": 2.0,
         "alignment_threshold": 0.1,
         "suggested_max_strength_cap": 5.0,
+        "auto_strength_orthogonal_floor": 0.85,
         "display_name": "DiT (Flux/WAN/Z-Image/LTX/HunyuanVideo)",
     },
     "llm": {
@@ -76,6 +78,7 @@ _ARCH_PRESETS = {
         "magnitude_ratio_total_sign": 2.0,
         "alignment_threshold": 0.1,
         "suggested_max_strength_cap": 3.0,
+        "auto_strength_orthogonal_floor": 0.9,
         "display_name": "LLM (Qwen/LLaMA)",
     },
 }
@@ -86,6 +89,10 @@ _ARCH_TO_PRESET = {
     "acestep": "dit",
     "qwen_image": "llm",
 }
+
+# Video architectures where orthogonal LoRAs teach independent motions —
+# their energy should add naturally without scaling down.
+_VIDEO_ARCH_ORTHOGONAL_FLOOR = {"wan": 1.0, "ltx": 1.0}
 
 
 def _resolve_arch_preset(arch_override, detected_arch):
@@ -741,7 +748,6 @@ class _LoRAMergeBase:
         Canonical format: diffusion_model.blocks.N.{self_attn,cross_attn,ffn}.*
 
         Handles LyCORIS, diffusers, Fun LoRA, finetrainer formats.
-        Also applies RS-LoRA alpha compensation if detected.
         """
         normalized = {}
         for k, v in lora_sd.items():
@@ -854,23 +860,12 @@ class _LoRAMergeBase:
 
             normalized[new_k] = v
 
-        # RS-LoRA compensation: detect and fix alpha scaling.
-        # RS-LoRA files omit ALL alpha keys and rely on sqrt(rank) scaling.
-        # Only apply compensation if the file has zero alpha keys (reliable
-        # heuristic — standard LoRAs either include explicit alphas or use
-        # rank as default alpha, which _get_lora_key_info handles).
-        has_any_alpha = any(nk.endswith('.alpha') for nk in normalized)
-        has_any_lora = any(nk.endswith('.lora_A.weight') for nk in normalized)
-        if not has_any_alpha and has_any_lora:
-            # Find rank from any lora_A weight
-            sample_key = next(nk for nk in normalized if nk.endswith('.lora_A.weight'))
-            rank = normalized[sample_key].shape[0]
-            # alpha/rank = rank^1.5/rank = sqrt(rank), matching RS-LoRA scaling
-            corrected_alpha = torch.tensor(rank * (rank ** 0.5))
-            for nk in list(normalized.keys()):
-                if nk.endswith('.lora_A.weight'):
-                    alpha_key = nk.replace('.lora_A.weight', '.alpha')
-                    normalized[alpha_key] = corrected_alpha
+        # Note: RS-LoRA compensation removed. RS-LoRA files omit alpha and
+        # rely on sqrt(rank) scaling, but we can't distinguish them from
+        # standard PEFT LoRAs that also omit alpha. False positives cause
+        # ~5.66x weight amplification (rank 32). When alpha is missing,
+        # _get_lora_key_info defaults alpha=rank (scale=1.0), which is
+        # correct for standard LoRAs and only slightly weak for RS-LoRA.
 
         return normalized
 
@@ -2350,11 +2345,20 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
             score += 0.10
 
     # --- Quality fit (0-0.15) ---
+    # Enhanced/maximum resolve conflicts via orthogonalization, column-wise
+    # resolution, TALL masks, and SVD alignment.  When LoRAs are orthogonal
+    # there are no real conflicts — the extra processing treats noise as
+    # signal and can smooth away valid independent contributions.
     if quality == "maximum":
-        conflict_benefit = min(effective_conflict / 0.3, 1.0) * 0.10
-        score += 0.05 + conflict_benefit
+        if is_orthogonal:
+            score += min(effective_conflict / 0.3, 1.0) * 0.10
+        else:
+            score += 0.05 + min(effective_conflict / 0.3, 1.0) * 0.10
     elif quality == "enhanced":
-        score += 0.08 + min(effective_conflict / 0.3, 1.0) * 0.07
+        if is_orthogonal:
+            score += min(effective_conflict / 0.3, 1.0) * 0.10
+        else:
+            score += 0.08 + min(effective_conflict / 0.3, 1.0) * 0.07
     else:
         if effective_conflict < 0.10:
             score += 0.10
@@ -2549,8 +2553,8 @@ class LoRAOptimizer(_LoRAMergeBase):
             "required": {
                 "model": ("MODEL", {"tooltip": "Your base model (e.g. SDXL, Flux). The merged LoRAs will be applied to it."}),
                 "lora_stack": ("LORA_STACK", {"tooltip": "Connect a LoRA Stack node here. This is the list of LoRAs you want to merge together."}),
-                "output_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                                              "tooltip": "Master volume for the merged result. 1.0 = full effect, 0.5 = half, 0 = no effect. Start at 1.0 and lower if the result looks too strong."}),
+                "output_strength": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 10.0, "step": 0.05,
+                                              "tooltip": "Master volume for the merged result. 1.0 = full effect, 0.5 = half, 0 = disabled. Set to -1 for auto: uses the suggested max strength (compensates for energy lost during merge)."}),
             },
             "optional": {
                 "clip": ("CLIP", {"tooltip": "The text encoder. Connect this so LoRAs can also affect how your prompts are understood. Leave empty for video models that don't use CLIP."}),
@@ -2559,6 +2563,12 @@ class LoRAOptimizer(_LoRAMergeBase):
                 "auto_strength": (["enabled", "disabled"], {
                     "default": "enabled",
                     "tooltip": "Automatically turns down individual LoRA strengths when combining many LoRAs to avoid oversaturated or distorted results. Useful when stacking 3+ LoRAs."
+                }),
+                "auto_strength_floor": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Minimum scale factor for auto-strength when LoRAs are orthogonal (independent). "
+                               "-1 = auto (1.0 for video models like Wan/LTX to preserve motion, 0.85 for image models). "
+                               "Set manually to override — e.g. 0.9 for less reduction, 1.0 to disable reduction for orthogonal LoRAs entirely."
                 }),
                 "free_vram_between_passes": (["disabled", "enabled"], {
                     "default": "disabled",
@@ -2634,17 +2644,24 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "forceInput": True,
                     "tooltip": "Connect the merge_strategy output from a LoRA Conflict Editor to override the optimizer's auto-detected strategy."
                 }),
+                "tuner_data": ("TUNER_DATA", {
+                    "tooltip": "Connect from the LoRA AutoTuner's tuner_data output. Used when settings_source is 'from_autotuner'."
+                }),
+                "settings_source": (["manual", "from_autotuner"], {
+                    "default": "manual",
+                    "tooltip": "manual: use widget settings. from_autotuner: use the AutoTuner's best config (connect tuner_data). Switch to manual to tweak from the AutoTuner's starting point."
+                }),
             }
         }
 
     RETURN_TYPES = ("MODEL", "CLIP", "STRING", "LORA_DATA")
     RETURN_NAMES = ("model", "clip", "analysis_report", "lora_data")
-    FUNCTION = "optimize_merge"
+    FUNCTION = "execute_node"
     CATEGORY = "LoRA Optimizer"
     DESCRIPTION = "Auto-analyzes LoRA stack and selects optimal merge strategy per weight group. Outputs merged model + analysis report. Best for style/character LoRAs — apply edit, distillation (LCM/Turbo/Hyper), or DPO LoRAs via a standard Load LoRA node instead."
 
     @staticmethod
-    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_quality="standard", behavior_profile="v1.2", architecture_preset="auto"):
+    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_quality="standard", behavior_profile="v1.2", architecture_preset="auto", auto_strength_floor=-1.0):
         """
         Build a deterministic SHA-256 hash (16 hex chars) from the stack
         configuration. Used by IS_CHANGED to let ComfyUI skip re-execution
@@ -2667,12 +2684,13 @@ class LoRAOptimizer(_LoRAMergeBase):
                     entries.append((str(item.get("name", "")), float(item.get("strength", 0)), cm, kf))
             entries.sort()
             h.update(json.dumps(entries).encode())
-        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}|cp={compress_patches}|sd={svd_device}|nk={normalize_keys}|sp={sparsification}|spd={sparsification_density}|dd={dare_dampening}|mso={merge_strategy_override}|mq={merge_quality}|bp={behavior_profile}|ap={architecture_preset}".encode())
+        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}|cp={compress_patches}|sd={svd_device}|nk={normalize_keys}|sp={sparsification}|spd={sparsification_density}|dd={dare_dampening}|mso={merge_strategy_override}|mq={merge_quality}|bp={behavior_profile}|ap={architecture_preset}|asf={auto_strength_floor}".encode())
         return h.hexdigest()[:16]
 
     @classmethod
     def IS_CHANGED(cls, model, lora_stack, output_strength, clip=None,
                    clip_strength_multiplier=1.0, auto_strength="disabled",
+                   auto_strength_floor=-1.0,
                    free_vram_between_passes="disabled", vram_budget=0.0,
                    optimization_mode="per_prefix",
                    cache_patches="enabled", compress_patches="non_ties",
@@ -2680,15 +2698,21 @@ class LoRAOptimizer(_LoRAMergeBase):
                    sparsification="disabled", sparsification_density=0.7,
                    dare_dampening=0.0,
                    merge_strategy_override="", merge_quality="standard",
-                   behavior_profile="v1.2", architecture_preset="auto"):
-        return cls._compute_cache_key(lora_stack, output_strength,
-                                      clip_strength_multiplier, auto_strength,
-                                      optimization_mode, compress_patches,
-                                      svd_device, normalize_keys,
-                                      sparsification, sparsification_density,
-                                      dare_dampening,
-                                      merge_strategy_override, merge_quality,
-                                      behavior_profile, architecture_preset)
+                   behavior_profile="v1.2", architecture_preset="auto",
+                   tuner_data=None, settings_source="manual"):
+        base_key = cls._compute_cache_key(lora_stack, output_strength,
+                                          clip_strength_multiplier, auto_strength,
+                                          optimization_mode, compress_patches,
+                                          svd_device, normalize_keys,
+                                          sparsification, sparsification_density,
+                                          dare_dampening,
+                                          merge_strategy_override, merge_quality,
+                                          behavior_profile, architecture_preset,
+                                          auto_strength_floor)
+        cache_key = f"{base_key}|mid={id(model)}|ss={settings_source}"
+        if settings_source == "from_autotuner" and tuner_data is not None:
+            return f"{cache_key}|at={id(tuner_data)}"
+        return cache_key
 
     def _save_report_to_disk(self, cache_key, lora_combo, auto_strength, report, selected_params):
         """
@@ -3004,7 +3028,7 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         return max(arch_preset["density_clamp_min"], min(arch_preset["density_clamp_max"], above_noise))
 
-    def _compute_auto_strengths(self, active_loras, lora_stats, pairwise_similarities=None, arch_preset=None):
+    def _compute_auto_strengths(self, active_loras, lora_stats, pairwise_similarities=None, arch_preset=None, detected_arch=None, auto_strength_floor=-1.0):
         """
         Compute reduced per-LoRA strengths using interference-aware energy
         normalization. Uses pairwise cosine similarity to account for
@@ -3072,6 +3096,25 @@ class LoRAOptimizer(_LoRAMergeBase):
         else:
             scale = 1.0
 
+        # Architecture-aware orthogonal floor: when LoRAs are orthogonal
+        # (independent), video models should preserve full energy because
+        # orthogonal video LoRAs teach independent motions.  Image models
+        # get a modest floor to prevent over-reduction while still dampening.
+        floor_applied = False
+        if pairwise_similarities:
+            avg_cos = sum(pairwise_similarities.values()) / len(pairwise_similarities)
+            alignment_thresh = arch_preset["alignment_threshold"]
+            if abs(avg_cos) <= alignment_thresh:
+                if auto_strength_floor >= 0:
+                    floor = auto_strength_floor
+                else:
+                    floor = _VIDEO_ARCH_ORTHOGONAL_FLOOR.get(
+                        detected_arch,
+                        arch_preset.get("auto_strength_orthogonal_floor", 0.85))
+                if scale < floor:
+                    scale = floor
+                    floor_applied = True
+
         # Apply scale to all strengths
         new_strengths = []
         for i in range(n):
@@ -3082,6 +3125,9 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         # Build reasoning
         reasoning.append(f"Scale factor: {scale:.4f}")
+        if floor_applied:
+            arch_label = detected_arch or "unknown"
+            reasoning.append(f"  (orthogonal floor {floor:.2f} applied for {arch_label} — preserving independent contributions)")
         if pairwise_similarities:
             avg_cos = sum(pairwise_similarities.values()) / len(pairwise_similarities)
             orthogonal_energy = math.sqrt(orthogonal_energy_sq)
@@ -3176,10 +3222,9 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         # Near-orthogonal LoRAs: ~50% sign conflict is the base rate for
         # independent vectors, not actual semantic conflict. TIES trimming
-        # destroys both signals. Use weighted_average which divides by N,
-        # naturally reducing per-LoRA influence. NOT upgraded to SLERP:
-        # SLERP's norm correction preserves magnitude, giving ~1.6x more
-        # energy than weighted_average for 3 orthogonal vectors ("burned" look).
+        # destroys both signals. Use weighted_average as the global mode,
+        # upgraded to SLERP per-prefix to preserve magnitude (important for
+        # video LoRAs where motion energy matters).
         if (behavior_profile in ("v1.2", "no_slerp")
                 and abs(avg_cos_sim) < arch_preset["orthogonal_cos_sim_max"]
                 and avg_conflict_ratio < arch_preset["orthogonal_conflict_max"]):
@@ -3187,7 +3232,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             reasoning.append(f"Cosine similarity {avg_cos_sim:.2f} near zero (orthogonal LoRAs) — "
                              f"sign conflict {avg_conflict_ratio:.1%} is base-rate noise, not real conflict")
             if behavior_profile == "v1.2":
-                reasoning.append("  Using weighted_average to preserve both signals (no SLERP upgrade — orthogonal vectors need magnitude reduction)")
+                reasoning.append("  Using weighted_average (upgraded to SLERP per-prefix to preserve magnitude)")
             else:
                 reasoning.append("  Using weighted_average to preserve both signals (SLERP upgrade disabled by profile)")
             density = 0.5
@@ -3475,19 +3520,103 @@ class LoRAOptimizer(_LoRAMergeBase):
         lines.append(f"  CLIP patches: {merge_summary['clip_patches']}")
         if merge_summary.get('skipped_keys', 0) > 0:
             lines.append(f"  Skipped keys: {merge_summary['skipped_keys']} (shape mismatch, e.g. sliced weights)")
-        lines.append(f"  Output strength: {merge_summary['output_strength']}")
+        os_val = merge_summary['output_strength']
+        auto_os = merge_summary.get('auto_output_strength', False)
+        if auto_os:
+            lines.append(f"  Output strength: {os_val:.2f} (auto — suggested max)")
+        else:
+            lines.append(f"  Output strength: {os_val}")
         lines.append(f"  CLIP strength: {merge_summary['clip_strength']}")
-        if merge_summary.get('suggested_max_strength') is not None:
+        if not auto_os and merge_summary.get('suggested_max_strength') is not None:
             sms = merge_summary['suggested_max_strength']
             lines.append(f"  Suggested max output_strength: {sms:.2f}")
             if sms >= 3.0:
                 lines.append(f"    (capped at 3.0 — actual headroom may be higher)")
+            elif sms == 1.0:
+                lines.append(f"    (energy preserved — no compensation needed)")
 
         lines.append("")
         lines.append("=" * 50)
         return "\n".join(lines)
 
-    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_quality="standard", behavior_profile="v1.2", architecture_preset="auto", _analysis_cache=None, _diff_cache=None, _skip_report=False):
+    def execute_node(self, model, lora_stack, output_strength, clip=None,
+                     clip_strength_multiplier=1.0, auto_strength="enabled",
+                     auto_strength_floor=-1.0,
+                     free_vram_between_passes="disabled", vram_budget=0.0,
+                     optimization_mode="per_prefix", cache_patches="enabled",
+                     compress_patches="non_ties", svd_device="gpu",
+                     normalize_keys="enabled", sparsification="disabled",
+                     sparsification_density=0.7, dare_dampening=0.0,
+                     merge_strategy_override="", merge_quality="standard",
+                     behavior_profile="v1.2", architecture_preset="auto",
+                     tuner_data=None, settings_source="manual"):
+        """
+        ComfyUI entry point. Routes between passthrough and merge modes:
+        - from_autotuner: passthrough (model already merged by AutoTuner upstream),
+          sync widgets from tuner_data
+        - manual: merge using widget settings (AutoTuner upstream in tuning_only
+          mode passes the base model through)
+        """
+        # --- from_autotuner: passthrough mode ---
+        if settings_source == "from_autotuner":
+            if tuner_data is None or "top_n" not in tuner_data or len(tuner_data["top_n"]) == 0:
+                logging.warning("[AutoTuner Bridge] No valid tuner_data — falling back to manual merge")
+            else:
+                config = tuner_data["top_n"][0]["config"]
+                entry = tuner_data["top_n"][0]
+                score = entry.get("score_measured", entry.get("score_heuristic", 0))
+                mode_display = ("per-prefix (auto)" if config["optimization_mode"] == "per_prefix"
+                                else config.get("merge_mode", "unknown"))
+
+                report_lines = [
+                    f"[AutoTuner Bridge] Passthrough — model merged by AutoTuner (rank #1, score: {score:.3f}):",
+                    f"  optimization_mode: {config['optimization_mode']}",
+                    f"  merge mode: {mode_display}",
+                    f"  merge_quality: {config['merge_quality']}",
+                ]
+                if config["sparsification"] != "disabled":
+                    report_lines.append(
+                        f"  sparsification: {config['sparsification']} "
+                        f"(density: {config['sparsification_density']}, "
+                        f"dampening: {config['dare_dampening']})"
+                    )
+                report_lines.append(f"  auto_strength: {config['auto_strength']}")
+                report_lines.append("")
+                report_lines.append("Switch settings_source to 'manual' to tweak from these settings.")
+                report = "\n".join(report_lines)
+
+                logging.info(f"[AutoTuner Bridge] Passthrough mode — model already merged by AutoTuner")
+
+                # Return model as-is + UI data for JS widget sync
+                return {"result": (model, clip, report, None),
+                        "ui": {"applied_settings": [json.dumps(config)]}}
+
+        # --- manual: active merge mode ---
+        result = self.optimize_merge(
+            model, lora_stack, output_strength,
+            clip=clip,
+            clip_strength_multiplier=clip_strength_multiplier,
+            auto_strength=auto_strength,
+            auto_strength_floor=auto_strength_floor,
+            free_vram_between_passes=free_vram_between_passes,
+            vram_budget=vram_budget,
+            optimization_mode=optimization_mode,
+            cache_patches=cache_patches,
+            compress_patches=compress_patches,
+            svd_device=svd_device,
+            normalize_keys=normalize_keys,
+            sparsification=sparsification,
+            sparsification_density=sparsification_density,
+            dare_dampening=dare_dampening,
+            merge_strategy_override=merge_strategy_override,
+            merge_quality=merge_quality,
+            behavior_profile=behavior_profile,
+            architecture_preset=architecture_preset,
+        )
+
+        return result
+
+    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", auto_strength_floor=-1.0, free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_quality="standard", behavior_profile="v1.2", architecture_preset="auto", _analysis_cache=None, _diff_cache=None, _skip_report=False):
         """
         Main entry point. Two-pass streaming architecture:
         Pass 1: Compute diffs per-prefix, sample conflicts + magnitudes, discard diffs
@@ -3549,14 +3678,24 @@ class LoRAOptimizer(_LoRAMergeBase):
                                             sparsification, sparsification_density,
                                             dare_dampening,
                                             merge_strategy_override, merge_quality,
-                                            behavior_profile, architecture_preset)
+                                            behavior_profile, architecture_preset,
+                                            auto_strength_floor)
+        # Include model identity so switching base models invalidates the cache
+        cache_key = f"{cache_key}|mid={id(model)}"
         if cache_patches == "enabled" and cache_key in self._merge_cache:
             model_patches, clip_patches, report, clip_strength_out, lora_data = self._merge_cache[cache_key]
+            # Resolve auto output_strength from cached suggested_max_strength
+            cached_os = output_strength
+            if cached_os < 0 and lora_data and lora_data.get("suggested_max_strength") is not None:
+                cached_os = lora_data["suggested_max_strength"]
+                clip_strength_out = cached_os * clip_strength_multiplier
+            elif cached_os < 0:
+                cached_os = 1.0
             new_model = model
             new_clip = clip
             if model is not None and len(model_patches) > 0:
                 new_model = model.clone()
-                new_model.add_patches(model_patches, output_strength)
+                new_model.add_patches(model_patches, cached_os)
                 self._update_model_size(new_model, model_patches)
             if clip is not None and len(clip_patches) > 0:
                 new_clip = clip.clone()
@@ -3822,7 +3961,9 @@ class LoRAOptimizer(_LoRAMergeBase):
         if auto_strength == "enabled":
             new_strengths, strength_reasoning = self._compute_auto_strengths(
                 active_loras, lora_stats, pairwise_similarities=pairwise_similarities,
-                arch_preset=arch_preset)
+                arch_preset=arch_preset,
+                detected_arch=getattr(self, '_detected_arch', None),
+                auto_strength_floor=auto_strength_floor)
 
             for i in range(len(active_loras)):
                 orig = active_loras[i]["strength"]
@@ -3943,21 +4084,17 @@ class LoRAOptimizer(_LoRAMergeBase):
                         arch_preset=arch_preset,
                         precomputed_density=pf.get("precomputed_density"),
                     )
-                    # Upgrade weighted_average → slerp for 2+ positively-aligned LoRAs.
-                    # SLERP preserves magnitude better than weighted_average's /N reduction.
-                    # Skip when inappropriate:
-                    #  - Orthogonal (|cos| < 0.25): SLERP's norm correction gives ~1.6x
-                    #    more energy than weighted_average for 3 orthogonal vectors.
-                    #  - Opposing (cos < 0): SLERP interpolates between opposing directions
-                    #    while preserving magnitude; combined with auto-strength boosting
-                    #    (scale > 1.0 for opposing pairs), this amplifies artifacts.
-                    # Both cases benefit from weighted_average's /N magnitude reduction.
+                    # Upgrade weighted_average → slerp for 2+ non-opposing LoRAs.
+                    # SLERP preserves magnitude better than weighted_average's /N reduction,
+                    # which is critical for video LoRAs where motion energy matters.
+                    # Skip for opposing LoRAs (cos < 0): SLERP interpolates between opposing
+                    # directions while preserving magnitude, amplifying artifacts.
                     pf_raw_cos = pf.get("avg_cos_sim", 0.0)
                     pf_orthogonal = abs(pf_raw_cos) < arch_preset["orthogonal_cos_sim_max"]
                     pf_opposing = pf_raw_cos < 0
                     if (pf_mode == "weighted_average" and pf["n_loras"] >= 2
                             and behavior_profile == "v1.2"
-                            and not pf_orthogonal and not pf_opposing):
+                            and not pf_opposing):
                         pf_mode = "slerp"
 
             # Apply merge strategy override from Conflict Editor (takes priority over auto-selection)
@@ -4153,8 +4290,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             # in enhanced quality doesn't account for the directional cancellation
             # that weighted_average provides.
             pf_quality = merge_quality
-            if (pf_mode == "weighted_average"
-                    and (pf_orthogonal or pf_opposing)):
+            if (pf_mode == "weighted_average" and pf_opposing):
                 pf_quality = "standard"
 
             merged_diff = self._merge_diffs(
@@ -4307,8 +4443,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         suggested_max_strength = None
         if total_merged_energy > 0 and total_input_energy > 0:
             norm_ratio = total_merged_energy / total_input_energy
-            if norm_ratio < 1.0:
-                suggested_max_strength = min(1.0 / norm_ratio, arch_preset["suggested_max_strength_cap"])
+            suggested_max_strength = max(1.0, min(1.0 / norm_ratio, arch_preset["suggested_max_strength_cap"]))
 
         # Free analysis data no longer needed (skip when AutoTuner owns the data)
         if _analysis_cache is None:
@@ -4329,6 +4464,16 @@ class LoRAOptimizer(_LoRAMergeBase):
         for lora_prefix, (target_key, is_clip) in all_key_targets.items():
             tkey = target_key[0] if isinstance(target_key, tuple) else target_key
             reverse_key_map[tkey] = lora_prefix
+
+        # Auto output strength: -1 = use suggested max strength
+        auto_output_strength = False
+        if output_strength < 0 and suggested_max_strength is not None:
+            output_strength = suggested_max_strength
+            auto_output_strength = True
+            logging.info(f"[LoRA Optimizer] Auto output_strength: {output_strength:.2f} (suggested max)")
+        elif output_strength < 0:
+            output_strength = 1.0
+            logging.info("[LoRA Optimizer] Auto output_strength: no suggestion available, using 1.0")
 
         # Apply patches
         new_model = model
@@ -4361,6 +4506,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             "output_strength": output_strength,
             "clip_strength": clip_strength_out,
             "suggested_max_strength": suggested_max_strength,
+            "auto_output_strength": auto_output_strength,
         }
 
         report = self._build_report(
@@ -4431,8 +4577,8 @@ class LoRAOptimizerSimple(LoRAOptimizer):
                     "tooltip": "LoRA stack from a LoRA Stack node."
                 }),
                 "output_strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Global multiplier applied after merging."
+                    "default": 1.0, "min": -1.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Global multiplier applied after merging. Set to -1 for auto (uses suggested max strength)."
                 }),
             },
             "optional": {
@@ -4446,6 +4592,7 @@ class LoRAOptimizerSimple(LoRAOptimizer):
             },
         }
 
+    FUNCTION = "optimize_merge"
     DESCRIPTION = (
         "Simplified LoRA Optimizer — merges a LoRA stack with good defaults. "
         "Use LoRA Optimizer (Advanced) for sparsification, merge quality, "
@@ -4454,13 +4601,14 @@ class LoRAOptimizerSimple(LoRAOptimizer):
 
     _SIMPLE_DEFAULTS = dict(
         auto_strength="enabled",
+        auto_strength_floor=-1.0,
         free_vram_between_passes="disabled",
         vram_budget=0.0,
         optimization_mode="per_prefix",
         cache_patches="enabled",
         compress_patches="non_ties",
         svd_device="gpu",
-        normalize_keys="disabled",
+        normalize_keys="enabled",
         sparsification="disabled",
         sparsification_density=0.7,
         dare_dampening=0.0,
@@ -4508,8 +4656,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "tooltip": "LoRA stack from a LoRA Stack node."
                 }),
                 "output_strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Master volume for the merged result."
+                    "default": 1.0, "min": -1.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Master volume for the merged result. Set to -1 for auto (uses suggested max strength)."
                 }),
             },
             "optional": {
@@ -4540,6 +4688,12 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "default": "auto",
                     "tooltip": "Architecture-aware threshold tuning. 'auto' detects from LoRA keys."
                 }),
+                "auto_strength_floor": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Minimum scale factor for auto-strength when LoRAs are orthogonal (independent). "
+                               "-1 = auto (1.0 for video models like Wan/LTX to preserve motion, 0.85 for image models). "
+                               "Set manually to override — e.g. 0.9 for less reduction, 1.0 to disable reduction for orthogonal LoRAs entirely."
+                }),
                 "record_dataset": (["disabled", "enabled"], {
                     "default": "disabled",
                     "tooltip": "Record analysis metrics and scored configs to a JSONL dataset file for threshold tuning research. Saved to lora_optimizer_reports/autotuner_dataset.jsonl."
@@ -4565,9 +4719,15 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "tooltip": "Controls how many prefixes Phase 2 scores per candidate. "
                                "All candidates are scored on the same subset so ranking stays fair.\n\n"
                                "• full — Score every prefix. Best accuracy, slowest. Use when merging very different LoRAs (e.g. style + character + concept) where block behavior varies a lot.\n"
-                               "• fast — Every 2nd prefix (~50%% faster). Good default for most merges.\n"
+                               "• fast — Every 2nd prefix (~50%% faster). Higher accuracy than turbo, still much faster than full.\n"
                                "• turbo — Every 3rd prefix (~67%% faster). Works well when your LoRAs have similar conflict across blocks (e.g. multiple characters from the same trainer).\n"
                                "• turbo+ — Every 4th prefix (~75%% faster). Best for large models (DiT/Flux/WAN) or when iterating quickly. May miss subtle block-level differences on SD/SDXL."
+                }),
+                "output_mode": (["merge", "tuning_only"], {
+                    "default": "merge",
+                    "tooltip": "merge: output the best merged model (default). "
+                               "tuning_only: skip the final merge — output the base model unchanged and pass tuner_data to a downstream LoRA Optimizer for merging. "
+                               "Use tuning_only when chaining AutoTuner → Optimizer in a single model line."
                 }),
             },
         }
@@ -4585,10 +4745,11 @@ class LoRAAutoTuner(LoRAOptimizer):
     def auto_tune(self, model, lora_stack, output_strength, clip=None,
                   clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
                   scoring_svd="disabled", scoring_device="gpu",
-                  architecture_preset="auto", record_dataset="disabled",
+                  architecture_preset="auto", auto_strength_floor=-1.0,
+                  record_dataset="disabled",
                   cache_patches="enabled",
                   diff_cache_mode="disabled", diff_cache_ram_pct=0.5, vram_budget=0.0,
-                  scoring_speed="full"):
+                  scoring_speed="full", output_mode="merge"):
         import hashlib, json
 
         # --- Normalize & validate stack ---
@@ -4599,6 +4760,8 @@ class LoRAAutoTuner(LoRAOptimizer):
 
         if len(active_loras) == 1:
             # Single LoRA: nothing to tune, delegate directly
+            if output_mode == "tuning_only":
+                return (model, clip, "Single LoRA detected -- tuning_only passthrough.", "", None, None)
             merged_model, merged_clip, report, lora_data = super().optimize_merge(
                 model, lora_stack, output_strength,
                 clip=clip, clip_strength_multiplier=clip_strength_multiplier,
@@ -4613,17 +4776,24 @@ class LoRAAutoTuner(LoRAOptimizer):
                                 sort_keys=True)
         lora_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
-        # Check AutoTuner cache
+        # Check AutoTuner cache (output_mode excluded so mode switches reuse cached sweep)
         at_cache_key = hashlib.sha256(
             f"{lora_hash}|os={output_strength}|csm={clip_strength_multiplier}"
             f"|top_n={top_n}|nk={normalize_keys}|ss={scoring_svd}"
             f"|ap={architecture_preset}|vb={vram_budget}"
-            f"|spd={scoring_speed}".encode()
+            f"|spd={scoring_speed}|mid={id(model)}".encode()
         ).hexdigest()[:16]
         if cache_patches == "enabled" and hasattr(self, '_autotuner_cache') and at_cache_key in self._autotuner_cache:
-            cached = self._autotuner_cache[at_cache_key]
-            logging.info(f"[LoRA AutoTuner] Using cached result")
-            return cached
+            cached_result, cached_mode = self._autotuner_cache[at_cache_key]
+            if output_mode == "tuning_only":
+                # Return base model + cached tuner_data (no merge needed)
+                logging.info("[LoRA AutoTuner] Using cached result (tuning_only passthrough)")
+                return (model, clip, cached_result[2], "", cached_result[4], None)
+            elif cached_mode == "merge":
+                # Cached has merged model, return as-is
+                logging.info("[LoRA AutoTuner] Using cached result")
+                return cached_result
+            # else: cached was tuning_only but now need merge — fall through to re-run
 
         # --- Pass 1: Analysis (run once, reuse for all configs) ---
         model_keys = self._get_model_keys(model)
@@ -4645,7 +4815,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         all_lora_prefixes = sorted(all_lora_prefixes)
 
         if not all_lora_prefixes:
-            return (model, clip, "No LoRA prefixes found.", None, None)
+            return (model, clip, "No LoRA prefixes found.", "", None, None)
 
         # Determine compute device
         compute_device = self._get_compute_device()
@@ -4710,7 +4880,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         logging.info(f"[LoRA AutoTuner] Pass 1: Analyzing {len(all_lora_prefixes)} prefixes...")
         t_start = time.time()
         # Progress bar: analysis prefixes + top_n merges (+ 1 final merge when subsampling)
-        n_pbar_merges = top_n + (1 if scoring_speed != "full" and top_n > 1 else 0)
+        n_pbar_merges = top_n + (1 if scoring_speed != "full" and top_n > 1 and output_mode != "tuning_only" else 0)
         pbar = comfy.utils.ProgressBar(len(all_lora_prefixes) + n_pbar_merges)
         if use_gpu:
             for lora_prefix in all_lora_prefixes:
@@ -4733,7 +4903,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                     pbar.update(1)
 
         if prefix_count == 0:
-            return (model, clip, "No compatible LoRA keys found.", None, None)
+            return (model, clip, "No compatible LoRA keys found.", "", None, None)
 
         t_analysis = time.time() - t_start
         logging.info(f"[LoRA AutoTuner] Analysis complete: {prefix_count} prefixes ({t_analysis:.1f}s)")
@@ -4868,6 +5038,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 clip=clip,
                 clip_strength_multiplier=clip_strength_multiplier,
                 auto_strength=config["auto_strength"],
+                auto_strength_floor=auto_strength_floor,
                 optimization_mode=config["optimization_mode"],
                 sparsification=config["sparsification"],
                 sparsification_density=config["sparsification_density"],
@@ -4903,8 +5074,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                          f"(merge {t_elapsed - t_score_elapsed:.1f}s + score {t_score_elapsed:.1f}s)")
             pbar.update(1)
 
-            if use_subsampling:
-                # When subsampling, discard all candidates — final full merge comes after
+            if use_subsampling or output_mode == "tuning_only":
+                # When subsampling or tuning_only, discard all candidates
                 del merged_model, merged_clip, lora_data
             elif measured["composite_score"] > best_score:
                 # Keep only the best model in memory, free the rest immediately
@@ -4938,8 +5109,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                 },
             })
 
-        # Final full merge when subsampling was used
-        if use_subsampling and best_config is not None:
+        # Final full merge when subsampling was used (skip if tuning_only)
+        if use_subsampling and best_config is not None and output_mode != "tuning_only":
             logging.info(f"[LoRA AutoTuner] Final merge with winning config "
                          f"({best_config['merge_mode']}, {best_config['merge_quality']})...")
             t_final = time.time()
@@ -4949,6 +5120,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 clip=clip,
                 clip_strength_multiplier=clip_strength_multiplier,
                 auto_strength=best_config["auto_strength"],
+                auto_strength_floor=auto_strength_floor,
                 optimization_mode=best_config["optimization_mode"],
                 sparsification=best_config["sparsification"],
                 sparsification_density=best_config["sparsification_density"],
@@ -5030,6 +5202,24 @@ class LoRAAutoTuner(LoRAOptimizer):
             results, tuner_data["analysis_summary"], output_strength,
             suggested_max_strength=suggested_max, scoring_speed=scoring_speed)
 
+        if output_mode == "tuning_only":
+            # Passthrough: return base model unchanged, no merge result
+            for r in results:
+                r.pop("merged_model", None)
+                r.pop("merged_clip", None)
+                r.pop("lora_data", None)
+            del results, best, best_model, best_clip, best_lora_data, best_analysis_report, active_loras
+            gc.collect()
+            if use_gpu:
+                torch.cuda.empty_cache()
+            logging.info("[LoRA AutoTuner] tuning_only mode — returning base model (no merge)")
+            result = (model, clip, report, "", tuner_data, None)
+            if cache_patches == "enabled":
+                self._autotuner_cache = {at_cache_key: (result, "tuning_only")}
+            else:
+                self._autotuner_cache = {}
+            return result
+
         # Extract return values, then free heavy intermediates
         ret_model = best["merged_model"]
         ret_clip = best["merged_clip"]
@@ -5046,7 +5236,7 @@ class LoRAAutoTuner(LoRAOptimizer):
 
         result = (ret_model, ret_clip, report, ret_analysis_report, tuner_data, ret_lora_data)
         if cache_patches == "enabled":
-            self._autotuner_cache = {at_cache_key: result}
+            self._autotuner_cache = {at_cache_key: (result, "merge")}
         else:
             self._autotuner_cache = {}
             logging.info("[LoRA AutoTuner] Patch cache disabled — RAM freed after merge")
@@ -5178,10 +5368,10 @@ class LoRAAutoTuner(LoRAOptimizer):
                    architecture_preset="auto", record_dataset="disabled",
                    cache_patches="enabled",
                    diff_cache_mode="disabled", diff_cache_ram_pct=0.5,
-                   vram_budget=0.0, scoring_speed="full"):
-        return (id(lora_stack), output_strength, clip_strength_multiplier, top_n,
+                   vram_budget=0.0, scoring_speed="full", output_mode="merge"):
+        return (id(model), id(lora_stack), output_strength, clip_strength_multiplier, top_n,
                 normalize_keys, scoring_svd, scoring_device, architecture_preset,
-                vram_budget, record_dataset, scoring_speed)
+                vram_budget, record_dataset, scoring_speed, output_mode)
 
 
 class LoRAMergeSelector(LoRAOptimizer):
@@ -5209,8 +5399,8 @@ class LoRAMergeSelector(LoRAOptimizer):
                     "tooltip": "Which ranked configuration to apply (1 = best, 2 = second best, etc.)."
                 }),
                 "output_strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Master volume for the merged result."
+                    "default": 1.0, "min": -1.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Master volume for the merged result. Set to -1 for auto (uses suggested max strength)."
                 }),
             },
             "optional": {
@@ -5313,7 +5503,7 @@ class LoRAMergeSelector(LoRAOptimizer):
     def IS_CHANGED(cls, model, lora_stack, tuner_data, selection,
                    output_strength, clip=None, clip_strength_multiplier=1.0,
                    vram_budget=0.0):
-        return (id(tuner_data), selection, output_strength, clip_strength_multiplier)
+        return (id(model), id(tuner_data), selection, output_strength, clip_strength_multiplier)
 
 
 class WanVideoLoRAOptimizer(LoRAOptimizer):
@@ -5323,7 +5513,7 @@ class WanVideoLoRAOptimizer(LoRAOptimizer):
 
     All merging algorithms (TIES, DARE/DELLA, SVD compression, auto-strength,
     conflict analysis) are inherited from LoRAOptimizer. Wan LoRA key
-    normalization (LyCORIS, diffusers, Fun LoRA, finetrainer, RS-LoRA) is
+    normalization (LyCORIS, diffusers, Fun LoRA, finetrainer) is
     already handled by the parent's _normalize_keys_wan.
     """
 
@@ -5352,10 +5542,13 @@ class WanVideoLoRAOptimizer(LoRAOptimizer):
             "tooltip": "Architecture-aware threshold tuning. Default 'dit' for WanVideo models. "
                        "'auto' detects from LoRA keys."
         })
+        base["optional"].pop("tuner_data", None)
+        base["optional"].pop("settings_source", None)
         return base
 
     RETURN_TYPES = ("WANVIDEOMODEL", "STRING", "LORA_DATA")
     RETURN_NAMES = ("model", "analysis_report", "lora_data")
+    FUNCTION = "optimize_merge"
     CATEGORY = "LoRA Optimizer"
     DESCRIPTION = (
         "WanVideo LoRA Optimizer — merges multiple WanVideo LoRAs using "
