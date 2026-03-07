@@ -3188,10 +3188,9 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         # Near-orthogonal LoRAs: ~50% sign conflict is the base rate for
         # independent vectors, not actual semantic conflict. TIES trimming
-        # destroys both signals. Use weighted_average which divides by N,
-        # naturally reducing per-LoRA influence. NOT upgraded to SLERP:
-        # SLERP's norm correction preserves magnitude, giving ~1.6x more
-        # energy than weighted_average for 3 orthogonal vectors ("burned" look).
+        # destroys both signals. Use weighted_average as the global mode,
+        # upgraded to SLERP per-prefix to preserve magnitude (important for
+        # video LoRAs where motion energy matters).
         if (behavior_profile in ("v1.2", "no_slerp")
                 and abs(avg_cos_sim) < arch_preset["orthogonal_cos_sim_max"]
                 and avg_conflict_ratio < arch_preset["orthogonal_conflict_max"]):
@@ -3199,7 +3198,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             reasoning.append(f"Cosine similarity {avg_cos_sim:.2f} near zero (orthogonal LoRAs) — "
                              f"sign conflict {avg_conflict_ratio:.1%} is base-rate noise, not real conflict")
             if behavior_profile == "v1.2":
-                reasoning.append("  Using weighted_average to preserve both signals (no SLERP upgrade — orthogonal vectors need magnitude reduction)")
+                reasoning.append("  Using weighted_average (upgraded to SLERP per-prefix to preserve magnitude)")
             else:
                 reasoning.append("  Using weighted_average to preserve both signals (SLERP upgrade disabled by profile)")
             density = 0.5
@@ -4044,21 +4043,17 @@ class LoRAOptimizer(_LoRAMergeBase):
                         arch_preset=arch_preset,
                         precomputed_density=pf.get("precomputed_density"),
                     )
-                    # Upgrade weighted_average → slerp for 2+ positively-aligned LoRAs.
-                    # SLERP preserves magnitude better than weighted_average's /N reduction.
-                    # Skip when inappropriate:
-                    #  - Orthogonal (|cos| < 0.25): SLERP's norm correction gives ~1.6x
-                    #    more energy than weighted_average for 3 orthogonal vectors.
-                    #  - Opposing (cos < 0): SLERP interpolates between opposing directions
-                    #    while preserving magnitude; combined with auto-strength boosting
-                    #    (scale > 1.0 for opposing pairs), this amplifies artifacts.
-                    # Both cases benefit from weighted_average's /N magnitude reduction.
+                    # Upgrade weighted_average → slerp for 2+ non-opposing LoRAs.
+                    # SLERP preserves magnitude better than weighted_average's /N reduction,
+                    # which is critical for video LoRAs where motion energy matters.
+                    # Skip for opposing LoRAs (cos < 0): SLERP interpolates between opposing
+                    # directions while preserving magnitude, amplifying artifacts.
                     pf_raw_cos = pf.get("avg_cos_sim", 0.0)
                     pf_orthogonal = abs(pf_raw_cos) < arch_preset["orthogonal_cos_sim_max"]
                     pf_opposing = pf_raw_cos < 0
                     if (pf_mode == "weighted_average" and pf["n_loras"] >= 2
                             and behavior_profile == "v1.2"
-                            and not pf_orthogonal and not pf_opposing):
+                            and not pf_opposing):
                         pf_mode = "slerp"
 
             # Apply merge strategy override from Conflict Editor (takes priority over auto-selection)
@@ -4254,8 +4249,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             # in enhanced quality doesn't account for the directional cancellation
             # that weighted_average provides.
             pf_quality = merge_quality
-            if (pf_mode == "weighted_average"
-                    and (pf_orthogonal or pf_opposing)):
+            if (pf_mode == "weighted_average" and pf_opposing):
                 pf_quality = "standard"
 
             merged_diff = self._merge_diffs(
