@@ -1,8 +1,8 @@
 {
   "id": "9ae6082b-c7f4-433c-9971-7a8f65a3ea65",
   "revision": 0,
-  "last_node_id": 714,
-  "last_link_id": 1523,
+  "last_node_id": 721,
+  "last_link_id": 1563,
   "nodes": [
     {
       "id": 533,
@@ -18,7 +18,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 63,
+      "order": 67,
       "mode": 0,
       "inputs": [
         {
@@ -61,7 +61,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 72,
+      "order": 76,
       "mode": 0,
       "inputs": [
         {
@@ -103,7 +103,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 64,
+      "order": 68,
       "mode": 0,
       "inputs": [
         {
@@ -146,7 +146,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 94,
+      "order": 99,
       "mode": 0,
       "inputs": [
         {
@@ -195,7 +195,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 89,
+      "order": 93,
       "mode": 0,
       "inputs": [
         {
@@ -246,7 +246,7 @@
         "collapsed": false,
         "pinned": true
       },
-      "order": 81,
+      "order": 88,
       "mode": 0,
       "inputs": [
         {
@@ -423,7 +423,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 73,
+      "order": 77,
       "mode": 0,
       "inputs": [
         {
@@ -523,7 +523,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 75,
+      "order": 79,
       "mode": 0,
       "inputs": [
         {
@@ -607,7 +607,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 100,
+      "order": 102,
       "mode": 0,
       "inputs": [
         {
@@ -743,7 +743,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 74,
+      "order": 78,
       "mode": 0,
       "inputs": [
         {
@@ -835,7 +835,7 @@
         "collapsed": true,
         "pinned": true
       },
-      "order": 65,
+      "order": 69,
       "mode": 0,
       "inputs": [
         {
@@ -929,7 +929,7 @@
         "collapsed": false,
         "pinned": true
       },
-      "order": 103,
+      "order": 105,
       "mode": 0,
       "inputs": [
         {
@@ -978,7 +978,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 106,
+      "order": 108,
       "mode": 0,
       "inputs": [
         {
@@ -1014,13 +1014,13 @@
       "flags": {
         "pinned": true
       },
-      "order": 55,
+      "order": 57,
       "mode": 0,
       "inputs": [
         {
           "name": "model",
           "type": "MODEL",
-          "link": 1372
+          "link": 1527
         },
         {
           "name": "shift",
@@ -1078,7 +1078,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 76,
+      "order": 73,
       "mode": 2,
       "inputs": [
         {
@@ -1121,7 +1121,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 82,
+      "order": 84,
       "mode": 2,
       "inputs": [
         {
@@ -1254,7 +1254,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 95,
+      "order": 98,
       "mode": 2,
       "inputs": [
         {
@@ -1305,7 +1305,7 @@
         "collapsed": false,
         "pinned": true
       },
-      "order": 90,
+      "order": 92,
       "mode": 2,
       "inputs": [
         {
@@ -1439,7 +1439,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 83,
+      "order": 85,
       "mode": 2,
       "inputs": [
         {
@@ -1481,7 +1481,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 84,
+      "order": 86,
       "mode": 2,
       "inputs": [
         {
@@ -1701,7 +1701,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 85,
+      "order": 87,
       "mode": 2,
       "inputs": [
         {
@@ -1793,7 +1793,7 @@
         "collapsed": true,
         "pinned": true
       },
-      "order": 78,
+      "order": 75,
       "mode": 2,
       "inputs": [
         {
@@ -1936,7 +1936,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 109,
+      "order": 110,
       "mode": 2,
       "inputs": [
         {
@@ -2001,209 +2001,6 @@
       ]
     },
     {
-      "id": 618,
-      "type": "LoRAOptimizer",
-      "pos": [
-        -2304,
-        -448
-      ],
-      "size": [
-        320.8833312988281,
-        522
-      ],
-      "flags": {
-        "pinned": true
-      },
-      "order": 45,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 1388
-        },
-        {
-          "name": "lora_stack",
-          "type": "LORA_STACK",
-          "link": 1390
-        },
-        {
-          "name": "clip",
-          "shape": 7,
-          "type": "CLIP",
-          "link": 1386
-        },
-        {
-          "name": "merge_strategy_override",
-          "shape": 7,
-          "type": "STRING",
-          "link": null
-        },
-        {
-          "name": "tuner_data",
-          "shape": 7,
-          "type": "TUNER_DATA",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "links": [
-            1372
-          ]
-        },
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "links": [
-            1373
-          ]
-        },
-        {
-          "name": "analysis_report",
-          "type": "STRING",
-          "links": [
-            1434
-          ]
-        },
-        {
-          "name": "lora_data",
-          "type": "LORA_DATA",
-          "links": null
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfyui-lora-optimizer",
-        "ver": "ac7010390c580c3b153ff2a81cf27fb6944f8fd7",
-        "Node name for S&R": "LoRAOptimizer",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {},
-          "version": "7.7"
-        }
-      },
-      "widgets_values": [
-        1,
-        1,
-        "enabled",
-        "disabled",
-        0.7,
-        "per_prefix",
-        "enabled",
-        "non_ties",
-        "gpu",
-        "enabled",
-        "disabled",
-        0.9,
-        0,
-        "standard",
-        "classic",
-        "auto",
-        "manual"
-      ]
-    },
-    {
-      "id": 654,
-      "type": "LoRAAutoTuner",
-      "pos": [
-        -2304,
-        608
-      ],
-      "size": [
-        294.6166687011719,
-        470
-      ],
-      "flags": {
-        "pinned": true
-      },
-      "order": 58,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 1445
-        },
-        {
-          "name": "lora_stack",
-          "type": "LORA_STACK",
-          "link": 1447
-        },
-        {
-          "name": "clip",
-          "shape": 7,
-          "type": "CLIP",
-          "link": 1438
-        }
-      ],
-      "outputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "links": [
-            1432
-          ]
-        },
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "links": [
-            1433
-          ]
-        },
-        {
-          "name": "report",
-          "type": "STRING",
-          "links": [
-            1436
-          ]
-        },
-        {
-          "name": "analysis_report",
-          "type": "STRING",
-          "links": []
-        },
-        {
-          "name": "tuner_data",
-          "type": "TUNER_DATA",
-          "links": null
-        },
-        {
-          "name": "lora_data",
-          "type": "LORA_DATA",
-          "links": null
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfyui-lora-optimizer",
-        "ver": "71d103af304dbae3036fe7b951eb42df2c9dd3ca",
-        "Node name for S&R": "LoRAAutoTuner",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {},
-          "version": "7.7"
-        }
-      },
-      "widgets_values": [
-        1,
-        1,
-        3,
-        "enabled",
-        "disabled",
-        "gpu",
-        "auto",
-        "disabled",
-        "enabled",
-        "auto",
-        0.5,
-        0,
-        "turbo",
-        "merge"
-      ]
-    },
-    {
       "id": 655,
       "type": "PreviewAny",
       "pos": [
@@ -2217,13 +2014,13 @@
       "flags": {
         "pinned": true
       },
-      "order": 57,
+      "order": 59,
       "mode": 0,
       "inputs": [
         {
           "name": "source",
           "type": "*",
-          "link": 1434
+          "link": 1529
         }
       ],
       "outputs": [],
@@ -2258,13 +2055,13 @@
         "collapsed": true,
         "pinned": true
       },
-      "order": 56,
+      "order": 58,
       "mode": 0,
       "inputs": [
         {
           "name": "clip",
           "type": "CLIP",
-          "link": 1373
+          "link": 1528
         },
         {
           "name": "text",
@@ -2325,13 +2122,13 @@
         "collapsed": true,
         "pinned": true
       },
-      "order": 67,
+      "order": 65,
       "mode": 2,
       "inputs": [
         {
           "name": "clip",
           "type": "CLIP",
-          "link": 1433
+          "link": 1559
         },
         {
           "name": "text",
@@ -2582,7 +2379,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 77,
+      "order": 74,
       "mode": 2,
       "inputs": [
         {
@@ -2625,7 +2422,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 91,
+      "order": 89,
       "mode": 2,
       "inputs": [
         {
@@ -2668,7 +2465,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 96,
+      "order": 94,
       "mode": 2,
       "inputs": [
         {
@@ -2752,7 +2549,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 108,
+      "order": 106,
       "mode": 2,
       "inputs": [
         {
@@ -2801,7 +2598,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 105,
+      "order": 103,
       "mode": 2,
       "inputs": [
         {
@@ -2852,7 +2649,7 @@
         "collapsed": false,
         "pinned": true
       },
-      "order": 102,
+      "order": 100,
       "mode": 2,
       "inputs": [
         {
@@ -2986,7 +2783,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 98,
+      "order": 96,
       "mode": 2,
       "inputs": [
         {
@@ -3028,7 +2825,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 97,
+      "order": 95,
       "mode": 2,
       "inputs": [
         {
@@ -3112,7 +2909,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 110,
+      "order": 109,
       "mode": 2,
       "inputs": [
         {
@@ -3248,7 +3045,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 99,
+      "order": 97,
       "mode": 2,
       "inputs": [
         {
@@ -3510,7 +3307,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 93,
+      "order": 91,
       "mode": 2,
       "inputs": [
         {
@@ -3595,13 +3392,13 @@
       "flags": {
         "pinned": true
       },
-      "order": 86,
+      "order": 81,
       "mode": 2,
       "inputs": [
         {
           "name": "model",
           "type": "MODEL",
-          "link": 1493
+          "link": 1546
         },
         {
           "name": "shift",
@@ -3660,7 +3457,7 @@
         "collapsed": true,
         "pinned": true
       },
-      "order": 92,
+      "order": 90,
       "mode": 2,
       "inputs": [
         {
@@ -3707,7 +3504,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 59,
+      "order": 55,
       "mode": 0,
       "inputs": [
         {
@@ -3721,8 +3518,8 @@
           "name": "",
           "type": "LORA_STACK",
           "links": [
-            1484,
-            1494
+            1543,
+            1550
           ]
         }
       ],
@@ -3750,7 +3547,7 @@
       "flags": {
         "pinned": true
       },
-      "order": 46,
+      "order": 45,
       "mode": 0,
       "inputs": [
         {
@@ -3764,8 +3561,8 @@
           "name": "",
           "type": "LORA_STACK",
           "links": [
-            1447,
-            1498
+            1498,
+            1556
           ]
         }
       ],
@@ -3807,8 +3604,8 @@
           "name": "",
           "type": "MODEL",
           "links": [
-            1445,
-            1499
+            1499,
+            1555
           ]
         }
       ],
@@ -4103,13 +3900,13 @@
         "collapsed": true,
         "pinned": true
       },
-      "order": 87,
+      "order": 82,
       "mode": 2,
       "inputs": [
         {
           "name": "clip",
           "type": "CLIP",
-          "link": 1512
+          "link": 1547
         },
         {
           "name": "text",
@@ -4169,13 +3966,13 @@
       "flags": {
         "pinned": true
       },
-      "order": 66,
+      "order": 64,
       "mode": 2,
       "inputs": [
         {
           "name": "model",
           "type": "MODEL",
-          "link": 1432
+          "link": 1558
         },
         {
           "name": "shift",
@@ -4247,8 +4044,8 @@
           "name": "",
           "type": "MODEL",
           "links": [
-            1388,
-            1444
+            1444,
+            1524
           ]
         }
       ],
@@ -4306,46 +4103,6 @@
       }
     },
     {
-      "id": 657,
-      "type": "PreviewAny",
-      "pos": [
-        -1920,
-        864
-      ],
-      "size": [
-        416,
-        640
-      ],
-      "flags": {
-        "pinned": true
-      },
-      "order": 68,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "source",
-          "type": "*",
-          "link": 1436
-        }
-      ],
-      "outputs": [],
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.15.1",
-        "Node name for S&R": "PreviewAny",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {},
-          "version": "7.7"
-        }
-      },
-      "widgets_values": [
-        null,
-        null,
-        null
-      ]
-    },
-    {
       "id": 691,
       "type": "Reroute",
       "pos": [
@@ -4373,7 +4130,7 @@
           "name": "",
           "type": "MODEL",
           "links": [
-            1483
+            1549
           ]
         }
       ],
@@ -4386,110 +4143,6 @@
           "input_ue_unconnectable": {}
         }
       }
-    },
-    {
-      "id": 699,
-      "type": "LoRAOptimizer",
-      "pos": [
-        -1952,
-        1664
-      ],
-      "size": [
-        330.91666412353516,
-        522
-      ],
-      "flags": {
-        "pinned": true
-      },
-      "order": 79,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 1516
-        },
-        {
-          "name": "lora_stack",
-          "type": "LORA_STACK",
-          "link": 1494
-        },
-        {
-          "name": "clip",
-          "shape": 7,
-          "type": "CLIP",
-          "link": 1517
-        },
-        {
-          "name": "merge_strategy_override",
-          "shape": 7,
-          "type": "STRING",
-          "link": null
-        },
-        {
-          "name": "tuner_data",
-          "shape": 7,
-          "type": "TUNER_DATA",
-          "link": 1495
-        }
-      ],
-      "outputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "links": [
-            1493
-          ]
-        },
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "links": [
-            1512
-          ]
-        },
-        {
-          "name": "analysis_report",
-          "type": "STRING",
-          "links": [
-            1514
-          ]
-        },
-        {
-          "name": "lora_data",
-          "type": "LORA_DATA",
-          "links": null
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfyui-lora-optimizer",
-        "ver": "71d103af304dbae3036fe7b951eb42df2c9dd3ca",
-        "Node name for S&R": "LoRAOptimizer",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {},
-          "version": "7.7"
-        }
-      },
-      "widgets_values": [
-        1,
-        1,
-        "enabled",
-        "disabled",
-        0.7,
-        "per_prefix",
-        "enabled",
-        "non_ties",
-        "gpu",
-        "enabled",
-        "della_conflict",
-        0.7,
-        0,
-        "standard",
-        "classic",
-        "auto",
-        "from_autotuner"
-      ]
     },
     {
       "id": 683,
@@ -4611,8 +4264,8 @@
           "name": "",
           "type": "CLIP",
           "links": [
-            1438,
-            1497
+            1497,
+            1557
           ]
         }
       ],
@@ -4654,8 +4307,8 @@
           "name": "",
           "type": "LORA_STACK",
           "links": [
-            1390,
-            1446
+            1446,
+            1525
           ]
         }
       ],
@@ -4697,8 +4350,8 @@
           "name": "",
           "type": "CLIP",
           "links": [
-            1386,
-            1506
+            1506,
+            1526
           ]
         }
       ],
@@ -5055,7 +4708,7 @@
           "name": "",
           "type": "CLIP",
           "links": [
-            1485
+            1551
           ]
         }
       ],
@@ -5115,105 +4768,6 @@
       }
     },
     {
-      "id": 686,
-      "type": "LoRAAutoTuner",
-      "pos": [
-        -2304,
-        1664
-      ],
-      "size": [
-        294.6166687011719,
-        470
-      ],
-      "flags": {
-        "pinned": true
-      },
-      "order": 69,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 1483
-        },
-        {
-          "name": "lora_stack",
-          "type": "LORA_STACK",
-          "link": 1484
-        },
-        {
-          "name": "clip",
-          "shape": 7,
-          "type": "CLIP",
-          "link": 1485
-        }
-      ],
-      "outputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "links": [
-            1516
-          ]
-        },
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "links": [
-            1517
-          ]
-        },
-        {
-          "name": "report",
-          "type": "STRING",
-          "links": []
-        },
-        {
-          "name": "analysis_report",
-          "type": "STRING",
-          "links": []
-        },
-        {
-          "name": "tuner_data",
-          "type": "TUNER_DATA",
-          "links": [
-            1495
-          ]
-        },
-        {
-          "name": "lora_data",
-          "type": "LORA_DATA",
-          "links": null
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfyui-lora-optimizer",
-        "ver": "71d103af304dbae3036fe7b951eb42df2c9dd3ca",
-        "Node name for S&R": "LoRAAutoTuner",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {},
-          "version": "7.7"
-        }
-      },
-      "widgets_values": [
-        1,
-        1,
-        3,
-        "enabled",
-        "disabled",
-        "gpu",
-        "auto",
-        "disabled",
-        "enabled",
-        "auto",
-        0.5,
-        0,
-        "turbo",
-        "merge"
-      ]
-    },
-    {
       "id": 703,
       "type": "easy showAnything",
       "pos": [
@@ -5227,14 +4781,14 @@
       "flags": {
         "pinned": true
       },
-      "order": 88,
+      "order": 83,
       "mode": 2,
       "inputs": [
         {
           "name": "anything",
           "shape": 7,
           "type": "*",
-          "link": 1514
+          "link": 1548
         }
       ],
       "outputs": [
@@ -5671,6 +5225,448 @@
       ],
       "color": "#432",
       "bgcolor": "#653"
+    },
+    {
+      "id": 715,
+      "type": "LoRAOptimizer",
+      "pos": [
+        -2304,
+        -448
+      ],
+      "size": [
+        270.91666412353516,
+        522
+      ],
+      "flags": {},
+      "order": 46,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1524
+        },
+        {
+          "name": "lora_stack",
+          "type": "LORA_STACK",
+          "link": 1525
+        },
+        {
+          "name": "clip",
+          "shape": 7,
+          "type": "CLIP",
+          "link": 1526
+        },
+        {
+          "name": "merge_strategy_override",
+          "shape": 7,
+          "type": "STRING",
+          "link": null
+        },
+        {
+          "name": "tuner_data",
+          "shape": 7,
+          "type": "TUNER_DATA",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            1527
+          ]
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "links": [
+            1528
+          ]
+        },
+        {
+          "name": "analysis_report",
+          "type": "STRING",
+          "links": [
+            1529
+          ]
+        },
+        {
+          "name": "lora_data",
+          "type": "LORA_DATA",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-lora-optimizer",
+        "ver": "4d28654431ac41a6385e3284a829251063eab6ad",
+        "Node name for S&R": "LoRAOptimizer",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.7"
+        }
+      },
+      "widgets_values": [
+        1,
+        1,
+        "enabled",
+        -1,
+        "enabled",
+        0.9,
+        "per_prefix",
+        "enabled",
+        "non_ties",
+        "gpu",
+        "enabled",
+        "disabled",
+        0.9,
+        0,
+        "standard",
+        "classic",
+        "auto",
+        "manual"
+      ]
+    },
+    {
+      "id": 657,
+      "type": "PreviewAny",
+      "pos": [
+        -1920,
+        864
+      ],
+      "size": [
+        416,
+        640
+      ],
+      "flags": {
+        "pinned": true
+      },
+      "order": 66,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 1560
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.15.1",
+        "Node name for S&R": "PreviewAny",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.7"
+        }
+      },
+      "widgets_values": [
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "id": 720,
+      "type": "LoRAAutoTuner",
+      "pos": [
+        -2304,
+        608
+      ],
+      "size": [
+        294.6166687011719,
+        470
+      ],
+      "flags": {},
+      "order": 56,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1555
+        },
+        {
+          "name": "lora_stack",
+          "type": "LORA_STACK",
+          "link": 1556
+        },
+        {
+          "name": "clip",
+          "shape": 7,
+          "type": "CLIP",
+          "link": 1557
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            1558
+          ]
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "links": [
+            1559
+          ]
+        },
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": [
+            1560
+          ]
+        },
+        {
+          "name": "analysis_report",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "tuner_data",
+          "type": "TUNER_DATA",
+          "links": null
+        },
+        {
+          "name": "lora_data",
+          "type": "LORA_DATA",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-lora-optimizer",
+        "ver": "4d28654431ac41a6385e3284a829251063eab6ad",
+        "Node name for S&R": "LoRAAutoTuner",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.7"
+        }
+      },
+      "widgets_values": [
+        1,
+        1,
+        3,
+        "enabled",
+        "disabled",
+        "gpu",
+        "auto",
+        -1,
+        "disabled",
+        "enabled",
+        "auto",
+        0.5,
+        0,
+        "turbo",
+        "merge"
+      ]
+    },
+    {
+      "id": 718,
+      "type": "LoRAOptimizer",
+      "pos": [
+        -1952,
+        1664
+      ],
+      "size": [
+        270.91666412353516,
+        546
+      ],
+      "flags": {},
+      "order": 72,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1552
+        },
+        {
+          "name": "lora_stack",
+          "type": "LORA_STACK",
+          "link": 1543
+        },
+        {
+          "name": "clip",
+          "shape": 7,
+          "type": "CLIP",
+          "link": 1553
+        },
+        {
+          "name": "merge_strategy_override",
+          "shape": 7,
+          "type": "STRING",
+          "link": null
+        },
+        {
+          "name": "tuner_data",
+          "shape": 7,
+          "type": "TUNER_DATA",
+          "link": 1563
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            1546
+          ]
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "links": [
+            1547
+          ]
+        },
+        {
+          "name": "analysis_report",
+          "type": "STRING",
+          "links": [
+            1548
+          ]
+        },
+        {
+          "name": "lora_data",
+          "type": "LORA_DATA",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-lora-optimizer",
+        "ver": "4d28654431ac41a6385e3284a829251063eab6ad",
+        "Node name for S&R": "LoRAOptimizer",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.7"
+        }
+      },
+      "widgets_values": [
+        1,
+        1,
+        "enabled",
+        -1,
+        "enabled",
+        0.7,
+        "per_prefix",
+        "enabled",
+        "non_ties",
+        "gpu",
+        "enabled",
+        "della_conflict",
+        0.7,
+        0,
+        "standard",
+        "classic",
+        "auto",
+        "manual"
+      ]
+    },
+    {
+      "id": 719,
+      "type": "LoRAAutoTuner",
+      "pos": [
+        -2304,
+        1664
+      ],
+      "size": [
+        234.61666870117188,
+        494
+      ],
+      "flags": {},
+      "order": 63,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1549
+        },
+        {
+          "name": "lora_stack",
+          "type": "LORA_STACK",
+          "link": 1550
+        },
+        {
+          "name": "clip",
+          "shape": 7,
+          "type": "CLIP",
+          "link": 1551
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            1552
+          ]
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "links": [
+            1553
+          ]
+        },
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "analysis_report",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "tuner_data",
+          "type": "TUNER_DATA",
+          "links": [
+            1563
+          ]
+        },
+        {
+          "name": "lora_data",
+          "type": "LORA_DATA",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-lora-optimizer",
+        "ver": "4d28654431ac41a6385e3284a829251063eab6ad",
+        "Node name for S&R": "LoRAAutoTuner",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.7"
+        }
+      },
+      "widgets_values": [
+        1,
+        1,
+        3,
+        "enabled",
+        "disabled",
+        "gpu",
+        "auto",
+        -1,
+        "disabled",
+        "enabled",
+        "auto",
+        0.5,
+        0,
+        "turbo",
+        "merge"
+      ]
     }
   ],
   "links": [
@@ -5843,22 +5839,6 @@
       "INT"
     ],
     [
-      1372,
-      618,
-      0,
-      47,
-      0,
-      "MODEL"
-    ],
-    [
-      1373,
-      618,
-      1,
-      45,
-      0,
-      "CLIP"
-    ],
-    [
       1375,
       45,
       0,
@@ -5915,36 +5895,12 @@
       "INT"
     ],
     [
-      1386,
-      625,
-      0,
-      618,
-      2,
-      "CLIP"
-    ],
-    [
       1387,
       46,
       0,
       626,
       0,
       "MODEL"
-    ],
-    [
-      1388,
-      626,
-      0,
-      618,
-      0,
-      "MODEL"
-    ],
-    [
-      1390,
-      627,
-      0,
-      618,
-      1,
-      "LORA_STACK"
     ],
     [
       1391,
@@ -6211,46 +6167,6 @@
       "FLOAT"
     ],
     [
-      1432,
-      654,
-      0,
-      630,
-      0,
-      "MODEL"
-    ],
-    [
-      1433,
-      654,
-      1,
-      642,
-      0,
-      "CLIP"
-    ],
-    [
-      1434,
-      618,
-      2,
-      655,
-      0,
-      "STRING"
-    ],
-    [
-      1436,
-      654,
-      2,
-      657,
-      0,
-      "STRING"
-    ],
-    [
-      1438,
-      658,
-      0,
-      654,
-      2,
-      "CLIP"
-    ],
-    [
       1439,
       550,
       0,
@@ -6291,27 +6207,11 @@
       "MODEL"
     ],
     [
-      1445,
-      662,
-      0,
-      654,
-      0,
-      "MODEL"
-    ],
-    [
       1446,
       627,
       0,
       663,
       0,
-      "LORA_STACK"
-    ],
-    [
-      1447,
-      663,
-      0,
-      654,
-      1,
       "LORA_STACK"
     ],
     [
@@ -6587,30 +6487,6 @@
       "IMAGE"
     ],
     [
-      1483,
-      691,
-      0,
-      686,
-      0,
-      "MODEL"
-    ],
-    [
-      1484,
-      692,
-      0,
-      686,
-      1,
-      "LORA_STACK"
-    ],
-    [
-      1485,
-      690,
-      0,
-      686,
-      2,
-      "CLIP"
-    ],
-    [
       1489,
       697,
       0,
@@ -6633,30 +6509,6 @@
       695,
       0,
       "CONDITIONING"
-    ],
-    [
-      1493,
-      699,
-      0,
-      667,
-      0,
-      "MODEL"
-    ],
-    [
-      1494,
-      692,
-      0,
-      699,
-      1,
-      "LORA_STACK"
-    ],
-    [
-      1495,
-      686,
-      4,
-      699,
-      4,
-      "TUNER_DATA"
     ],
     [
       1496,
@@ -6771,38 +6623,6 @@
       "CLIP"
     ],
     [
-      1512,
-      699,
-      1,
-      689,
-      0,
-      "CLIP"
-    ],
-    [
-      1514,
-      699,
-      2,
-      703,
-      0,
-      "STRING"
-    ],
-    [
-      1516,
-      686,
-      0,
-      699,
-      0,
-      "MODEL"
-    ],
-    [
-      1517,
-      686,
-      1,
-      699,
-      2,
-      "CLIP"
-    ],
-    [
       1518,
       628,
       0,
@@ -6849,6 +6669,182 @@
       683,
       0,
       "INT"
+    ],
+    [
+      1524,
+      626,
+      0,
+      715,
+      0,
+      "MODEL"
+    ],
+    [
+      1525,
+      627,
+      0,
+      715,
+      1,
+      "LORA_STACK"
+    ],
+    [
+      1526,
+      625,
+      0,
+      715,
+      2,
+      "CLIP"
+    ],
+    [
+      1527,
+      715,
+      0,
+      47,
+      0,
+      "MODEL"
+    ],
+    [
+      1528,
+      715,
+      1,
+      45,
+      0,
+      "CLIP"
+    ],
+    [
+      1529,
+      715,
+      2,
+      655,
+      0,
+      "STRING"
+    ],
+    [
+      1543,
+      692,
+      0,
+      718,
+      1,
+      "LORA_STACK"
+    ],
+    [
+      1546,
+      718,
+      0,
+      667,
+      0,
+      "MODEL"
+    ],
+    [
+      1547,
+      718,
+      1,
+      689,
+      0,
+      "CLIP"
+    ],
+    [
+      1548,
+      718,
+      2,
+      703,
+      0,
+      "STRING"
+    ],
+    [
+      1549,
+      691,
+      0,
+      719,
+      0,
+      "MODEL"
+    ],
+    [
+      1550,
+      692,
+      0,
+      719,
+      1,
+      "LORA_STACK"
+    ],
+    [
+      1551,
+      690,
+      0,
+      719,
+      2,
+      "CLIP"
+    ],
+    [
+      1552,
+      719,
+      0,
+      718,
+      0,
+      "MODEL"
+    ],
+    [
+      1553,
+      719,
+      1,
+      718,
+      2,
+      "CLIP"
+    ],
+    [
+      1555,
+      662,
+      0,
+      720,
+      0,
+      "MODEL"
+    ],
+    [
+      1556,
+      663,
+      0,
+      720,
+      1,
+      "LORA_STACK"
+    ],
+    [
+      1557,
+      658,
+      0,
+      720,
+      2,
+      "CLIP"
+    ],
+    [
+      1558,
+      720,
+      0,
+      630,
+      0,
+      "MODEL"
+    ],
+    [
+      1559,
+      720,
+      1,
+      642,
+      0,
+      "CLIP"
+    ],
+    [
+      1560,
+      720,
+      2,
+      657,
+      0,
+      "STRING"
+    ],
+    [
+      1563,
+      719,
+      4,
+      718,
+      4,
+      "TUNER_DATA"
     ]
   ],
   "groups": [
@@ -6901,10 +6897,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.243044209673999,
+      "scale": 0.2973163841807957,
       "offset": [
-        9059.774434145176,
-        1813.996937295587
+        8142.966686813604,
+        2123.087621084178
       ]
     },
     "frontendVersion": "1.39.19",
