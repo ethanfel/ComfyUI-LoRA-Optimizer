@@ -5727,17 +5727,14 @@ class SaveMergedLoRA:
             logging.warning("[Save Merged LoRA] No lora_data received (optimizer may have returned early). Nothing to save.")
             return ("",)
 
-        # Determine save path
-        if os.path.isabs(filename):
-            # Absolute path provided — use as-is
-            save_path = filename if filename.endswith('.safetensors') else f"{filename}.safetensors"
-            save_dir = os.path.dirname(save_path)
-        else:
-            # Plain filename or relative path — save under primary ComfyUI loras folder
-            save_dir = folder_paths.get_folder_paths("loras")[0]
-            base = filename if filename.endswith('.safetensors') else f"{filename}.safetensors"
-            save_path = os.path.join(save_dir, base)
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        # Determine save path — always constrained to the loras directory
+        save_dir = folder_paths.get_folder_paths("loras")[0]
+        base = os.path.basename(filename)
+        base = base if base.endswith('.safetensors') else f"{base}.safetensors"
+        save_path = os.path.join(save_dir, base)
+        # Verify resolved path stays inside the loras directory
+        if not os.path.realpath(save_path).startswith(os.path.realpath(save_dir)):
+            raise ValueError(f"[Save Merged LoRA] Path escapes loras directory: {filename}")
 
         model_patches = lora_data["model_patches"]
         clip_patches = lora_data["clip_patches"]
@@ -5827,12 +5824,12 @@ class SaveTunerData:
     def save_tuner_data(self, tuner_data, filename):
         if tuner_data is None:
             return ("",)
-        base = filename if filename.endswith(".json") else f"{filename}.json"
-        if os.path.isabs(filename):
-            save_path = base
-        else:
-            save_path = os.path.join(TUNER_DATA_DIR, base)
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        base = os.path.basename(filename)
+        base = base if base.endswith(".json") else f"{base}.json"
+        save_path = os.path.join(TUNER_DATA_DIR, base)
+        # Verify resolved path stays inside the tuner_data directory
+        if not os.path.realpath(save_path).startswith(os.path.realpath(TUNER_DATA_DIR)):
+            raise ValueError(f"[Save Tuner Data] Path escapes tuner_data directory: {filename}")
         with open(save_path, "w") as f:
             json.dump(tuner_data, f, indent=2)
         logging.info(f"[Save Tuner Data] Saved to: {save_path}")
