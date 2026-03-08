@@ -4123,6 +4123,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         fr_rank_threshold = fr_preset.get("rank_threshold", 256)
         global_avg_rank = (sum(s["avg_rank"] for s in lora_stats) / len(lora_stats)) if lora_stats else 0
         is_full_rank = global_avg_rank >= fr_rank_threshold
+        logging.info(f"[LoRA Optimizer] Global avg rank: {global_avg_rank:.0f} (full-rank threshold: {fr_rank_threshold})")
         if is_full_rank:
             logging.info(f"[LoRA Optimizer] Full-rank LoRAs detected (avg rank {global_avg_rank:.0f} >= {fr_rank_threshold})")
             if fr_preset.get("disable_slerp_upgrade", False):
