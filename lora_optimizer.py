@@ -50,6 +50,12 @@ _ARCH_PRESETS = {
         "suggested_max_strength_cap": 3.0,
         "auto_strength_orthogonal_floor": 0.85,
         "display_name": "SD/SDXL UNet",
+        "full_rank": {
+            "rank_threshold": 256,
+            "disable_slerp_upgrade": True,
+            "prefer_sum_orthogonal": True,
+            "auto_strength_floor": 1.0,
+        },
     },
     "dit": {
         "density_noise_floor_ratio": 0.05,
@@ -66,6 +72,12 @@ _ARCH_PRESETS = {
         "suggested_max_strength_cap": 5.0,
         "auto_strength_orthogonal_floor": 0.85,
         "display_name": "DiT (Flux/WAN/Z-Image/LTX/HunyuanVideo)",
+        "full_rank": {
+            "rank_threshold": 256,
+            "disable_slerp_upgrade": True,
+            "prefer_sum_orthogonal": True,
+            "auto_strength_floor": 1.0,
+        },
     },
     "llm": {
         "density_noise_floor_ratio": 0.15,
@@ -82,6 +94,12 @@ _ARCH_PRESETS = {
         "suggested_max_strength_cap": 3.0,
         "auto_strength_orthogonal_floor": 0.9,
         "display_name": "LLM (Qwen/LLaMA)",
+        "full_rank": {
+            "rank_threshold": 256,
+            "disable_slerp_upgrade": True,
+            "prefer_sum_orthogonal": True,
+            "auto_strength_floor": 1.0,
+        },
     },
 }
 
@@ -3316,7 +3334,7 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         return max(arch_preset["density_clamp_min"], min(arch_preset["density_clamp_max"], above_noise))
 
-    def _compute_auto_strengths(self, active_loras, lora_stats, pairwise_similarities=None, arch_preset=None, detected_arch=None, auto_strength_floor=-1.0):
+    def _compute_auto_strengths(self, active_loras, lora_stats, pairwise_similarities=None, arch_preset=None, detected_arch=None, auto_strength_floor=-1.0, is_full_rank=False):
         """
         Compute reduced per-LoRA strengths using interference-aware energy
         normalization. Uses pairwise cosine similarity to account for
@@ -3395,6 +3413,10 @@ class LoRAOptimizer(_LoRAMergeBase):
             if abs(avg_cos) <= alignment_thresh:
                 if auto_strength_floor >= 0:
                     floor = auto_strength_floor
+                elif is_full_rank:
+                    # Full-rank patches already represent the complete weight delta;
+                    # scaling them down loses information.
+                    floor = arch_preset.get("full_rank", {}).get("auto_strength_floor", 1.0)
                 else:
                     floor = _VIDEO_ARCH_ORTHOGONAL_FLOOR.get(
                         detected_arch,
@@ -3415,7 +3437,10 @@ class LoRAOptimizer(_LoRAMergeBase):
         reasoning.append(f"Scale factor: {scale:.4f}")
         if floor_applied:
             arch_label = detected_arch or "unknown"
-            reasoning.append(f"  (orthogonal floor {floor:.2f} applied for {arch_label} — preserving independent contributions)")
+            if is_full_rank:
+                reasoning.append(f"  (full-rank orthogonal floor {floor:.2f} applied — preserving complete weight deltas)")
+            else:
+                reasoning.append(f"  (orthogonal floor {floor:.2f} applied for {arch_label} — preserving independent contributions)")
         if pairwise_similarities:
             avg_cos = sum(pairwise_similarities.values()) / len(pairwise_similarities)
             orthogonal_energy = math.sqrt(orthogonal_energy_sq)
@@ -3575,7 +3600,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                       merge_quality="standard",
                       compatibility_warnings=None,
                       behavior_profile="v1.2",
-                      architecture_preset=None):
+                      architecture_preset=None,
+                      is_full_rank=False):
         """Format analysis as a multi-line report string."""
         lines = []
         lines.append("=" * 50)
@@ -3611,6 +3637,13 @@ class LoRAOptimizer(_LoRAMergeBase):
             }
             lines.append(f"Architecture: {arch_names.get(detected_arch, detected_arch)} (auto-detected)")
             lines.append(f"Key normalization: enabled")
+            lines.append("")
+
+        if is_full_rank:
+            global_avg_rank = (sum(s["avg_rank"] for s in lora_stats) / len(lora_stats)) if lora_stats else 0
+            lines.append("Full-rank LoRAs detected (avg rank {:.0f})".format(global_avg_rank))
+            lines.append("  Using full-rank merge path: SLERP upgrade disabled,")
+            lines.append("  orthogonal patches use weighted_sum, auto-strength floor raised")
             lines.append("")
 
         if compatibility_warnings:
@@ -4084,6 +4117,19 @@ class LoRAOptimizer(_LoRAMergeBase):
                 "key_filter": active_loras[i].get("key_filter", "all"),
             })
 
+        # Full-rank detection: when average rank exceeds threshold, switch to
+        # safer merge strategies that preserve information in high-dimensional patches.
+        fr_preset = arch_preset.get("full_rank", {})
+        fr_rank_threshold = fr_preset.get("rank_threshold", 256)
+        global_avg_rank = (sum(s["avg_rank"] for s in lora_stats) / len(lora_stats)) if lora_stats else 0
+        is_full_rank = global_avg_rank >= fr_rank_threshold
+        if is_full_rank:
+            logging.info(f"[LoRA Optimizer] Full-rank LoRAs detected (avg rank {global_avg_rank:.0f} >= {fr_rank_threshold})")
+            if fr_preset.get("disable_slerp_upgrade", False):
+                logging.info(f"[LoRA Optimizer]   SLERP upgrade disabled for full-rank patches")
+            if fr_preset.get("prefer_sum_orthogonal", False):
+                logging.info(f"[LoRA Optimizer]   Orthogonal full-rank patches will use weighted_sum (additive)")
+
         # Pairwise conflict stats and cosine similarity from accumulated counts
         total_overlap = 0
         total_conflict = 0
@@ -4174,7 +4220,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                 active_loras, lora_stats, pairwise_similarities=pairwise_similarities,
                 arch_preset=arch_preset,
                 detected_arch=getattr(self, '_detected_arch', None),
-                auto_strength_floor=auto_strength_floor)
+                auto_strength_floor=auto_strength_floor,
+                is_full_rank=is_full_rank)
 
             for i in range(len(active_loras)):
                 orig = active_loras[i]["strength"]
@@ -4303,10 +4350,19 @@ class LoRAOptimizer(_LoRAMergeBase):
                     pf_raw_cos = pf.get("avg_cos_sim", 0.0)
                     pf_orthogonal = abs(pf_raw_cos) < arch_preset["orthogonal_cos_sim_max"]
                     pf_opposing = pf_raw_cos < 0
+                    # Full-rank gate: skip SLERP upgrade — for full-rank patches the
+                    # information is spread across all dimensions, and SLERP's
+                    # hypersphere interpolation loses signal from both LoRAs.
                     if (pf_mode == "weighted_average" and pf["n_loras"] >= 2
                             and behavior_profile == "v1.2"
-                            and not pf_opposing):
+                            and not pf_opposing
+                            and not (is_full_rank and fr_preset.get("disable_slerp_upgrade", False))):
                         pf_mode = "slerp"
+                    # Full-rank gate: orthogonal full-rank patches → weighted_sum.
+                    # Independent full-rank deltas should be added, not averaged.
+                    if (is_full_rank and fr_preset.get("prefer_sum_orthogonal", False)
+                            and pf_mode == "weighted_average" and pf_orthogonal):
+                        pf_mode = "weighted_sum"
 
             # Apply merge strategy override from Conflict Editor (takes priority over auto-selection)
             # Skip when user explicitly chose weighted_sum_only (protects DPO/edit LoRAs)
@@ -4738,6 +4794,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             compatibility_warnings=compatibility_warnings,
             behavior_profile=behavior_profile,
             architecture_preset=preset_key,
+            is_full_rank=is_full_rank,
         )
 
         # Bundle LORA_DATA for optional downstream saving
@@ -5987,6 +6044,7 @@ class SaveTunerData:
                 "tuner_data": ("TUNER_DATA", {"tooltip": "Connect the tuner_data output from LoRA AutoTuner."}),
                 "save_folder": (folder_choices, {"tooltip": "Which tuner_data folder to save into. Lists all configured paths (from extra_model_paths.yaml and defaults)."}),
                 "filename": ("STRING", {"default": "tuner_data", "tooltip": "Filename. Subdirectories allowed (e.g. 'results/experiment1'). Extension .tuner is added automatically (.json also accepted)."}),
+                "overwrite": ("BOOLEAN", {"default": True, "tooltip": "When enabled, overwrites existing files. When disabled, appends _001, _002, etc. to avoid overwriting."}),
             }
         }
 
@@ -5997,7 +6055,7 @@ class SaveTunerData:
     OUTPUT_NODE = True
     DESCRIPTION = "Saves AutoTuner results to a .tuner file so they can be reloaded later without re-running the tuner."
 
-    def save_tuner_data(self, tuner_data, save_folder, filename):
+    def save_tuner_data(self, tuner_data, save_folder, filename, overwrite=True):
         if tuner_data is None:
             return ("",)
         save_dir = save_folder
@@ -6005,6 +6063,12 @@ class SaveTunerData:
         save_path = os.path.join(save_dir, base)
         if not os.path.realpath(save_path).startswith(os.path.realpath(save_dir) + os.sep):
             raise ValueError(f"[Save Tuner Data] Path escapes tuner_data directory: {filename}")
+        if not overwrite and os.path.exists(save_path):
+            stem, ext = os.path.splitext(save_path)
+            counter = 1
+            while os.path.exists(save_path):
+                save_path = f"{stem}_{counter:03d}{ext}"
+                counter += 1
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with open(save_path, "w") as f:
             json.dump(tuner_data, f, indent=2)
@@ -6287,6 +6351,13 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                 "l2_mean": l2_mean,
             })
 
+        # Full-rank detection for compatibility analyzer
+        ca_fr_preset = arch_preset.get("full_rank", {})
+        ca_global_avg_rank = (sum(s["avg_rank"] for s in lora_stats) / len(lora_stats)) if lora_stats else 0
+        ca_is_full_rank = ca_global_avg_rank >= ca_fr_preset.get("rank_threshold", 256)
+        if ca_is_full_rank:
+            logging.info(f"[Compatibility Analyzer] Full-rank LoRAs detected (avg rank {ca_global_avg_rank:.0f})")
+
         total_overlap = 0
         total_conflict = 0
         pairwise_conflicts = []
@@ -6389,7 +6460,8 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                 new_strengths, _ = self._compute_auto_strengths(
                     group_loras, group_lora_stats,
                     pairwise_similarities=group_pw_sim,
-                    arch_preset=arch_preset, detected_arch=detected_arch)
+                    arch_preset=arch_preset, detected_arch=detected_arch,
+                    is_full_rank=ca_is_full_rank)
                 info["strengths"] = {group[k]: new_strengths[k] for k in range(len(group))}
 
                 # Suggested merge strategy
