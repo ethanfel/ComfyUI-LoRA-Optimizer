@@ -35,7 +35,7 @@ Each LoRA's contribution is scaled by its strength and summed. No normalization,
 ### When Selected
 
 - Automatically used for prefixes where **only one LoRA** has weights (no overlap, no conflict)
-- Forced everywhere when `optimization_mode=weighted_sum_only`
+- Forced everywhere when `optimization_mode=additive`
 
 ### Properties
 

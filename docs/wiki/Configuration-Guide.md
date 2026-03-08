@@ -34,17 +34,17 @@ Controls whether the optimizer picks strategies per-prefix or globally.
 |-------|----------|-------------|
 | `per_prefix` (default) | Each weight group gets its own strategy | Almost always — this is the main feature |
 | `global` | Single strategy for all prefixes | When you want consistent behavior across all layers |
-| `weighted_sum_only` | Force weighted sum everywhere | For distillation/edit LoRAs, or when combined with SVD compression for zero-loss output |
+| `additive` | Force weighted sum everywhere | For distillation/edit LoRAs, or when combined with SVD compression for zero-loss output |
 
-### `behavior_profile`
+### `strategy_set`
 
 Controls which merge strategies are available during auto-selection. This is about _strategy logic_ — which algorithms can be picked.
 
 | Value | Auto-selectable Strategies | When to Use |
 |-------|---------------------------|-------------|
-| `v1.2` (default) | TIES, weighted_average, SLERP, consensus | Recommended — full algorithm repertoire |
+| `full` (default) | TIES, weighted_average, SLERP, consensus | Recommended — full algorithm repertoire |
 | `no_slerp` | TIES, weighted_average, consensus | If SLERP produces undesirable results for your LoRAs |
-| `classic` | TIES, weighted_average only | Reproduce pre-1.2 behavior |
+| `basic` | TIES, weighted_average only | Reproduce pre-1.2 behavior |
 
 ### `architecture_preset`
 
@@ -118,34 +118,34 @@ DAREx-q enhancement for DARE modes only. Interpolates the rescaling factor towar
 
 ## Merge Quality
 
-### `merge_quality`
+### `merge_refinement`
 
 Controls additional processing techniques applied during merging. Higher quality = better conflict resolution at slight compute cost.
 
 | Level | Techniques Added | Cost |
 |-------|-----------------|------|
-| `standard` (default) | Element-wise sign voting only | Baseline |
-| `enhanced` | + DO-orthogonalization, column-wise voting, TALL-mask protection | Minimal extra compute, no extra VRAM |
-| `maximum` | + KnOTS SVD alignment (on top of enhanced) | More VRAM for SVD decomposition |
+| `none` (default) | Element-wise sign voting only | Baseline |
+| `refine` | + DO-orthogonalization, column-wise voting, TALL-mask protection | Minimal extra compute, no extra VRAM |
+| `full` | + KnOTS SVD alignment (on top of refine) | More VRAM for SVD decomposition |
 
 **Recommendations:**
-- Start with `standard` — it's often sufficient
-- Try `enhanced` if you see artifacts or loss of individual LoRA character
-- Use `maximum` for critical merges where quality matters most
+- Start with `none` — it's often sufficient
+- Try `refine` if you see artifacts or loss of individual LoRA character
+- Use `full` for critical merges where quality matters most
 - Best combined with conflict-aware sparsification (`dare_conflict` or `della_conflict`)
 
 ---
 
 ## Compression & Memory
 
-### `compress_patches`
+### `patch_compression`
 
 Re-compresses merged full-rank patches to low-rank via SVD, reducing RAM by ~32x.
 
 | Value | Compresses | Quality Loss |
 |-------|-----------|-------------|
 | `non_ties` (default) | weighted_sum and weighted_average prefixes | None (linear ops are exactly representable) |
-| `all` | All prefixes including TIES | Lossy on TIES prefixes (nonlinear ops produce full-rank) |
+| `aggressive` | All prefixes including TIES | Lossy on TIES prefixes (nonlinear ops produce full-rank) |
 | `disabled` | Nothing | None, but ~32x more RAM |
 
 ### `svd_device` (gpu / cpu)
@@ -224,10 +224,10 @@ Use the **LoRA Optimizer** (Simple) node. Everything is handled automatically.
 |-----------|-------|
 | `auto_strength` | enabled |
 | `optimization_mode` | per_prefix |
-| `merge_quality` | enhanced |
+| `merge_refinement` | refine |
 | `sparsification` | della_conflict |
 | `sparsification_density` | 0.7 |
-| `compress_patches` | non_ties |
+| `patch_compression` | non_ties |
 
 ### Maximum Quality (Critical Merge)
 
@@ -235,17 +235,17 @@ Use the **LoRA Optimizer** (Simple) node. Everything is handled automatically.
 |-----------|-------|
 | `auto_strength` | enabled |
 | `optimization_mode` | per_prefix |
-| `merge_quality` | maximum |
+| `merge_refinement` | full |
 | `sparsification` | della_conflict |
 | `sparsification_density` | 0.7 |
-| `compress_patches` | non_ties |
+| `patch_compression` | non_ties |
 
 ### Video Models (Low Memory)
 
 | Parameter | Value |
 |-----------|-------|
 | `cache_patches` | disabled |
-| `compress_patches` | all |
+| `patch_compression` | aggressive |
 | `free_vram_between_passes` | enabled |
 | `normalize_keys` | enabled |
 | `vram_budget` | 0.0 |

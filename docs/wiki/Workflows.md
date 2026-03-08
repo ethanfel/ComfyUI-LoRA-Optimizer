@@ -61,9 +61,9 @@ LoRA Conflict Editor ──► LORA_STACK ──► LoRA Optimizer (Advanced) �
 
 ---
 
-## AutoTuner (Find Best Config)
+## AutoTuner (Rank Configs)
 
-Let the AutoTuner sweep all parameter combinations and find the optimal merge.
+Let the AutoTuner sweep all parameter combinations and rank the strongest merges.
 
 ```
 Load Checkpoint ──► MODEL ──► LoRA AutoTuner ──► MODEL ──► KSampler
@@ -73,7 +73,7 @@ LoRA Stack ──────────────────────┘
                                              ──► LORA_DATA
 ```
 
-**When to use:** When you're not sure which settings work best, or when you want to compare different configurations objectively.
+**When to use:** When you're not sure which settings are strongest for your stack, or when you want to compare different configurations systematically.
 
 ### Trying Alternatives with Merge Selector
 
@@ -83,7 +83,31 @@ LoRA AutoTuner ──► TUNER_DATA ──► Merge Selector (selection=2) ─�
                                                                ──► LORA_DATA
 ```
 
-The AutoTuner ranks all configs by quality score. Selection 1 = best, 2 = second best, etc. Use the report to see what each config does, then switch between them with the Merge Selector.
+The AutoTuner ranks all configs by its composite score. Selection 1 = top-ranked, 2 = next-ranked, etc. Use the report to see what each config does, then switch between them with the Merge Selector.
+
+---
+
+## AutoTuner → Optimizer Bridge
+
+Use the AutoTuner to rank configs, then hand the winning settings to a downstream Optimizer for manual tweaking without rewiring the graph.
+
+```
+Load Checkpoint ──► MODEL ──► LoRA AutoTuner ──► MODEL ──► LoRA Optimizer ──► MODEL ──► KSampler
+                    CLIP ──►                 ──► CLIP  ──►                ──► CLIP
+                                 ▲                               ▲
+LoRA Stack ──────────────────────┘                               │
+                     TUNER_DATA ──────────────────────────────────┘
+```
+
+**Switch behavior:**
+- `LoRA AutoTuner.output_mode = merge` + `LoRA Optimizer.settings_source = from_autotuner`
+  - AutoTuner applies the top-ranked merge.
+  - Optimizer becomes a passthrough and mirrors the winning settings in its widgets.
+- `LoRA AutoTuner.output_mode = tuning_only` + `LoRA Optimizer.settings_source = manual`
+  - AutoTuner passes the base model through.
+  - Optimizer takes over using its own widget settings, starting from the AutoTuner recommendation.
+
+**When to use:** When you want the AutoTuner to narrow the search space first, then manually tweak merge quality, sparsification, or smoothing from a strong starting point.
 
 ---
 
@@ -95,7 +119,7 @@ Save the merge result as a standalone `.safetensors` file.
 LoRA Optimizer ──► LORA_DATA ──► Save Merged LoRA ──► filepath (STRING)
 ```
 
-The saved file works with any standard LoRA loader — no optimizer needed to use it. Set `bake_strength=enabled` so the saved LoRA reproduces your exact merge at strength 1.0.
+The saved file works with any standard LoRA loader — no optimizer needed to use it. Set `bake_strength=enabled` so the saved LoRA reproduces your exact merge at strength 1.0. Choose the destination with `save_folder`; `filename` is relative to that folder and may include subdirectories.
 
 **When to use:**
 - Share your merge with others
