@@ -1,8 +1,8 @@
 {
   "id": "9ae6082b-c7f4-433c-9971-7a8f65a3ea65",
   "revision": 0,
-  "last_node_id": 724,
-  "last_link_id": 1582,
+  "last_node_id": 725,
+  "last_link_id": 1583,
   "nodes": [
     {
       "id": 533,
@@ -4768,51 +4768,6 @@
       }
     },
     {
-      "id": 703,
-      "type": "easy showAnything",
-      "pos": [
-        -1568,
-        1984
-      ],
-      "size": [
-        384,
-        576
-      ],
-      "flags": {
-        "pinned": true
-      },
-      "order": 83,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "anything",
-          "shape": 7,
-          "type": "*",
-          "link": 1582
-        }
-      ],
-      "outputs": [
-        {
-          "name": "output",
-          "type": "*",
-          "links": null
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfyui-easy-use",
-        "ver": "1.3.6",
-        "Node name for S&R": "easy showAnything",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {},
-          "version": "7.7"
-        }
-      },
-      "widgets_values": [
-        ""
-      ]
-    },
-    {
       "id": 713,
       "type": "Note",
       "pos": [
@@ -4839,7 +4794,7 @@
         }
       },
       "widgets_values": [
-        "Tips:\n\n\u2022 cache_patches keeps the full sweep result in\n  RAM \u2014 switching output_mode or re-running with\n  same LoRAs is instant.\n\n\u2022 diff_cache_mode \"auto\" speeds up Phase 2 by\n  caching LoRA diffs between candidates. Uses RAM\n  up to diff_cache_ram_pct, then spills to disk.\n\n\u2022 scoring_svd adds effective rank scoring \u2014 more\n  thorough but much slower on large models. Leave\n  disabled unless you need it.\n\n\u2022 The tuner_data output can connect to a Merge\n  Selector node to try alternative ranked configs,\n  or to a LoRA Optimizer for the bridge workflow."
+        "Tips:\n\n• cache_patches keeps the full sweep result in\n  RAM — switching output_mode or re-running with\n  same LoRAs is instant.\n\n• diff_cache_mode \"auto\" speeds up Phase 2 by\n  caching LoRA diffs between candidates. Uses RAM\n  up to diff_cache_ram_pct, then spills to disk.\n\n• scoring_svd adds effective rank scoring — more\n  thorough but much slower on large models. Leave\n  disabled unless you need it.\n\n• The tuner_data output can connect to a Merge\n  Selector node to try alternative ranked configs,\n  or to a LoRA Optimizer for the bridge workflow."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -4871,7 +4826,7 @@
         }
       },
       "widgets_values": [
-        "Tips:\n\n\u2022 Switching modes is instant when cache is enabled\n  \u2014 the AutoTuner reuses its cached sweep results.\n\n\u2022 In Mode A (from_autotuner), the Optimizer's \n  widgets update to show the AutoTuner's winning\n  config. These values persist when you switch \n  to Mode B.\n\n\u2022 The LoRA Stack connects to BOTH nodes. The \n  AutoTuner always needs it for analysis. The\n  Optimizer uses it when in \"manual\" mode.\n\n\u2022 You can still use the AutoTuner's report output\n  to see the full ranking of tested configs."
+        "Tips:\n\n• Switching modes is instant when cache is enabled\n  — the AutoTuner reuses its cached sweep results.\n\n• In Mode A (from_autotuner), the Optimizer's \n  widgets update to show the AutoTuner's winning\n  config. These values persist when you switch \n  to Mode B.\n\n• The LoRA Stack connects to BOTH nodes. The \n  AutoTuner always needs it for analysis. The\n  Optimizer uses it when in \"manual\" mode.\n\n• You can still use the AutoTuner's report output\n  to see the full ranking of tested configs."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -4903,7 +4858,7 @@
         }
       },
       "widgets_values": [
-        "AutoTuner + Optimizer Bridge\n\nBest of both worlds: let the AutoTuner find optimal\nsettings, then fine-tune them manually.\n\nHow to use:\n  1. Run the workflow \u2014 AutoTuner finds the best \n     config and merges your LoRAs automatically\n  2. The Optimizer shows you what settings won\n  3. Want to tweak? Flip the Optimizer to \"manual\"\n     \u2014 the AutoTuner automatically steps aside\n  4. Adjust any setting (quality, sparsification...)\n     and re-run. You're starting from the best\n     config, not from scratch.\n\nThe two switches stay in sync automatically:\n  \u2022 \"from_autotuner\" = AutoTuner merges, Optimizer\n    shows the result (hands-off mode)\n  \u2022 \"manual\" = You control the merge, AutoTuner\n    just passes the model through (hands-on mode)\n\nSwitching between modes is instant thanks to caching.\n\nThis is the recommended workflow if you want to\nunderstand and control how your LoRAs are merged\nwhile still getting a smart starting point."
+        "AutoTuner + Optimizer Bridge\n\nBest of both worlds: let the AutoTuner find optimal\nsettings, then fine-tune them manually.\n\nHow to use:\n  1. Run the workflow — AutoTuner finds the best \n     config and merges your LoRAs automatically\n  2. The Optimizer shows you what settings won\n  3. Want to tweak? Flip the Optimizer to \"manual\"\n     — the AutoTuner automatically steps aside\n  4. Adjust any setting (quality, sparsification...)\n     and re-run. You're starting from the best\n     config, not from scratch.\n\nThe two switches stay in sync automatically:\n  • \"from_autotuner\" = AutoTuner merges, Optimizer\n    shows the result (hands-off mode)\n  • \"manual\" = You control the merge, AutoTuner\n    just passes the model through (hands-on mode)\n\nSwitching between modes is instant thanks to caching.\n\nThis is the recommended workflow if you want to\nunderstand and control how your LoRAs are merged\nwhile still getting a smart starting point."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -4935,7 +4890,7 @@
         }
       },
       "widgets_values": [
-        "LoRA AutoTuner\n\nFinds the best settings automatically. Instead of\nguessing which merge settings work best for your\nspecific LoRA combination, it tries many different\nconfigurations and picks the winner.\n\nWhen to use:\n  You want the best possible merge quality and are\n  willing to wait for the tuner to test options.\n  First run takes a while, but results are cached\n  so subsequent runs are instant.\n\nWhat to connect:\n  \u2022 model \u2014 Your base model\n  \u2022 lora_stack \u2014 Your LoRAs from a LoRA Stack node\n  \u2022 clip \u2014 Your text encoder\n\nWhat you get:\n  \u2022 The best merged model it found\n  \u2022 A ranked report showing all tested configs\n  \u2022 tuner_data \u2014 The winning settings, which you \n    can pass to a Merge Selector to try runner-up\n    configs, or to an Optimizer for fine-tuning\n\nGood starting settings:\n  \u2022 top_n: 3 (tests 3 best candidates)\n  \u2022 scoring_speed: turbo (fast, good enough)\n  \u2022 cache_patches: enabled (re-runs are instant)\n\nThe report shows you which config won and why \u2014\nuseful even if you later want to tweak manually."
+        "LoRA AutoTuner\n\nFinds the best settings automatically. Instead of\nguessing which merge settings work best for your\nspecific LoRA combination, it tries many different\nconfigurations and picks the winner.\n\nWhen to use:\n  You want the best possible merge quality and are\n  willing to wait for the tuner to test options.\n  First run takes a while, but results are cached\n  so subsequent runs are instant.\n\nWhat to connect:\n  • model — Your base model\n  • lora_stack — Your LoRAs from a LoRA Stack node\n  • clip — Your text encoder\n\nWhat you get:\n  • The best merged model it found\n  • A ranked report showing all tested configs\n  • tuner_data — The winning settings, which you \n    can pass to a Merge Selector to try runner-up\n    configs, or to an Optimizer for fine-tuning\n\nGood starting settings:\n  • top_n: 3 (tests 3 best candidates)\n  • scoring_speed: turbo (fast, good enough)\n  • cache_patches: enabled (re-runs are instant)\n\nThe report shows you which config won and why —\nuseful even if you later want to tweak manually."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -4967,7 +4922,7 @@
         }
       },
       "widgets_values": [
-        "LoRA Optimizer\n\nCombines multiple LoRAs together intelligently.\nInstead of just stacking them (which often causes\nmuddy or oversaturated results), it analyzes where\nyour LoRAs conflict and picks the best way to blend\nthem for each part of the model.\n\nWhen to use:\n  You have 2+ style/character LoRAs and want them\n  to work well together without fighting each other.\n\nWhat to connect:\n  \u2022 model \u2014 Your base model (SDXL, Flux, etc.)\n  \u2022 lora_stack \u2014 Your LoRAs from a LoRA Stack node\n  \u2022 clip \u2014 Your text encoder (so LoRAs can also \n    affect how prompts are understood)\n\nWhat you get:\n  \u2022 A merged model ready for sampling\n  \u2022 An analysis report explaining what it did\n\nGood starting settings:\n  \u2022 output_strength: 1.0 (lower if too strong)\n  \u2022 auto_strength: enabled (prevents oversaturation)\n  \u2022 Everything else: defaults work well for most cases\n\nRead the analysis_report output to understand how\nyour LoRAs interact \u2014 it shows which layers had\nconflicts and how they were resolved."
+        "LoRA Optimizer\n\nCombines multiple LoRAs together intelligently.\nInstead of just stacking them (which often causes\nmuddy or oversaturated results), it analyzes where\nyour LoRAs conflict and picks the best way to blend\nthem for each part of the model.\n\nWhen to use:\n  You have 2+ style/character LoRAs and want them\n  to work well together without fighting each other.\n\nWhat to connect:\n  • model — Your base model (SDXL, Flux, etc.)\n  • lora_stack — Your LoRAs from a LoRA Stack node\n  • clip — Your text encoder (so LoRAs can also \n    affect how prompts are understood)\n\nWhat you get:\n  • A merged model ready for sampling\n  • An analysis report explaining what it did\n\nGood starting settings:\n  • output_strength: 1.0 (lower if too strong)\n  • auto_strength: enabled (prevents oversaturation)\n  • Everything else: defaults work well for most cases\n\nRead the analysis_report output to understand how\nyour LoRAs interact — it shows which layers had\nconflicts and how they were resolved."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -5221,7 +5176,7 @@
         }
       },
       "widgets_values": [
-        "Tips:\n\n\u2022 cache_patches keeps the result in RAM \u2014 re-runs\n  are instant. Disable for large video models.\n\n\u2022 patch_compression \"smart\" shrinks memory with\n  no quality loss. Use \"aggressive\" to save more RAM.\n\n\u2022 normalize_keys should stay enabled \u2014 it makes\n  LoRAs from different trainers compatible.\n\n\u2022 strategy_set \"full\" is the latest. Use\n  \"basic\" only if comparing with older results.\n\n\u2022 For edit/distillation/DPO LoRAs, use \n  \"additive\" mode or apply them via a\n  standard Load LoRA node instead."
+        "Tips:\n\n• cache_patches keeps the result in RAM — re-runs\n  are instant. Disable for large video models.\n\n• patch_compression \"smart\" shrinks memory with\n  no quality loss. Use \"aggressive\" to save more RAM.\n\n• normalize_keys should stay enabled — it makes\n  LoRAs from different trainers compatible.\n\n• strategy_set \"full\" is the latest. Use\n  \"basic\" only if comparing with older results.\n\n• For edit/distillation/DPO LoRAs, use \n  \"additive\" mode or apply them via a\n  standard Load LoRA node instead."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -5346,11 +5301,12 @@
       "properties": {
         "cnr_id": "comfyui-lora-optimizer",
         "ver": "49c875b9f0b3016fbc1f75a11585eb953e90cd59",
+        "Node name for S&R": "LoRAOptimizer",
         "ue_properties": {
           "widget_ue_connectable": {},
-          "input_ue_unconnectable": {}
-        },
-        "Node name for S&R": "LoRAOptimizer"
+          "input_ue_unconnectable": {},
+          "version": "7.7"
+        }
       },
       "widgets_values": [
         1,
@@ -5446,11 +5402,12 @@
       "properties": {
         "cnr_id": "comfyui-lora-optimizer",
         "ver": "49c875b9f0b3016fbc1f75a11585eb953e90cd59",
+        "Node name for S&R": "LoRAAutoTuner",
         "ue_properties": {
           "widget_ue_connectable": {},
-          "input_ue_unconnectable": {}
-        },
-        "Node name for S&R": "LoRAAutoTuner"
+          "input_ue_unconnectable": {},
+          "version": "7.7"
+        }
       },
       "widgets_values": [
         1,
@@ -5468,113 +5425,6 @@
         0,
         "turbo",
         "merge"
-      ]
-    },
-    {
-      "id": 724,
-      "type": "LoRAOptimizer",
-      "pos": [
-        -1952,
-        1664
-      ],
-      "size": [
-        270.91666412353516,
-        546
-      ],
-      "flags": {},
-      "order": 72,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 1576
-        },
-        {
-          "name": "lora_stack",
-          "type": "LORA_STACK",
-          "link": 1577
-        },
-        {
-          "name": "clip",
-          "shape": 7,
-          "type": "CLIP",
-          "link": 1578
-        },
-        {
-          "name": "merge_strategy_override",
-          "shape": 7,
-          "type": "STRING",
-          "link": null
-        },
-        {
-          "name": "tuner_data",
-          "shape": 7,
-          "type": "TUNER_DATA",
-          "link": 1579
-        }
-      ],
-      "outputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "links": [
-            1580
-          ]
-        },
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "links": [
-            1581
-          ]
-        },
-        {
-          "name": "analysis_report",
-          "type": "STRING",
-          "links": [
-            1582
-          ]
-        },
-        {
-          "name": "tuner_data",
-          "type": "TUNER_DATA",
-          "links": null
-        },
-        {
-          "name": "lora_data",
-          "type": "LORA_DATA",
-          "links": null
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfyui-lora-optimizer",
-        "ver": "49c875b9f0b3016fbc1f75a11585eb953e90cd59",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {}
-        },
-        "Node name for S&R": "LoRAOptimizer"
-      },
-      "widgets_values": [
-        1,
-        1,
-        "enabled",
-        -1,
-        "enabled",
-        0.7,
-        "per_prefix",
-        "enabled",
-        "smart",
-        "gpu",
-        "enabled",
-        "della_conflict",
-        0.9,
-        0,
-        "none",
-        "full",
-        "auto",
-        "from_autotuner"
       ]
     },
     {
@@ -5673,6 +5523,154 @@
         0,
         "turbo",
         "merge"
+      ]
+    },
+    {
+      "id": 725,
+      "type": "PreviewAny",
+      "pos": [
+        -1611.3821381601747,
+        1896.5931692152124
+      ],
+      "size": [
+        416,
+        640
+      ],
+      "flags": {
+        "pinned": true
+      },
+      "order": 83,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 1583
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.15.1",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.7"
+        },
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "id": 724,
+      "type": "LoRAOptimizer",
+      "pos": [
+        -1952,
+        1664
+      ],
+      "size": [
+        270.91666412353516,
+        546
+      ],
+      "flags": {},
+      "order": 72,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1576
+        },
+        {
+          "name": "lora_stack",
+          "type": "LORA_STACK",
+          "link": 1577
+        },
+        {
+          "name": "clip",
+          "shape": 7,
+          "type": "CLIP",
+          "link": 1578
+        },
+        {
+          "name": "merge_strategy_override",
+          "shape": 7,
+          "type": "STRING",
+          "link": null
+        },
+        {
+          "name": "tuner_data",
+          "shape": 7,
+          "type": "TUNER_DATA",
+          "link": 1579
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            1580
+          ]
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "links": [
+            1581
+          ]
+        },
+        {
+          "name": "analysis_report",
+          "type": "STRING",
+          "links": [
+            1583
+          ]
+        },
+        {
+          "name": "tuner_data",
+          "type": "TUNER_DATA",
+          "links": null
+        },
+        {
+          "name": "lora_data",
+          "type": "LORA_DATA",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-lora-optimizer",
+        "ver": "49c875b9f0b3016fbc1f75a11585eb953e90cd59",
+        "Node name for S&R": "LoRAOptimizer",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.7"
+        }
+      },
+      "widgets_values": [
+        1,
+        1,
+        "enabled",
+        -1,
+        "enabled",
+        0.7,
+        "per_prefix",
+        "enabled",
+        "smart",
+        "gpu",
+        "enabled",
+        "della_conflict",
+        0.9,
+        0,
+        "none",
+        "full",
+        "auto",
+        "from_autotuner"
       ]
     }
   ],
@@ -6846,10 +6844,10 @@
       "CLIP"
     ],
     [
-      1582,
+      1583,
       724,
       2,
-      703,
+      725,
       0,
       "STRING"
     ]
@@ -6904,10 +6902,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.7010564815755828,
+      "scale": 0.27028762198254525,
       "offset": [
-        6419.282598199035,
-        719.7387241344283
+        9900.046187746388,
+        1506.8875010000386
       ]
     },
     "frontendVersion": "1.39.19",
