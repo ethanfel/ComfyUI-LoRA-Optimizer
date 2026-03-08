@@ -5084,6 +5084,18 @@ class LoRAOptimizer(_LoRAMergeBase):
         Pass 2: Recompute diffs per target group, merge immediately, discard
         Peak memory tracks the largest active target group, not the whole stack.
         """
+        # Free stale cached models when the input model changes — prevents
+        # the old patched model from staying in RAM after switching models.
+        current_mid = id(model) if model is not None else None
+        prev_mid = getattr(self, '_cached_model_id', None)
+        if prev_mid is not None and current_mid != prev_mid:
+            if hasattr(self, '_merge_cache') and self._merge_cache:
+                self._merge_cache.clear()
+            if hasattr(self, '_autotuner_cache') and getattr(self, '_autotuner_cache', None):
+                self._autotuner_cache.clear()
+            import gc; gc.collect()
+        self._cached_model_id = current_mid
+
         # Normalize stack format (standard tuples or LoRAStack dicts)
         if not lora_stack or len(lora_stack) == 0:
             return (model, clip, "No LoRAs in stack.", None, None)
@@ -6108,6 +6120,17 @@ class LoRAAutoTuner(LoRAOptimizer):
                   scoring_speed="full", output_mode="merge",
                   decision_smoothing=0.25):
         import hashlib, json
+
+        # Free stale cached models when the input model changes
+        current_mid = id(model) if model is not None else None
+        prev_mid = getattr(self, '_cached_model_id', None)
+        if prev_mid is not None and current_mid != prev_mid:
+            if hasattr(self, '_merge_cache') and self._merge_cache:
+                self._merge_cache.clear()
+            if hasattr(self, '_autotuner_cache') and getattr(self, '_autotuner_cache', None):
+                self._autotuner_cache.clear()
+            import gc; gc.collect()
+        self._cached_model_id = current_mid
 
         # --- Normalize & validate stack ---
         normalized_stack = self._normalize_stack(lora_stack, normalize_keys=normalize_keys)
