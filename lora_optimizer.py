@@ -5093,7 +5093,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 self._merge_cache.clear()
             if hasattr(self, '_autotuner_cache') and getattr(self, '_autotuner_cache', None):
                 self._autotuner_cache.clear()
-            import gc; gc.collect()
+            gc.collect()
         self._cached_model_id = current_mid
 
         # Normalize stack format (standard tuples or LoRAStack dicts)
@@ -6129,7 +6129,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 self._merge_cache.clear()
             if hasattr(self, '_autotuner_cache') and getattr(self, '_autotuner_cache', None):
                 self._autotuner_cache.clear()
-            import gc; gc.collect()
+            gc.collect()
         self._cached_model_id = current_mid
 
         # --- Normalize & validate stack ---
