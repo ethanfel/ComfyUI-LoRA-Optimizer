@@ -4408,11 +4408,15 @@ class LoRAOptimizer(_LoRAMergeBase):
                     # Upgrade weighted_average → slerp for 2+ non-opposing LoRAs.
                     # SLERP preserves magnitude better than weighted_average's /N reduction,
                     # which is critical for video LoRAs where motion energy matters.
-                    # Skip for opposing LoRAs (cos < 0): SLERP interpolates between opposing
-                    # directions while preserving magnitude, amplifying artifacts.
+                    # Skip for genuinely opposing LoRAs (cos significantly negative):
+                    # SLERP interpolates between opposing directions while preserving
+                    # magnitude, amplifying artifacts.  For orthogonal LoRAs (|cos| < threshold),
+                    # per-prefix cos_sim scatters around zero — slightly negative values are
+                    # noise, not real opposition.  Only block SLERP when cos_sim is below
+                    # the negative of the orthogonal threshold (genuinely anti-correlated).
                     pf_raw_cos = pf.get("avg_cos_sim", 0.0)
                     pf_orthogonal = abs(pf_raw_cos) < arch_preset["orthogonal_cos_sim_max"]
-                    pf_opposing = pf_raw_cos < 0
+                    pf_opposing = pf_raw_cos < -arch_preset["orthogonal_cos_sim_max"]
                     # Full-rank gate: skip SLERP upgrade — for full-rank patches the
                     # information is spread across all dimensions, and SLERP's
                     # hypersphere interpolation loses signal from both LoRAs.
