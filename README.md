@@ -7,7 +7,7 @@
   <img src="https://img.shields.io/badge/TIES_Merging-NeurIPS_2023-8b5cf6?style=flat-square" alt="TIES">
   <img src="https://img.shields.io/badge/DARE_%7C_DELLA-Sparsification-f59e0b?style=flat-square" alt="DARE/DELLA">
   <img src="https://img.shields.io/badge/Per--Prefix_Adaptive-Merge-e94560?style=flat-square" alt="Per-Prefix">
-  <img src="https://img.shields.io/badge/KnOTS_%7C_Column--wise_%7C_TALL--masks-Merge_Quality-a78bfa?style=flat-square" alt="Merge Quality">
+  <img src="https://img.shields.io/badge/KnOTS_%7C_Column--wise_%7C_TALL--masks-Merge_Refinement-a78bfa?style=flat-square" alt="Merge Refinement">
   <img src="https://img.shields.io/badge/SVD_Patch-Compression-64ffda?style=flat-square" alt="SVD">
   <img src="https://img.shields.io/badge/Architecture--Aware-Key_Normalization-22c55e?style=flat-square" alt="Key Normalization">
   <img src="https://img.shields.io/badge/AutoTuner-Parameter_Sweep-e94560?style=flat-square" alt="AutoTuner">
@@ -17,7 +17,7 @@
 
 ---
 
-A ComfyUI node suite that **automatically analyzes your LoRA stack** and selects the best merge strategy per weight group — diff-based merging, TIES conflict resolution, DARE/DELLA sparsification, per-prefix adaptive decisions, SVD patch compression, architecture-aware key normalization, enhanced merge quality (KnOTS alignment, column-wise voting, TALL-mask protection), and auto-tuned parameters. Core nodes: **LoRA Stack** (build input), **LoRA Optimizer** (analyze + merge), and **LoRA AutoTuner** (sweep all parameters automatically and find the best config).
+A ComfyUI node suite that **automatically analyzes your LoRA stack** and selects the best merge strategy per weight group — diff-based merging, TIES conflict resolution, DARE/DELLA sparsification, per-prefix adaptive decisions, SVD patch compression, architecture-aware key normalization, merge refinement (KnOTS alignment, orthogonalization, TALL-mask protection), and auto-tuned parameters. Core nodes: **LoRA Stack** (build input), **LoRA Optimizer** (analyze + merge), and **LoRA AutoTuner** (sweep all parameters automatically and find the best config).
 
 ## The Problem
 
@@ -33,6 +33,14 @@ A ComfyUI node suite that **automatically analyzes your LoRA stack** and selects
 <p align="center"><img src="assets/merge-use-cases.png" width="720" alt="Should I merge this LoRA? Decision guide"></p>
 
 </details>
+
+---
+
+### Merge Strategy Guide
+
+How LoRAs relate to each other, what the optimizer does about it, and when to change settings.
+
+<p align="center"><img src="docs/merge-strategy-guide.png" width="720" alt="LoRA Merge Strategy Guide"></p>
 
 ---
 
@@ -70,7 +78,7 @@ The auto-optimizer. Takes a `LORA_STACK`, analyzes the LoRAs, and automatically 
 | Variant | Description |
 |---------|-------------|
 | **LoRA Optimizer** (Simple) | Sensible defaults — just model, stack, output strength, and optional CLIP. Auto-strength enabled. |
-| **LoRA Optimizer (Advanced)** | Full control — sparsification, merge quality, SVD device, key normalization, and all other knobs. |
+| **LoRA Optimizer (Advanced)** | Full control — sparsification, merge refinement, SVD device, key normalization, and all other knobs. |
 
 Also accepts standard tuple-format stacks `(lora_name, model_strength, clip_strength)` from Efficiency Nodes, Comfyroll, and similar packs.
 
@@ -152,33 +160,33 @@ DARE and DELLA **sparsify each LoRA's diff before merging**, reducing parameter 
 </details>
 
 <details>
-<summary><b>Merge Quality (Enhanced / Maximum)</b></summary>
+<summary><b>Merge Refinement (Refine / Full)</b></summary>
 
-Three quality levels for merge conflict resolution, selectable via the `merge_quality` dropdown:
+Optional preprocessing steps applied to weight diffs before merging, selectable via the `merge_refinement` dropdown:
 
 <p align="center"><a href="assets/merge-quality-diagram.png"><img src="assets/merge-quality-diagram.svg" alt="Merge Quality Pipeline" width="100%"></a></p>
 
 | Level | What It Adds | Cost |
 |-------|-------------|------|
-| **standard** (default) | Current behavior — element-wise sign voting and merge | Baseline |
-| **enhanced** | Column-wise conflict resolution + TALL-mask selfish weight protection | Minimal extra compute, no extra VRAM |
-| **maximum** | KnOTS SVD alignment + column-wise + TALL-masks | More VRAM for SVD decomposition |
+| **none** (default) | Merge as-is, no extra processing | Baseline |
+| **refine** | Direction orthogonalization + TALL-mask selfish weight protection | Minimal extra compute, no extra VRAM |
+| **full** | KnOTS SVD alignment + orthogonalization + TALL-masks | More VRAM for SVD decomposition |
 
-**Column-wise conflict resolution** (enhanced+): Instead of each weight position voting independently on sign direction, entire output neurons (rows) vote as a unit. This preserves structural coherence — a neuron's weights work together, so their signs should be resolved together.
+**TALL-masks** (refine+): Identifies "selfish" weights — positions where one LoRA dominates and others contribute little. These weights are separated from the consensus merge and added back afterward, protecting each LoRA's unique features from being averaged away.
 
-**TALL-masks** (enhanced+): Identifies "selfish" weights — positions where one LoRA dominates and others contribute little. These weights are separated from the consensus merge and added back afterward, protecting each LoRA's unique features from being averaged away.
+**Direction orthogonalization** (refine+): Projects LoRA diffs to be mutually orthogonal, reducing interference between LoRAs that modify overlapping weight regions.
 
-**KnOTS SVD alignment** (maximum): Projects all LoRA diffs into a shared singular value basis via truncated SVD before merging. This makes diffs more directly comparable by aligning their representation spaces. Falls back to CPU on GPU OOM, skips gracefully if both fail.
+**KnOTS SVD alignment** (full): Projects all LoRA diffs into a shared singular value basis via truncated SVD before merging. This makes diffs more directly comparable by aligning their representation spaces. Falls back to CPU on GPU OOM, skips gracefully if both fail.
 
 **Interaction with other settings:**
 - Works with all merge modes (TIES, weighted_average, SLERP, etc.)
-- Combines with DARE/DELLA sparsification — sparsification runs first, then quality enhancements
+- Combines with DARE/DELLA sparsification — sparsification runs first, then refinement
 - Best combination: `maximum` + `della_conflict` (or `dare_conflict`) for full pipeline
 - Single-LoRA prefixes: all enhancements short-circuit (no work to do)
 
 | Setting | Default | Options |
 |---------|---------|---------|
-| `merge_quality` | standard | `standard`, `enhanced`, `maximum` |
+| `merge_refinement` | none | `none`, `refine`, `full` |
 
 </details>
 
@@ -292,7 +300,7 @@ All numeric thresholds in the optimizer (density estimation, conflict detection,
 |---------|---------|---------|
 | `architecture_preset` | auto | `auto`, `sd_unet`, `dit`, `llm`. Auto-detection uses the same key pattern matching as key normalization |
 
-**Note:** This is orthogonal to `behavior_profile` (which controls *strategy features* like consensus mode and SLERP upgrade). Architecture preset controls the *numeric thresholds* those strategies use.
+**Note:** This is orthogonal to `strategy_set` (which controls *which strategies* are available — consensus, SLERP, etc.). Architecture preset controls the *numeric thresholds* those strategies use.
 
 </details>
 
@@ -303,13 +311,13 @@ After merging, full-rank diff patches consume ~128x more RAM than standard LoRA 
 
 | Mode | What gets compressed | Quality | RAM savings |
 |------|---------------------|---------|-------------|
-| `non_ties` (default) | `weighted_sum` and `weighted_average` prefixes only | Lossless — sum of input ranks preserves all merge information | ~32x on compressed prefixes |
-| `all` | Everything including TIES | Lossy on TIES prefixes — nonlinear ops (trim, sign election) produce full-rank results that can't be perfectly captured | ~32x on all prefixes |
+| `smart` (default) | `weighted_sum` and `weighted_average` prefixes only | Lossless — sum of input ranks preserves all merge information | ~32x on compressed prefixes |
+| `aggressive` | Everything including TIES | Lossy on TIES prefixes — nonlinear ops (trim, sign election) produce full-rank results that can't be perfectly captured | ~32x on all prefixes |
 | `disabled` | Nothing | No loss | No savings |
 
 The compression rank is automatically computed as the sum of all input LoRA ranks. For example, 3 rank-32 LoRAs produce a rank-96 compressed patch — enough to represent the full merge without quality loss on linear operations.
 
-> **Tip:** For video models (LTX, Wan, etc.) with high RAM usage, use `weighted_sum_only` + `non_ties` (or `all`). Every patch gets losslessly compressed with minimal RAM footprint.
+> **Tip:** For video models (LTX, Wan, etc.) with high RAM usage, use `additive` mode + `smart` (or `aggressive`) compression. Every patch gets losslessly compressed with minimal RAM footprint.
 
 </details>
 
@@ -320,7 +328,7 @@ The compression rank is automatically computed as the sum of all input LoRA rank
 |------|----------|
 | `per_prefix` (default) | Each weight group picks its own strategy based on local conflict data |
 | `global` | Single strategy for all prefixes (original behavior) |
-| `weighted_sum_only` | Forces simple weighted sum everywhere — no TIES, no averaging. Combined with patch compression, all patches are fully compressible with zero quality loss |
+| `additive` | Simple weighted addition — no conflict resolution. Preserves all weights exactly. Use for DPO/edit/distill LoRAs, or with patch compression for minimal RAM |
 
 </details>
 
@@ -347,7 +355,7 @@ The analysis report includes a visual block-by-block map showing what strategy w
 | Option | Default | Effect |
 |--------|---------|--------|
 | `cache_patches` | enabled | Cache merged patches in RAM for faster re-execution. Disable to free RAM after merge (recommended for video models) |
-| `compress_patches` | non_ties | SVD re-compression of merged patches (see above) |
+| `patch_compression` | smart | SVD re-compression of merged patches (see above) |
 | `svd_device` | gpu | Device for SVD compression. GPU is ~10-50x faster than CPU. Use CPU if GPU memory is tight |
 | `free_vram_between_passes` | disabled | Release GPU cache between analysis and merge passes. Lowers peak VRAM at negligible speed cost |
 
@@ -355,7 +363,7 @@ The analysis report includes a visual block-by-block map showing what strategy w
 
 #### Inputs / Outputs
 
-**Inputs (Advanced):** `MODEL`, `CLIP` (optional), `LORA_STACK`, output strength, clip strength multiplier, auto strength, auto strength floor, optimization mode, merge quality, behavior profile, architecture preset, cache patches, compress patches, SVD device, free VRAM between passes, normalize keys, sparsification, sparsification density, DARE dampening, `TUNER_DATA` (optional — for bridge workflow), settings_source.
+**Inputs (Advanced):** `MODEL`, `CLIP` (optional), `LORA_STACK`, output strength, clip strength multiplier, auto strength, auto strength floor, optimization mode, merge refinement, strategy set, architecture preset, cache patches, patch compression, SVD device, free VRAM between passes, normalize keys, sparsification, sparsification density, DARE dampening, `TUNER_DATA` (optional — for bridge workflow), settings_source.
 
 **Outputs:** `MODEL`, `CLIP`, `STRING` (analysis report), `LORA_DATA` (for Save Merged LoRA / Merged LoRA to Hook)
 
@@ -449,7 +457,7 @@ Connect the `STRING` output to a **Show Text** node to see the report in ComfyUI
 <details>
 <summary><b>Important notes & limitations</b></summary>
 
-> **Structural & Edit LoRAs:** Do not put distillation LoRAs (LCM, Lightning, Turbo, Hyper), DPO LoRAs, or **edit model LoRAs** (Qwen edit, Klein edit, instruction-editing LoRAs) in the optimizer stack. These LoRAs modify the model's fundamental behavior — their weights are precisely calibrated and merging them with style LoRAs can break their training. Apply them via a standard **Load LoRA** node upstream, then feed only your style/character LoRAs into the optimizer. If you must include an edit LoRA in the stack, use `weighted_sum_only` mode and disable sparsification to avoid weight trimming.
+> **Structural & Edit LoRAs:** Do not put distillation LoRAs (LCM, Lightning, Turbo, Hyper), DPO LoRAs, or **edit model LoRAs** (Qwen edit, Klein edit, instruction-editing LoRAs) in the optimizer stack. These LoRAs modify the model's fundamental behavior — their weights are precisely calibrated and merging them with style LoRAs can break their training. Apply them via a standard **Load LoRA** node upstream, then feed only your style/character LoRAs into the optimizer. If you must include an edit LoRA in the stack, use `additive` mode and disable sparsification to avoid weight trimming.
 
 > **Limitation:** The optimizer only analyzes LoRAs in its own stack. It cannot see LoRA patches applied by upstream nodes (Load LoRA, etc.) — those stack additively on top of the optimizer's output. Fully baked merges (safetensors checkpoints) are indistinguishable from base weights and cannot be detected.
 
@@ -562,7 +570,7 @@ Chain the AutoTuner and Optimizer in a **single model line** for a "find best, t
 1. Start with `from_autotuner` — let the AutoTuner find the best config
 2. Inspect the Optimizer's widgets to see what won
 3. Switch to `manual` — the Optimizer takes over, starting from the AutoTuner's recommendation
-4. Tweak settings (merge_quality, sparsification, etc.) and re-run
+4. Tweak settings (merge_refinement, sparsification, etc.) and re-run
 
 Switching between modes is instant — the AutoTuner reuses its cached sweep results.
 
@@ -636,7 +644,7 @@ The `prev_hooks` input allows chaining multiple hook sources together.
 
 Variant of the LoRA Optimizer for **WanVideo models** (via [kijai's WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper)). Accepts `WANVIDEOMODEL` instead of `MODEL`, skips CLIP, and applies merged patches in-memory.
 
-All merging algorithms are inherited — TIES, DARE/DELLA, SVD compression, auto-strength, per-prefix adaptive merge, merge quality enhancements (KnOTS, column-wise, TALL-masks), and Wan key normalization (LyCORIS, diffusers, Fun LoRA, finetrainer, RS-LoRA) all work identically.
+All merging algorithms are inherited — TIES, DARE/DELLA, SVD compression, auto-strength, per-prefix adaptive merge, merge refinement (KnOTS, orthogonalization, TALL-masks), and Wan key normalization (LyCORIS, diffusers, Fun LoRA, finetrainer, RS-LoRA) all work identically.
 
 **Inputs:** `WANVIDEOMODEL`, `LORA_STACK`, output strength, and all optimizer options (except CLIP-related ones). Defaults: `normalize_keys=enabled`, `cache_patches=disabled`.
 
