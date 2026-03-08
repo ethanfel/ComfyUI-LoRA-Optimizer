@@ -4414,13 +4414,6 @@ class LoRAOptimizer(_LoRAMergeBase):
                     if (is_full_rank and fr_preset.get("prefer_sum_orthogonal", False)
                             and pf_mode == "weighted_average" and pf_orthogonal):
                         pf_mode = "weighted_sum"
-                    # For orthogonal LoRAs with near-zero excess conflict, use
-                    # weighted_sum (additive) so both concepts contribute fully.
-                    # weighted_average divides by N, halving each contribution.
-                    pf_excess = pf.get("excess_conflict", pf.get("decision_conflict", None))
-                    if (pf_mode == "weighted_average" and pf_orthogonal
-                            and pf_excess is not None and pf_excess < 0.05):
-                        pf_mode = "weighted_sum"
 
             # Apply merge strategy override from Conflict Editor (takes priority over auto-selection)
             # Skip when user explicitly chose additive (protects DPO/edit LoRAs)
