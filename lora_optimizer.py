@@ -5394,7 +5394,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     # which is critical for video LoRAs where motion energy matters.
                     # Skip for opposing LoRAs (cos < 0): SLERP interpolates between opposing
                     # directions while preserving magnitude, amplifying artifacts.
-                    pf_raw_cos = pf.get("decision_cosine", pf.get("avg_cos_sim", 0.0))
+                    pf_raw_cos = pf.get("avg_cos_sim", 0.0)
                     pf_orthogonal = abs(pf_raw_cos) < arch_preset["orthogonal_cos_sim_max"]
                     pf_opposing = pf_raw_cos < 0
                     # Full-rank gate: skip SLERP upgrade — for full-rank patches the
