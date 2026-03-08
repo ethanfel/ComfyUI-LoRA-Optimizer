@@ -86,12 +86,12 @@ The scale factor tells you how much the optimizer reduced strengths. A low facto
 | Setting | Recommended Value | Why |
 |---------|------------------|-----|
 | `cache_patches` | enabled | Instant re-execution with same settings |
-| `compress_patches` | non_ties | Lossless compression on linear ops |
+| `compress_patches` | non_ties | Exact low-rank path on linear ops; only nonlinear paths use SVD compression |
 | `vram_budget` | 0.3–0.5 | Keep some patches on GPU for faster sampling |
 
 ### Peak VRAM Usage
 
-The optimizer's two-pass architecture keeps peak VRAM at ~260MB per prefix regardless of LoRA count. The main memory consumer is the _merged result_, not the merge process. Use `compress_patches` and `vram_budget` to control where the result lives.
+The optimizer's two-pass architecture usually keeps peak memory near one active target group at a time, but the exact peak still depends on layer size, overlap count, and enabled quality/compression steps. The merged result can still dominate memory. Use `compress_patches` and `vram_budget` to control where the result lives.
 
 ---
 
@@ -102,7 +102,7 @@ The optimizer's two-pass architecture keeps peak VRAM at ~260MB per prefix regar
 1. **Check auto-strength** — if enabled, it may be reducing strengths too aggressively for your use case. Try disabling it.
 2. **Check the strategy map** — if most prefixes use TIES, the LoRAs may conflict too much for a clean merge. Consider using fewer LoRAs or adjusting strengths.
 3. **Try enhanced quality** — `merge_quality=enhanced` adds DO-orthogonalization and TALL-mask protection.
-4. **Try the AutoTuner** — let it sweep all parameters objectively.
+4. **Try the AutoTuner** — let it rank parameter combinations by merge metrics or your external evaluator.
 
 ### "Results are too subtle / LoRA effect is weak"
 
@@ -151,7 +151,7 @@ The Merge Selector validates that the LoRA stack hasn't changed since the AutoTu
 ### Quality
 
 - `merge_quality=enhanced` with `della_conflict` sparsification is a strong default for quality
-- `merge_quality=maximum` adds KnOTS SVD alignment — best for critical merges
+- `merge_quality=maximum` adds KnOTS-inspired SVD alignment — strongest quality mode for critical merges
 - `behavior_profile=v1.2` gives the optimizer the full algorithm repertoire
 - Use the Conflict Editor to understand pairwise conflicts before choosing settings
 

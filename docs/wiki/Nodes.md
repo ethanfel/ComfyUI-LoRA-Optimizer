@@ -113,9 +113,12 @@ All inputs from the simple variant, plus:
 | `svd_device` | COMBO | gpu | `gpu`, `cpu` — device for SVD compression |
 | `cache_patches` | COMBO | enabled | `enabled`, `disabled` — keep merge in RAM for re-execution |
 | `free_vram_between_passes` | COMBO | disabled | `enabled`, `disabled` — release GPU cache between passes |
-| `normalize_keys` | COMBO | disabled | `enabled`, `disabled` — architecture-aware key normalization |
+| `normalize_keys` | COMBO | enabled | `enabled`, `disabled` — architecture-aware key normalization |
 | `behavior_profile` | COMBO | v1.2 | `v1.2`, `no_slerp`, `classic` — strategy selection logic |
 | `architecture_preset` | COMBO | auto | `auto`, `sd_unet`, `dit`, `llm` — numeric threshold tuning |
+| `auto_strength_floor` | FLOAT | -1.0 | Minimum auto-strength scale factor for orthogonal LoRAs (`-1` = architecture default) |
+| `decision_smoothing` | FLOAT | 0.25 | Smooth per-group decision metrics toward the surrounding block average (0 disables smoothing) |
+| `calibration_data` | CALIBRATION_DATA | — | Optional activation statistics for activation-aware importance |
 | `vram_budget` | FLOAT | 0.0 | Fraction of free VRAM for keeping patches on GPU (0.0–1.0) |
 
 ### Optional Inputs
@@ -123,6 +126,8 @@ All inputs from the simple variant, plus:
 | Input | Type | Description |
 |-------|------|-------------|
 | `merge_strategy_override` | STRING | Force a specific merge strategy (connect from Conflict Editor) |
+| `tuner_data` | TUNER_DATA | Optional AutoTuner result used when `settings_source=from_autotuner` |
+| `settings_source` | COMBO | `manual` or `from_autotuner`; controls whether widgets or AutoTuner config drive the node |
 
 ### Outputs
 
@@ -132,7 +137,7 @@ Same as the simple variant: `MODEL`, `CLIP`, `report` (STRING), `LORA_DATA`.
 
 ## LoRA AutoTuner
 
-Automated parameter sweep that finds the optimal merge configuration.
+Automated parameter sweep that ranks merge configurations.
 
 ### Inputs
 
@@ -142,19 +147,29 @@ All inputs from the Advanced optimizer, plus:
 |-------|------|---------|-------------|
 | `top_n` | INT | 3 | Number of candidates to actually merge and score (1–10) |
 | `scoring_svd` | COMBO | disabled | `enabled`, `disabled` — SVD-based effective rank scoring |
-| `scoring_device` | COMBO | cpu | `cpu`, `gpu` — device for SVD scoring (GPU is 10–50x faster) |
+| `scoring_device` | COMBO | gpu | `cpu`, `gpu` — device for SVD scoring (GPU is 10–50x faster) |
+| `scoring_speed` | COMBO | turbo | `full`, `fast`, `turbo`, `turbo+` — subsample scoring for faster sweeps |
+| `auto_strength_floor` | FLOAT | -1.0 | Minimum auto-strength scale factor for orthogonal LoRAs |
+| `output_mode` | COMBO | merge | `merge` = return top-ranked merge, `tuning_only` = pass base model through |
+| `decision_smoothing` | FLOAT | 0.25 | Same smoothing control as the optimizer; affects both ranking and final merge |
+| `calibration_data` | CALIBRATION_DATA | — | Optional activation statistics for activation-aware scoring |
+| `evaluator` | AUTOTUNER_EVALUATOR | — | Optional external evaluator hook for prompt/reference scoring |
 | `record_dataset` | COMBO | disabled | `enabled`, `disabled` — save metrics to JSONL for research |
+| `cache_patches` | COMBO | enabled | Cache the final AutoTuner result in RAM for fast re-execution |
+| `diff_cache_mode` | COMBO | auto | Diff cache mode across candidates: `disabled`, `auto`, `ram`, `disk` |
+| `diff_cache_ram_pct` | FLOAT | 0.5 | RAM fraction used before `auto` diff cache spills to disk |
 | `vram_budget` | FLOAT | 0.0 | Fraction of free VRAM for patch placement |
 
 ### Outputs
 
 | Output | Type | Description |
 |--------|------|-------------|
-| `MODEL` | MODEL | Patched model from the best-scoring config |
+| `MODEL` | MODEL | Patched model from the top-ranked config |
 | `CLIP` | CLIP | Patched text encoder |
-| `report` | STRING | Ranked results with heuristic and measured scores |
+| `report` | STRING | Ranked results with heuristic, internal, and optional external scores |
+| `analysis_report` | STRING | Full optimizer analysis report for the top-ranked config |
 | `TUNER_DATA` | TUNER_DATA | All ranked configs for Merge Selector |
-| `LORA_DATA` | LORA_DATA | Merged patches from the best config |
+| `LORA_DATA` | LORA_DATA | Merged patches from the top-ranked config |
 
 Marked as `OUTPUT_NODE` for ComfyUI's re-execution optimization.
 
@@ -172,8 +187,12 @@ Applies a specific ranked configuration from AutoTuner results.
 |-------|------|----------|---------|-------------|
 | `model` | MODEL | Yes | — | Base model |
 | `tuner_data` | TUNER_DATA | Yes | — | Output from LoRA AutoTuner |
-| `selection` | INT | Yes | 1 | Which ranked config to apply (1 = best, 2 = second best, etc.) |
+| `selection` | INT | Yes | 1 | Which ranked config to apply (1 = top-ranked, 2 = next-ranked, etc.) |
 | `clip` | CLIP | No | — | Text encoder |
+| `clip_strength_multiplier` | FLOAT | No | 1.0 | CLIP strength multiplier when replaying the selected config |
+| `auto_strength_floor` | FLOAT | No | -1.0 | Manual override for orthogonal auto-strength floor; `-1` reuses tuner setting |
+| `decision_smoothing` | FLOAT | No | 0.25 | Smoothing used when replaying the selected config |
+| `calibration_data` | CALIBRATION_DATA | No | — | Optional activation statistics; connect the same object used during AutoTuner |
 
 Validates that the LoRA stack hasn't changed since the AutoTuner ran (via hash comparison).
 
@@ -234,7 +253,8 @@ Exports merged patches as a standalone `.safetensors` file usable with any stand
 | Input | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `lora_data` | LORA_DATA | Yes | — | From Optimizer, AutoTuner, or Merge Selector |
-| `filename` | STRING | Yes | `merged_lora` | Plain name → saves to ComfyUI loras folder. Absolute path → saves there |
+| `save_folder` | COMBO | Yes | first configured LoRA folder | Which configured ComfyUI LoRA directory to save into |
+| `filename` | STRING | Yes | `merged_lora` | File name relative to `save_folder`. Subdirectories allowed |
 | `save_rank` | INT | Yes | 0 | 0 = use existing layer ranks. Non-zero = force this rank via SVD |
 | `bake_strength` | COMBO | Yes | enabled | Bake `output_strength` so the saved LoRA works at strength 1.0 |
 
@@ -243,6 +263,90 @@ Exports merged patches as a standalone `.safetensors` file usable with any stand
 | Output | Type | Description |
 |--------|------|-------------|
 | `filepath` | STRING | Full path to the saved `.safetensors` file |
+
+---
+
+## Build AutoTuner Python Evaluator
+
+Builds an `AUTOTUNER_EVALUATOR` object from a Python module path + callable name.
+
+### Inputs
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `module_path` | STRING | Yes | — | Python file path or importable module |
+| `callable_name` | STRING | Yes | `evaluate_candidate` | Callable that returns a float score or `{score, details}` |
+| `combine_mode` | COMBO | No | blend | `blend`, `external_only`, `multiply` |
+| `weight` | FLOAT | No | 0.5 | Blend weight when `combine_mode=blend` |
+| `context_json` | STRING | No | `{}` | JSON passed through as `context` to the evaluator |
+
+### Outputs
+
+| Output | Type | Description |
+|--------|------|-------------|
+| `evaluator` | AUTOTUNER_EVALUATOR | External evaluator spec for LoRA AutoTuner |
+
+---
+
+## Save / Load Calibration Data
+
+Persist activation calibration statistics for reuse across optimizer runs.
+
+### Save Calibration Data Inputs
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `calibration_data` | CALIBRATION_DATA | Yes | — | Calibration payload |
+| `filename` | STRING | Yes | `calibration_data` | File name under `models/lora_calibration_data/`. Subdirectories allowed; traversal blocked |
+
+### Load Calibration Data Outputs
+
+| Output | Type | Description |
+|--------|------|-------------|
+| `calibration_data` | CALIBRATION_DATA | Loaded activation statistics |
+
+---
+
+## Save / Load Tuner Data
+
+Persist AutoTuner rankings for reuse across optimizer runs.
+
+### Save Tuner Data Inputs
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `tuner_data` | TUNER_DATA | Yes | — | Ranked AutoTuner results |
+| `save_folder` | COMBO | Yes | first configured tuner_data folder | Which configured `tuner_data` directory to save into |
+| `filename` | STRING | Yes | `tuner_data` | File name under `save_folder`. Subdirectories allowed; `.tuner` is added automatically unless `.json`/`.tuner` is supplied |
+| `overwrite` | BOOLEAN | Yes | `true` | Overwrite an existing file or append `_001`, `_002`, … to avoid clobbering |
+
+### Load Tuner Data Outputs
+
+| Output | Type | Description |
+|--------|------|-------------|
+| `tuner_data` | TUNER_DATA | Loaded AutoTuner results ready for Merge Selector |
+
+---
+
+## LoRA Compatibility Analyzer
+
+Pre-merge planning node that analyzes overlap, cosine similarity, and conflicts without applying a merge.
+
+### Inputs
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | BOOLEAN | Yes | `false` | Run the analyzer only when explicitly enabled |
+| `model` | MODEL | Yes | — | Base model used for target grouping and key mapping |
+| `lora_stack` | LORA_STACK | Yes | — | Stack to analyze |
+| `clip` | CLIP | No | — | Optional CLIP model for text-encoder LoRA keys |
+
+### Outputs
+
+| Output | Type | Description |
+|--------|------|-------------|
+| `report` | STRING | Human-readable compatibility report with suggested groups |
+| `compatibility_map` | IMAGE | Heatmap of pairwise compatibility values |
 
 ---
 
@@ -282,7 +386,7 @@ Optimizer variant for WanVideo models via [kijai's WanVideoWrapper](https://gith
 |--------|----------|----------|
 | Model input | `MODEL` | `WANVIDEOMODEL` |
 | CLIP | Supported | Not used |
-| `normalize_keys` default | disabled | **enabled** |
+| `normalize_keys` default | enabled | **enabled** |
 | `cache_patches` default | enabled | **disabled** |
 | `architecture_preset` default | auto | **dit** |
 

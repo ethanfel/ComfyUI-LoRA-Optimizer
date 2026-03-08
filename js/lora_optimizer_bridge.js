@@ -39,9 +39,9 @@ const BRIDGE_WIDGETS = [
     "sparsification_density",
     "dare_dampening",
     "auto_strength",
+    "auto_strength_floor",
 ];
 
-// Mapping between the two switches
 const OPTIMIZER_TO_AUTOTUNER = {
     "from_autotuner": "merge",
     "manual": "tuning_only",
@@ -52,18 +52,13 @@ const AUTOTUNER_TO_OPTIMIZER = {
 };
 
 function findWidget(node, name) {
-    return node.widgets ? node.widgets.find((w) => w.name === name) : null;
+    return node.widgets ? node.widgets.find((widget) => widget.name === name) : null;
 }
 
-/**
- * Find the AutoTuner node connected to this Optimizer's tuner_data input,
- * or the Optimizer node connected to this AutoTuner's tuner_data output.
- */
 function findConnectedAutoTuner(optimizerNode) {
-    // Find the tuner_data input slot index
     if (!optimizerNode.inputs) return null;
-    for (let i = 0; i < optimizerNode.inputs.length; i++) {
-        const input = optimizerNode.inputs[i];
+    for (let index = 0; index < optimizerNode.inputs.length; index++) {
+        const input = optimizerNode.inputs[index];
         if (input.name === "tuner_data" && input.link != null) {
             const linkInfo = app.graph.links[input.link];
             if (linkInfo) {
@@ -78,10 +73,9 @@ function findConnectedAutoTuner(optimizerNode) {
 }
 
 function findConnectedOptimizer(autotunerNode) {
-    // Find tuner_data output slot
     if (!autotunerNode.outputs) return null;
-    for (let i = 0; i < autotunerNode.outputs.length; i++) {
-        const output = autotunerNode.outputs[i];
+    for (let index = 0; index < autotunerNode.outputs.length; index++) {
+        const output = autotunerNode.outputs[index];
         if (output.name === "tuner_data" && output.links) {
             for (const linkId of output.links) {
                 const linkInfo = app.graph.links[linkId];
@@ -97,9 +91,6 @@ function findConnectedOptimizer(autotunerNode) {
     return null;
 }
 
-/**
- * Check if the Optimizer's tuner_data input slot is connected.
- */
 function isTunerDataInputConnected(optimizerNode) {
     if (!optimizerNode.inputs) return false;
     for (const input of optimizerNode.inputs) {
@@ -108,9 +99,6 @@ function isTunerDataInputConnected(optimizerNode) {
     return false;
 }
 
-/**
- * Check if the AutoTuner's tuner_data output slot has any connections.
- */
 function isTunerDataOutputConnected(autotunerNode) {
     if (!autotunerNode.outputs) return false;
     for (const output of autotunerNode.outputs) {
@@ -126,24 +114,23 @@ function resizeNode(node) {
 }
 
 function updateOptimizerVisibility(node) {
-    const w = findWidget(node, "settings_source");
-    if (!w) return;
+    const widget = findWidget(node, "settings_source");
+    if (!widget) return;
     const connected = isTunerDataInputConnected(node);
-    toggleWidget(node, w, connected);
-    if (!connected) w.value = "manual";
+    toggleWidget(node, widget, connected);
+    if (!connected) widget.value = "manual";
     resizeNode(node);
 }
 
 function updateAutoTunerVisibility(node) {
-    const w = findWidget(node, "output_mode");
-    if (!w) return;
+    const widget = findWidget(node, "output_mode");
+    if (!widget) return;
     const connected = isTunerDataOutputConnected(node);
-    toggleWidget(node, w, connected);
-    if (!connected) w.value = "merge";
+    toggleWidget(node, widget, connected);
+    if (!connected) widget.value = "merge";
     resizeNode(node);
 }
 
-// Guard against infinite recursion during sync
 let _syncing = false;
 
 function syncOppositeSwitch(sourceWidget, sourceNode, targetFinder, mapping) {
@@ -167,13 +154,11 @@ function syncOppositeSwitch(sourceWidget, sourceNode, targetFinder, mapping) {
     }
 }
 
-// --- LoRAOptimizer extension ---
 app.registerExtension({
     name: "LoRAOptimizer.AutoTunerBridge",
     nodeCreated(node) {
         if (node.comfyClass !== "LoRAOptimizer") return;
 
-        // Widget sync on execution (applied_settings from Python)
         const origOnExecuted = node.onExecuted;
         node.onExecuted = function (message) {
             if (origOnExecuted) {
@@ -201,7 +186,6 @@ app.registerExtension({
             app.canvas?.setDirty?.(true, true);
         };
 
-        // Opposing switch sync: settings_source → output_mode
         const settingsWidget = findWidget(node, "settings_source");
         if (settingsWidget) {
             const origCallback = settingsWidget.callback;
@@ -211,8 +195,6 @@ app.registerExtension({
             };
         }
 
-        // Hide settings_source until tuner_data is connected
-        // Defer initial hide so node layout is finalized first
         setTimeout(() => updateOptimizerVisibility(node), 0);
         const origOnConnChange = node.onConnectionsChange;
         node.onConnectionsChange = function (side, slot, connected, linkInfo, ioSlot) {
@@ -222,13 +204,11 @@ app.registerExtension({
     },
 });
 
-// --- LoRAAutoTuner extension ---
 app.registerExtension({
     name: "LoRAOptimizer.AutoTunerOutputMode",
     nodeCreated(node) {
         if (node.comfyClass !== "LoRAAutoTuner") return;
 
-        // Opposing switch sync: output_mode → settings_source
         const outputModeWidget = findWidget(node, "output_mode");
         if (outputModeWidget) {
             const origCallback = outputModeWidget.callback;
@@ -238,7 +218,6 @@ app.registerExtension({
             };
         }
 
-        // Hide output_mode until tuner_data output is connected
         setTimeout(() => updateAutoTunerVisibility(node), 0);
         const origOnConnChange = node.onConnectionsChange;
         node.onConnectionsChange = function (side, slot, connected, linkInfo, ioSlot) {

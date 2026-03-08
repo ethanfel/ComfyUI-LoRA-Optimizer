@@ -13,19 +13,53 @@ import hashlib
 import time
 import re
 import gc
+import importlib
+import importlib.util
 import concurrent.futures
 import folder_paths
 import comfy.utils
 import comfy.sd
 import comfy.lora
 from comfy.weight_adapter.lora import LoRAAdapter
-from comfy.weight_adapter.lokr import LoKrAdapter
-from comfy.weight_adapter.loha import LoHaAdapter
+try:
+    from comfy.weight_adapter.lokr import LoKrAdapter
+except Exception:
+    class LoKrAdapter:
+        def __init__(self, loaded_keys, weights):
+            self.loaded_keys = loaded_keys
+            self.weights = weights
+
+try:
+    from comfy.weight_adapter.loha import LoHaAdapter
+except Exception:
+    class LoHaAdapter:
+        def __init__(self, loaded_keys, weights):
+            self.loaded_keys = loaded_keys
+            self.weights = weights
 from safetensors.torch import save_file
 
 TUNER_DATA_DIR = os.path.join(folder_paths.models_dir, "tuner_data")
 os.makedirs(TUNER_DATA_DIR, exist_ok=True)
 folder_paths.add_model_folder_path("tuner_data", TUNER_DATA_DIR)
+
+CALIBRATION_DATA_DIR = os.path.join(folder_paths.models_dir, "lora_calibration_data")
+os.makedirs(CALIBRATION_DATA_DIR, exist_ok=True)
+folder_paths.add_model_folder_path("lora_calibration_data", CALIBRATION_DATA_DIR)
+
+
+def _resolve_safe_output_path(base_dir, filename, suffix, label):
+    """Resolve a save path under `base_dir`, allowing subdirectories but blocking traversal."""
+    if filename is None:
+        raise ValueError(f"[{label}] Filename is required.")
+    base_dir_real = os.path.realpath(base_dir)
+    base_name = filename if filename.endswith(suffix) else f"{filename}{suffix}"
+    candidate = os.path.realpath(os.path.join(base_dir_real, base_name))
+    try:
+        if os.path.commonpath([base_dir_real, candidate]) != base_dir_real:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError(f"[{label}] Path escapes base directory: {filename}") from exc
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -103,16 +137,14 @@ _ARCH_PRESETS = {
     },
 }
 
+_VIDEO_ARCH_ORTHOGONAL_FLOOR = {"wan": 1.0, "ltx": 1.0}
+
 _ARCH_TO_PRESET = {
     "sdxl": "sd_unet", "unknown": "sd_unet",
     "flux": "dit", "wan": "dit", "zimage": "dit", "ltx": "dit",
     "acestep": "dit",
     "qwen_image": "llm",
 }
-
-# Video architectures where orthogonal LoRAs teach independent motions —
-# their energy should add naturally without scaling down.
-_VIDEO_ARCH_ORTHOGONAL_FLOOR = {"wan": 1.0, "ltx": 1.0}
 
 
 def _resolve_arch_preset(arch_override, detected_arch):
@@ -768,6 +800,7 @@ class _LoRAMergeBase:
         Canonical format: diffusion_model.blocks.N.{self_attn,cross_attn,ffn}.*
 
         Handles LyCORIS, diffusers, Fun LoRA, finetrainer formats.
+        Also applies RS-LoRA alpha compensation if detected.
         """
         normalized = {}
         for k, v in lora_sd.items():
@@ -880,12 +913,23 @@ class _LoRAMergeBase:
 
             normalized[new_k] = v
 
-        # Note: RS-LoRA compensation removed. RS-LoRA files omit alpha and
-        # rely on sqrt(rank) scaling, but we can't distinguish them from
-        # standard PEFT LoRAs that also omit alpha. False positives cause
-        # ~5.66x weight amplification (rank 32). When alpha is missing,
-        # _get_lora_key_info defaults alpha=rank (scale=1.0), which is
-        # correct for standard LoRAs and only slightly weak for RS-LoRA.
+        # RS-LoRA compensation: detect and fix alpha scaling.
+        # RS-LoRA files omit ALL alpha keys and rely on sqrt(rank) scaling.
+        # Only apply compensation if the file has zero alpha keys (reliable
+        # heuristic — standard LoRAs either include explicit alphas or use
+        # rank as default alpha, which _get_lora_key_info handles).
+        has_any_alpha = any(nk.endswith('.alpha') for nk in normalized)
+        has_any_lora = any(nk.endswith('.lora_A.weight') for nk in normalized)
+        if not has_any_alpha and has_any_lora:
+            # Find rank from any lora_A weight
+            sample_key = next(nk for nk in normalized if nk.endswith('.lora_A.weight'))
+            rank = normalized[sample_key].shape[0]
+            # alpha/rank = rank^1.5/rank = sqrt(rank), matching RS-LoRA scaling
+            corrected_alpha = torch.tensor(rank * (rank ** 0.5))
+            for nk in list(normalized.keys()):
+                if nk.endswith('.lora_A.weight'):
+                    alpha_key = nk.replace('.lora_A.weight', '.alpha')
+                    normalized[alpha_key] = corrected_alpha
 
         return normalized
 
@@ -997,6 +1041,58 @@ class _LoRAMergeBase:
             normalized[new_k] = v
         return normalized
 
+    _ACESTEP_COMPOUND_NAMES = sorted([
+        "self_attn", "cross_attn",
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+        "lora_up", "lora_down", "lora_A", "lora_B", "lora_mid",
+    ], key=len, reverse=True)
+
+    @classmethod
+    def _acestep_underscore_to_dot(cls, rest):
+        """Convert Kohya-style ACE-Step keys to dotted form while preserving
+        compound component names like self_attn and q_proj."""
+        protected = []
+        for i, name in enumerate(cls._ACESTEP_COMPOUND_NAMES):
+            placeholder = f"\x01{i}\x01"
+            if name in rest:
+                rest = rest.replace(name, placeholder)
+                protected.append((placeholder, name))
+        rest = rest.replace("_", ".")
+        for placeholder, name in protected:
+            rest = rest.replace(placeholder, name)
+        return rest
+
+    @classmethod
+    def _normalize_keys_acestep(cls, lora_sd):
+        """
+        Normalize ACE-Step LoRA keys to canonical
+        diffusion_model.layers.N.{self,cross}_attn.* form.
+        """
+        normalized = {}
+        for k, v in lora_sd.items():
+            new_k = k
+
+            if new_k.startswith("base_model.model."):
+                new_k = new_k[len("base_model.model."):]
+
+            if new_k.startswith("lora_unet_"):
+                rest = new_k[len("lora_unet_"):]
+                rest = cls._acestep_underscore_to_dot(rest)
+                new_k = f"diffusion_model.{rest}"
+
+            new_k = re.sub(r"^transformer\.", "diffusion_model.", new_k)
+            new_k = re.sub(r"^model\.", "diffusion_model.", new_k)
+
+            if new_k.startswith("layers."):
+                new_k = "diffusion_model." + new_k
+
+            if new_k.startswith("diffusion_model.layers."):
+                new_k = re.sub(r"\.to_(q|k|v|out)\.", lambda m: f".{m.group(1)}_proj.", new_k)
+
+            normalized[new_k] = v
+        return normalized
+
     @classmethod
     def _normalize_keys(cls, lora_sd, architecture):
         """
@@ -1009,6 +1105,8 @@ class _LoRAMergeBase:
             return cls._normalize_keys_flux(lora_sd)
         elif architecture == 'wan':
             return cls._normalize_keys_wan(lora_sd)
+        elif architecture == 'acestep':
+            return cls._normalize_keys_acestep(lora_sd)
         elif architecture == 'sdxl':
             return cls._normalize_keys_sdxl(lora_sd)
         elif architecture == 'ltx':
@@ -1082,7 +1180,10 @@ class _LoRAMergeBase:
                     q_diff = q_patch[1][0]
                     k_diff = k_patch[1][0]
                     v_diff = v_patch[1][0]
+                    store_dtype = q_diff.dtype
                     fused_diff = torch.cat([q_diff, k_diff, v_diff], dim=0)
+                    if store_dtype not in (torch.float32, torch.float64):
+                        fused_diff = fused_diff.to(store_dtype)
                     fused[fused_key] = ("diff", (fused_diff,))
                 elif all(isinstance(p, LoRAAdapter) for p in [q_patch, k_patch, v_patch]):
                     q_data = q_patch.weights
@@ -1110,23 +1211,18 @@ class _LoRAMergeBase:
                             diff = torch.mm(comp_data[0].float(), comp_data[1].float()) * (alpha / rank)
                             parts.append(diff)
                         fused_diff = torch.cat(parts, dim=0)
-                        # Downcast back to original dtype to avoid doubling memory/file size
                         if store_dtype not in (torch.float32, torch.float64):
                             fused_diff = fused_diff.to(store_dtype)
                         fused[fused_key] = ("diff", (fused_diff,))
-                elif any(hasattr(p, 'weights') for p in [q_patch, k_patch, v_patch]):
-                    # LoKr/LoHa or mixed adapter types: expand to diff, then fuse
-                    parts = []
-                    # Try to detect the native dtype before float32 expansion
+                elif any(hasattr(p, "weights") for p in [q_patch, k_patch, v_patch]):
                     store_dtype = torch.float16
-                    for p in [q_patch, k_patch, v_patch]:
-                        if hasattr(p, 'weights') and p.weights[0] is not None:
-                            dt = p.weights[0].dtype
-                            if dt not in (torch.float32, torch.float64):
-                                store_dtype = dt
+                    for candidate in [q_patch, k_patch, v_patch]:
+                        if hasattr(candidate, "weights") and candidate.weights[0] is not None:
+                            dtype = candidate.weights[0].dtype
+                            if dtype not in (torch.float32, torch.float64):
+                                store_dtype = dtype
                                 break
-                    for comp_patch in [q_patch, k_patch, v_patch]:
-                        parts.append(self._expand_patch_to_diff(comp_patch))
+                    parts = [self._expand_patch_to_diff(comp_patch) for comp_patch in [q_patch, k_patch, v_patch]]
                     fused_diff = torch.cat(parts, dim=0)
                     if store_dtype not in (torch.float32, torch.float64):
                         fused_diff = fused_diff.to(store_dtype)
@@ -1158,6 +1254,279 @@ class _LoRAMergeBase:
         if model is None:
             return {}
         return comfy.lora.model_lora_keys_unet(model.model, {})
+
+    @staticmethod
+    def _collect_lora_prefixes(active_loras):
+        """Collect all LoRA key prefixes from a stack in deterministic order."""
+        all_lora_prefixes = set()
+        suffixes = [
+            ".lora_up.weight", ".lora_down.weight",
+            "_lora.up.weight", "_lora.down.weight",
+            ".lora_B.weight", ".lora_A.weight",
+            ".lora.up.weight", ".lora.down.weight",
+            ".alpha",
+        ]
+        for item in active_loras:
+            for key in item["lora"].keys():
+                for suffix in suffixes:
+                    if key.endswith(suffix):
+                        all_lora_prefixes.add(key[:-len(suffix)])
+                        break
+        return sorted(all_lora_prefixes)
+
+    @staticmethod
+    def _resolve_target_key(lora_prefix, model_keys, clip_keys):
+        """Resolve a LoRA prefix to a model/CLIP target key."""
+        if lora_prefix in model_keys:
+            return (model_keys[lora_prefix], False)
+        if lora_prefix in clip_keys:
+            return (clip_keys[lora_prefix], True)
+        return (None, False)
+
+    @staticmethod
+    def _make_target_group_id(target_key, is_clip):
+        return (bool(is_clip), target_key)
+
+    @staticmethod
+    def _choose_canonical_prefix(aliases):
+        """Pick a stable human-readable label for an alias group."""
+        if not aliases:
+            return ""
+        def _sort_key(alias):
+            return (
+                alias.startswith("lora_"),
+                alias.count("_"),
+                len(alias),
+                alias,
+            )
+        return min(sorted(set(aliases)), key=_sort_key)
+
+    def _build_target_groups(self, all_lora_prefixes, model_keys, clip_keys):
+        """
+        Group aliases by resolved (is_clip, target_key) so analysis/merge operates
+        on actual model weights rather than raw trainer-specific prefixes.
+        """
+        grouped = {}
+        for prefix in all_lora_prefixes:
+            target_key, is_clip = self._resolve_target_key(prefix, model_keys, clip_keys)
+            if target_key is None:
+                continue
+            group_id = self._make_target_group_id(target_key, is_clip)
+            entry = grouped.setdefault(group_id, {
+                "target_key": target_key,
+                "is_clip": is_clip,
+                "aliases": [],
+            })
+            entry["aliases"].append(prefix)
+
+        ordered = {}
+        prepared = []
+        for entry in grouped.values():
+            aliases = sorted(set(entry["aliases"]))
+            canonical = self._choose_canonical_prefix(aliases)
+            prepared.append((entry["is_clip"], canonical, {
+                "target_key": entry["target_key"],
+                "is_clip": entry["is_clip"],
+                "aliases": aliases,
+                "label_prefix": canonical,
+            }))
+        for _is_clip, canonical, entry in sorted(prepared, key=lambda item: (item[0], item[1])):
+            ordered[canonical] = entry
+        return ordered
+
+    @staticmethod
+    def _group_target_key(target_group):
+        return target_group["target_key"]
+
+    def _resolve_target_shape(self, target_key, is_clip, model, clip):
+        """Resolve the actual target tensor shape for a target key."""
+        offset = None
+        if isinstance(target_key, tuple):
+            actual_key = target_key[0]
+            if len(target_key) > 1:
+                offset = target_key[1]
+        else:
+            actual_key = target_key
+
+        if is_clip:
+            target_weight = comfy.utils.get_attr(clip.cond_stage_model, actual_key)
+        else:
+            target_weight = comfy.utils.get_attr(model.model, actual_key)
+
+        target_shape = list(target_weight.shape)
+        if offset is not None:
+            target_shape[offset[0]] = offset[2]
+        return torch.Size(target_shape)
+
+    @staticmethod
+    def _resolve_branch_strength(item, is_clip, clip_strength_multiplier):
+        """Base per-LoRA strength for the target branch before auto-scaling."""
+        if is_clip:
+            if item["clip_strength"] is not None:
+                return item["clip_strength"]
+            return item["strength"]
+        return item["strength"]
+
+    def _apply_conflict_modes(self, diffs, eff_strengths, active_loras, merge_quality="standard"):
+        """Apply per-LoRA conflict_mode masking to already-aggregated diffs."""
+        if len(diffs) <= 1:
+            return diffs
+        if not any(active_loras[idx].get("conflict_mode", "all") != "all" for idx in diffs):
+            return diffs
+
+        indices = sorted(diffs.keys())
+        ref = diffs[indices[0]]
+        if merge_quality != "standard" and ref.dim() >= 2:
+            out_dim = ref.shape[0]
+            sign_sum = torch.zeros(out_dim, device=ref.device, dtype=torch.float32)
+            for idx in indices:
+                effective = diffs[idx] if eff_strengths[idx] >= 0 else -diffs[idx]
+                sign_sum += effective.reshape(out_dim, -1).to(dtype=torch.float32).sum(dim=1).sign()
+            majority_sign = torch.where(sign_sum >= 0, 1.0, -1.0)
+            majority_sign = majority_sign.reshape(-1, *([1] * (ref.dim() - 1))).expand_as(ref)
+        else:
+            sign_sum = torch.zeros_like(ref, dtype=torch.float32)
+            for idx in indices:
+                effective = diffs[idx] if eff_strengths[idx] >= 0 else -diffs[idx]
+                sign_sum += effective.sign()
+            majority_sign = torch.where(sign_sum >= 0, 1.0, -1.0)
+
+        masked = {}
+        for idx in indices:
+            diff = diffs[idx]
+            effective = diff if eff_strengths[idx] >= 0 else -diff
+            cm = active_loras[idx].get("conflict_mode", "all")
+            if cm == "low_conflict":
+                diff = diff * ((effective * majority_sign) > 0).float()
+            elif cm == "high_conflict":
+                diff = diff * ((effective * majority_sign) < 0).float()
+            masked[idx] = diff
+        return masked
+
+    def _prepare_group_diffs(self, target_group, active_loras, model, clip, device,
+                             clip_strength_multiplier=1.0, merge_quality="standard",
+                             diff_cache=None, auto_scale=1.0):
+        """
+        Aggregate all alias contributions that resolve to the same target weight.
+        Returns metadata plus one diff per contributing LoRA after key_filter and
+        conflict_mode are applied.
+        """
+        target_key = self._group_target_key(target_group)
+        is_clip = target_group["is_clip"]
+
+        try:
+            target_shape = self._resolve_target_shape(target_key, is_clip, model, clip)
+        except (AttributeError, RuntimeError, IndexError):
+            return None
+
+        use_gpu = device is not None and device.type != "cpu"
+        aggregated = {}
+        ranks = {}
+        raw_contributors = set()
+        storage_dtype = None
+        skip_count = 0
+
+        for i, item in enumerate(active_loras):
+            diff_accum = None
+            rank_sum = 0
+            for alias in target_group["aliases"]:
+                lora_info = self._get_lora_key_info(item["lora"], alias)
+                if lora_info is None:
+                    continue
+
+                mat_up, mat_down, alpha, mid = lora_info
+                rank_sum += mat_down.shape[0]
+                raw_contributors.add(i)
+                if storage_dtype is None:
+                    storage_dtype = mat_up.dtype
+
+                cache_key = (alias, i)
+                if diff_cache is not None and cache_key in diff_cache:
+                    diff = diff_cache.get(cache_key, device=device if use_gpu else None)
+                    if diff is not None:
+                        diff = diff.float()
+                else:
+                    diff = self._compute_lora_diff(
+                        mat_up, mat_down, alpha, mid, target_shape,
+                        device=device if use_gpu else None,
+                        to_cpu=not use_gpu,
+                    )
+                    if diff_cache is not None and diff is not None:
+                        diff_cache.put(cache_key, diff)
+                    if diff is not None:
+                        diff = diff.float()
+
+                if diff is None:
+                    skip_count += 1
+                    continue
+                diff_accum = diff if diff_accum is None else diff_accum + diff
+
+            if diff_accum is not None:
+                aggregated[i] = diff_accum
+                ranks[i] = rank_sum
+
+        raw_n = len(aggregated)
+        if raw_n == 0:
+            if skip_count > 0:
+                return {
+                    "label_prefix": target_group["label_prefix"],
+                    "target_key": target_key,
+                    "is_clip": is_clip,
+                    "raw_n_loras": 0,
+                    "diffs": {},
+                    "eff_strengths": {},
+                    "rank_sums": {},
+                    "target_shape": target_shape,
+                    "storage_dtype": storage_dtype,
+                    "skip_count": skip_count,
+                }
+            return None
+
+        filtered = {}
+        eff_strengths = {}
+        rank_sums = {}
+        for i, diff in aggregated.items():
+            kf = active_loras[i].get("key_filter", "all")
+            if kf == "shared_only" and raw_n < 2:
+                continue
+            if kf == "unique_only" and raw_n != 1:
+                continue
+            filtered[i] = diff
+            eff_strengths[i] = self._resolve_branch_strength(
+                active_loras[i], is_clip, clip_strength_multiplier
+            ) * auto_scale
+            rank_sums[i] = ranks.get(i, 0)
+
+        if not filtered:
+            return {
+                "label_prefix": target_group["label_prefix"],
+                "target_key": target_key,
+                "is_clip": is_clip,
+                "raw_n_loras": raw_n,
+                "diffs": {},
+                "eff_strengths": {},
+                "rank_sums": {},
+                "target_shape": target_shape,
+                "storage_dtype": storage_dtype,
+                "skip_count": skip_count,
+            }
+
+        filtered = self._apply_conflict_modes(
+            filtered, eff_strengths, active_loras, merge_quality=merge_quality
+        )
+
+        return {
+            "label_prefix": target_group["label_prefix"],
+            "target_key": target_key,
+            "is_clip": is_clip,
+            "raw_n_loras": raw_n,
+            "diffs": filtered,
+            "eff_strengths": eff_strengths,
+            "rank_sums": rank_sums,
+            "target_shape": target_shape,
+            "storage_dtype": storage_dtype,
+            "skip_count": skip_count,
+        }
 
     def _get_lora_key_info(self, lora_dict, key_prefix):
         """
@@ -1196,7 +1565,7 @@ class _LoRAMergeBase:
         
         return None
     
-    def _compute_lora_diff(self, mat_up, mat_down, alpha, mid, target_shape, device=None):
+    def _compute_lora_diff(self, mat_up, mat_down, alpha, mid, target_shape, device=None, to_cpu=True):
         """
         Computes full diff for a single LoRA.
         diff = mat_up @ mat_down × (alpha / rank)
@@ -1238,9 +1607,289 @@ class _LoRAMergeBase:
             return None
 
         diff = diff * scale
-        if device is not None and device.type != "cpu":
+        if to_cpu and device is not None and device.type != "cpu":
             return diff.cpu()
         return diff
+
+    @staticmethod
+    def _stable_data_hash(value):
+        """Create a compact stable hash for nested JSON-like data and tensors."""
+        def _normalize(obj):
+            if isinstance(obj, torch.Tensor):
+                t = obj.detach().float().cpu()
+                sample = t.flatten()[:16].tolist()
+                return {
+                    "__tensor__": True,
+                    "shape": list(t.shape),
+                    "dtype": str(t.dtype),
+                    "sample": sample,
+                }
+            if isinstance(obj, dict):
+                return {str(k): _normalize(obj[k]) for k in sorted(obj.keys(), key=str)}
+            if isinstance(obj, (list, tuple)):
+                return [_normalize(v) for v in obj]
+            if isinstance(obj, (str, int, float, bool)) or obj is None:
+                return obj
+            return repr(obj)
+
+        payload = json.dumps(_normalize(value), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _safe_unit_clamp(value):
+        return max(-1.0, min(1.0, float(value)))
+
+    @classmethod
+    def _resolve_calibration_entry(cls, calibration_data, target_key):
+        if not calibration_data:
+            return None
+        if isinstance(target_key, tuple):
+            target_key = target_key[0]
+        targets = calibration_data.get("targets") or calibration_data.get("keys") or {}
+        if target_key in targets:
+            return targets[target_key]
+        defaults = calibration_data.get("default") or calibration_data.get("defaults")
+        return defaults if isinstance(defaults, dict) else None
+
+    @classmethod
+    def _resolve_calibration_diag(cls, calibration_entry, flat_cols, device=None):
+        if not calibration_entry:
+            return None
+
+        diag = None
+        if "input_diag" in calibration_entry:
+            diag = calibration_entry["input_diag"]
+        elif "diag" in calibration_entry:
+            diag = calibration_entry["diag"]
+        elif "channel_diag" in calibration_entry:
+            channel_diag = torch.as_tensor(calibration_entry["channel_diag"], dtype=torch.float32)
+            if channel_diag.numel() > 0 and flat_cols % channel_diag.numel() == 0:
+                repeats = flat_cols // channel_diag.numel()
+                diag = channel_diag.repeat_interleave(repeats)
+
+        if diag is None:
+            return None
+
+        diag = torch.as_tensor(diag, dtype=torch.float32, device=device).flatten()
+        if diag.numel() == 1:
+            return diag.repeat(flat_cols)
+        if diag.numel() != flat_cols:
+            return None
+        return diag
+
+    @classmethod
+    def _compute_activation_importance(cls, diff, calibration_entry):
+        if diff is None:
+            return 0.0
+
+        mat = diff.reshape(diff.shape[0], -1).float() if diff.dim() >= 2 else diff.float().reshape(1, -1)
+        diag = cls._resolve_calibration_diag(calibration_entry, mat.shape[1], device=mat.device)
+        col_energy = mat.square().sum(dim=0)
+        if diag is not None:
+            return torch.dot(col_energy, diag).item()
+
+        scale = 1.0
+        if calibration_entry:
+            scale = float(calibration_entry.get("scale", calibration_entry.get("input_trace", 1.0)))
+        return col_energy.sum().item() * scale
+
+    @classmethod
+    def _compute_patch_activation_importance(cls, patch, calibration_entry, score_device=None):
+        if patch is None:
+            return 0.0
+
+        if isinstance(patch, tuple) and patch[0] == "diff":
+            tensor = patch[1][0].float()
+            if score_device is not None:
+                tensor = tensor.to(score_device)
+            return cls._compute_activation_importance(tensor, calibration_entry)
+
+        if isinstance(patch, (LoKrAdapter, LoHaAdapter)):
+            tensor = cls._expand_patch_to_diff(patch)
+            if score_device is not None:
+                tensor = tensor.to(score_device)
+            return cls._compute_activation_importance(tensor, calibration_entry)
+
+        if hasattr(patch, "weights"):
+            mat_up, mat_down, alpha, mid, _, _ = patch.weights
+            rank = mat_down.shape[0] if mat_down is not None and mat_down.dim() >= 1 else 1
+            scale = float(alpha) / rank if rank > 0 else 1.0
+
+            up_flat = mat_up.flatten(start_dim=1).float()
+            down_flat = mat_down.flatten(start_dim=1).float()
+            if mid is not None:
+                final_shape = [down_flat.shape[1], down_flat.shape[0], mid.shape[2], mid.shape[3]]
+                down_flat = torch.mm(
+                    mat_down.transpose(0, 1).flatten(start_dim=1).float(),
+                    mid.transpose(0, 1).flatten(start_dim=1).float(),
+                ).reshape(final_shape).transpose(0, 1).flatten(start_dim=1).float()
+            if score_device is not None:
+                up_flat = up_flat.to(score_device)
+                down_flat = down_flat.to(score_device)
+
+            gram_up = torch.mm(up_flat.T, up_flat)
+            diag = cls._resolve_calibration_diag(calibration_entry, down_flat.shape[1], device=down_flat.device)
+            if diag is not None:
+                gram_down = torch.mm(down_flat * diag.unsqueeze(0), down_flat.T)
+                return (torch.trace(gram_up @ gram_down).clamp(min=0) * (scale * scale)).item()
+
+            factor = float(calibration_entry.get("scale", calibration_entry.get("input_trace", 1.0))) if calibration_entry else 1.0
+            gram_down = torch.mm(down_flat, down_flat.T)
+            return (torch.trace(gram_up @ gram_down).clamp(min=0) * (scale * scale) * factor).item()
+
+        return 0.0
+
+    @staticmethod
+    def _compute_subspace_basis(diff, rank_hint=None, max_rank=8):
+        if diff is None:
+            return None
+
+        if diff.dim() >= 2:
+            mat = diff.reshape(diff.shape[0], -1).float()
+        else:
+            mat = diff.float().reshape(1, -1)
+
+        if min(mat.shape) <= 0:
+            return None
+
+        rank_cap = min(max_rank, min(mat.shape))
+        if rank_hint is not None:
+            rank_cap = min(rank_cap, max(1, int(rank_hint)))
+        rank_cap = max(rank_cap, 1)
+
+        try:
+            q = min(rank_cap, min(mat.shape))
+            U, _S, V = torch.svd_lowrank(mat, q=q)
+            return {"left": U[:, :q], "right": V[:, :q]}
+        except Exception:
+            try:
+                left, _ = torch.linalg.qr(mat, mode="reduced")
+                right, _ = torch.linalg.qr(mat.T, mode="reduced")
+                return {
+                    "left": left[:, :rank_cap],
+                    "right": right[:, :rank_cap],
+                }
+            except Exception:
+                return None
+
+    @classmethod
+    def _compute_subspace_overlap(cls, basis_a, basis_b):
+        if not basis_a or not basis_b:
+            return 0.0
+
+        def _project_overlap(q_a, q_b):
+            if q_a is None or q_b is None or q_a.numel() == 0 or q_b.numel() == 0:
+                return None
+            cross = torch.mm(q_a.transpose(0, 1), q_b)
+            denom = max(1, min(q_a.shape[1], q_b.shape[1]))
+            value = (cross.square().sum() / denom).item()
+            return min(max(value, 0.0), 1.0)
+
+        left = _project_overlap(basis_a.get("left"), basis_b.get("left"))
+        right = _project_overlap(basis_a.get("right"), basis_b.get("right"))
+        values = [v for v in (left, right) if v is not None]
+        return sum(values) / len(values) if values else 0.0
+
+    def _sample_pair_metrics(self, diff_a, diff_b, basis_a=None, basis_b=None, device=None):
+        """
+        Pairwise overlap/conflict metrics with a magnitude-aware noise floor,
+        excess-conflict baseline, and optional subspace overlap.
+        """
+        flat_a = diff_a.flatten()
+        flat_b = diff_b.flatten()
+        if device is not None:
+            flat_a = flat_a.to(device=device, dtype=torch.float32)
+            flat_b = flat_b.to(device=device, dtype=torch.float32)
+        elif flat_a.dtype != torch.float32:
+            flat_a = flat_a.float()
+            flat_b = flat_b.float()
+
+        if flat_a.numel() != flat_b.numel():
+            return {
+                "overlap": 0,
+                "conflict": 0,
+                "dot": 0.0,
+                "norm_a_sq": 0.0,
+                "norm_b_sq": 0.0,
+                "weighted_total": 0.0,
+                "weighted_conflict": 0.0,
+                "expected_conflict": 0.0,
+                "excess_conflict": 0.0,
+                "subspace_overlap": 0.0,
+                "subspace_weight": 0.0,
+            }
+
+        n = flat_a.numel()
+        if n > 100000:
+            target_device = flat_a.device
+            g = torch.Generator(device=target_device).manual_seed(42)
+            indices = torch.randperm(n, device=target_device, generator=g)[:100000]
+            flat_a = flat_a[indices]
+            flat_b = flat_b[indices]
+
+        mask = (flat_a != 0) & (flat_b != 0)
+        n_overlap = mask.sum().item()
+        if n_overlap == 0:
+            return {
+                "overlap": 0,
+                "conflict": 0,
+                "dot": 0.0,
+                "norm_a_sq": 0.0,
+                "norm_b_sq": 0.0,
+                "weighted_total": 0.0,
+                "weighted_conflict": 0.0,
+                "expected_conflict": 0.0,
+                "excess_conflict": 0.0,
+                "subspace_overlap": 0.0,
+                "subspace_weight": 0.0,
+            }
+
+        a_overlap = flat_a[mask]
+        b_overlap = flat_b[mask]
+        dot = (a_overlap * b_overlap).sum().item()
+        norm_a_sq = (a_overlap * a_overlap).sum().item()
+        norm_b_sq = (b_overlap * b_overlap).sum().item()
+        n_conflict = (a_overlap.sign() != b_overlap.sign()).sum().item()
+
+        a_rms = a_overlap.square().mean().sqrt()
+        b_rms = b_overlap.square().mean().sqrt()
+        noise_floor = max(a_rms.item(), b_rms.item()) * 0.05
+        strong_mask = (a_overlap.abs() > noise_floor) & (b_overlap.abs() > noise_floor)
+        if strong_mask.any():
+            a_strong = a_overlap[strong_mask]
+            b_strong = b_overlap[strong_mask]
+        else:
+            a_strong = a_overlap
+            b_strong = b_overlap
+
+        weights = torch.minimum(a_strong.abs(), b_strong.abs())
+        weighted_total = weights.sum().item()
+        mismatch = a_strong.sign() != b_strong.sign()
+        weighted_conflict = weights[mismatch].sum().item() if weighted_total > 0 else 0.0
+
+        denom = math.sqrt(norm_a_sq * norm_b_sq) if norm_a_sq > 0 and norm_b_sq > 0 else 0.0
+        cos_sim = dot / denom if denom > 0 else 0.0
+        cos_sim = self._safe_unit_clamp(cos_sim)
+        expected_conflict = math.acos(cos_sim) / math.pi if denom > 0 else 0.0
+        weighted_ratio = (weighted_conflict / weighted_total) if weighted_total > 0 else 0.0
+        excess_conflict = max(weighted_ratio - expected_conflict, 0.0)
+
+        subspace_overlap = self._compute_subspace_overlap(basis_a, basis_b)
+        subspace_weight = math.sqrt(norm_a_sq * norm_b_sq) if norm_a_sq > 0 and norm_b_sq > 0 else 0.0
+
+        return {
+            "overlap": n_overlap,
+            "conflict": n_conflict,
+            "dot": dot,
+            "norm_a_sq": norm_a_sq,
+            "norm_b_sq": norm_b_sq,
+            "weighted_total": weighted_total,
+            "weighted_conflict": weighted_conflict,
+            "expected_conflict": expected_conflict,
+            "excess_conflict": excess_conflict,
+            "subspace_overlap": subspace_overlap,
+            "subspace_weight": subspace_weight,
+        }
 
     @staticmethod
     def _ties_trim(tensor, density):
@@ -1370,11 +2019,10 @@ class _LoRAMergeBase:
         if isinstance(patch, tuple) and patch[0] == "diff":
             return patch[1][0].float()
         elif isinstance(patch, LoKrAdapter):
-            v = patch.weights
-            # weights = (w1, w2, alpha, w1_a, w1_b, w2_a, w2_b, t2, dora_scale)
-            w1, w2, alpha = v[0], v[1], v[2]
-            w1_a, w1_b = v[3], v[4]
-            w2_a, w2_b, t2 = v[5], v[6], v[7]
+            weights = patch.weights
+            w1, w2, alpha = weights[0], weights[1], weights[2]
+            w1_a, w1_b = weights[3], weights[4]
+            w2_a, w2_b, t2 = weights[5], weights[6], weights[7]
             if isinstance(alpha, torch.Tensor):
                 alpha = alpha.item()
             dim = None
@@ -1399,11 +2047,10 @@ class _LoRAMergeBase:
             scale = alpha / dim if (alpha is not None and dim is not None) else 1.0
             return torch.kron(w1, w2) * scale
         elif isinstance(patch, LoHaAdapter):
-            v = patch.weights
-            # weights = (w1a, w1b, alpha, w2a, w2b, t1, t2, dora_scale)
-            w1a, w1b, alpha = v[0], v[1], v[2]
-            w2a, w2b = v[3], v[4]
-            t1, t2 = v[5], v[6]
+            weights = patch.weights
+            w1a, w1b, alpha = weights[0], weights[1], weights[2]
+            w2a, w2b = weights[3], weights[4]
+            t1, t2 = weights[5], weights[6]
             if isinstance(alpha, torch.Tensor):
                 alpha = alpha.item()
             rank = w1b.shape[0]
@@ -1422,7 +2069,6 @@ class _LoRAMergeBase:
             scale = alpha / rank if alpha is not None else 1.0
             return (m1 * m2) * scale
         elif hasattr(patch, 'weights'):
-            # LoRAAdapter fallback
             w = patch.weights
             mat_up, mat_down, alpha = w[0], w[1], w[2]
             mid = w[3]
@@ -1453,7 +2099,7 @@ class _LoRAMergeBase:
             )
             if isinstance(patch, LoKrAdapter):
                 return LoKrAdapter(patch.loaded_keys, moved)
-            elif isinstance(patch, LoHaAdapter):
+            if isinstance(patch, LoHaAdapter):
                 return LoHaAdapter(patch.loaded_keys, moved)
             return LoRAAdapter(patch.loaded_keys, moved)
         elif isinstance(patch, tuple) and len(patch) == 2 and isinstance(patch[0], str):
@@ -1766,7 +2412,7 @@ class _LoRAMergeBase:
         computes up @ down * (rank/rank) = up @ down (no extra scaling).
 
         svd_device: where to run SVD. GPU is ~10-50x faster. CPU if None.
-        output_dtype: cast output to this dtype. None = same as input (fp16 stays fp16).
+        output_dtype: cast output to this dtype. None = same as input.
         For a [4096, 4096] diff at rank 128: 64MB → 2MB (~32x reduction).
         """
         original_shape = diff.shape
@@ -1779,17 +2425,14 @@ class _LoRAMergeBase:
         # Move to requested device for SVD (GPU is much faster for matmul-heavy randomized SVD)
         if svd_device is not None and mat.device != svd_device:
             mat = mat.to(svd_device)
-        # When rank > dim/2, full SVD + truncate is both faster and more accurate
-        # than randomized SVD (which would oversample beyond dim anyway).
         if rank > min(mat.shape) // 2:
             U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
             del mat
             U = U[:, :rank]
             S = S[:rank]
-            V = Vh[:rank, :].T  # Vh is [min(dim), n], transpose slice to [n, rank]
+            V = Vh[:rank, :].T
             del Vh
         else:
-            # Oversample by 20% for better randomized SVD accuracy, then truncate.
             q_oversample = min(rank + max(20, rank // 5), min(mat.shape))
             U, S, V = torch.svd_lowrank(mat, q=q_oversample, niter=4)
             del mat
@@ -1800,8 +2443,8 @@ class _LoRAMergeBase:
         # Reconstruct as: mat_up = U * sqrt(S), mat_down = sqrt(S) * V^T
         # Return on CPU for storage (ComfyUI moves to device when applying)
         sqrt_S = S.sqrt()
-        mat_up = (U * sqrt_S.unsqueeze(0)).to(output_dtype).cpu()    # [out, rank]
-        mat_down = ((V * sqrt_S.unsqueeze(0)).T).to(output_dtype).cpu()  # [rank, in]
+        mat_up = (U * sqrt_S.unsqueeze(0)).to(output_dtype).cpu()
+        mat_down = ((V * sqrt_S.unsqueeze(0)).T).to(output_dtype).cpu()
         del U, S, V, sqrt_S
         # alpha=rank so ComfyUI computes: up @ down * (rank/rank) = up @ down
         return LoRAAdapter(set(), (mat_up, mat_down, float(rank), None, None, None))
@@ -1811,12 +2454,9 @@ class _LoRAMergeBase:
     def _estimate_save_rank(initial_rank, model_patches, clip_patches,
                             max_error=0.05, n_samples=3):
         """
-        Determine the exact SVD rank needed to reconstruct merged diffs within
-        `max_error` relative Frobenius error.  Uses exact SVD on a few sample
-        diffs to find the minimum rank where the truncation error drops below
-        the threshold.  No arbitrary cap — rank is bounded only by min(dim).
+        Estimate the minimum SVD rank needed to reconstruct sample diff patches
+        within `max_error` relative Frobenius error.
         """
-        # Collect sample full-rank diffs (prefer larger ones for conservative estimate)
         samples = []
         for patch in list(model_patches.values()) + list(clip_patches.values()):
             if isinstance(patch, tuple) and patch[0] == "diff":
@@ -1829,28 +2469,21 @@ class _LoRAMergeBase:
         rank = max(initial_rank, 64)
         for sample in samples:
             mat = sample.reshape(sample.shape[0], -1).float()
-            # Exact SVD gives precise singular values — no randomized noise
-            S = torch.linalg.svdvals(mat)
-            total_sq = (S ** 2).sum().item()
+            singular_values = torch.linalg.svdvals(mat)
+            total_sq = (singular_values ** 2).sum().item()
             if total_sq == 0:
                 continue
-            # Find minimum rank where residual/total < max_error
-            # ||A - A_k||_F / ||A||_F < max_error  ⟺  residual_sq/total_sq < max_error^2
-            threshold_sq = max_error * max_error * total_sq
+            threshold_sq = (max_error * max_error) * total_sq
             cumulative_sq = 0.0
-            needed = len(S)
-            for r in range(len(S)):
-                cumulative_sq += S[r].item() ** 2
+            needed = len(singular_values)
+            for idx in range(len(singular_values)):
+                cumulative_sq += singular_values[idx].item() ** 2
                 if total_sq - cumulative_sq <= threshold_sq:
-                    needed = r + 1
+                    needed = idx + 1
                     break
             if needed > rank:
-                error_at_initial = math.sqrt(max(0, total_sq - sum(s.item()**2 for s in S[:rank])) / total_sq)
-                logging.info(f"[Save Merged LoRA] Sample diff ({mat.shape[0]}x{mat.shape[1]}): "
-                             f"need rank {needed} for <{max_error:.0%} error "
-                             f"(rank {rank} has {error_at_initial:.1%} error)")
                 rank = needed
-            del S, mat
+            del singular_values, mat
         return rank
 
     @torch.no_grad()
@@ -2313,115 +2946,6 @@ class _LoRAMergeBase:
 
         return normalized
 
-    def _run_pass1_analysis(self, active_loras, all_lora_prefixes, model_keys, clip_keys, model, clip, compute_device, progress_callback=None):
-        """
-        Run Pass 1 streaming analysis over all LoRA prefixes.
-
-        Args:
-            progress_callback: Optional callable invoked after each prefix is analyzed.
-
-        Returns a dict with:
-          all_key_targets, per_lora_stats, pair_accum, all_magnitude_samples,
-          prefix_count, prefix_stats, skipped_keys, pairs
-        """
-        use_gpu = compute_device.type != "cpu"
-
-        all_key_targets = {}
-        skipped_keys = 0
-        per_lora_stats = [{
-            "name": item["name"],
-            "strength": item["strength"],
-            "ranks": [],
-            "key_count": 0,
-            "l2_norms": [],
-        } for item in active_loras]
-
-        pairs = [(i, j) for i in range(len(active_loras))
-                         for j in range(i + 1, len(active_loras))]
-        pair_accum = {(i, j): [0, 0, 0.0, 0.0, 0.0] for i, j in pairs}
-        pair_shared_prefixes = {(i, j): 0 for i, j in pairs}
-        all_magnitude_samples = []
-        prefix_count = 0
-        prefix_stats = {}
-
-        def _collect_analysis_result(result):
-            nonlocal skipped_keys, prefix_count
-            if result is None:
-                return
-            prefix, partial_stats, pair_conflicts, mag_samples, target_info, skips = result
-            skipped_keys += skips
-            if len(partial_stats) > 0:
-                all_key_targets[prefix] = target_info
-                prefix_count += 1
-            for (idx, rank, l2) in partial_stats:
-                per_lora_stats[idx]["ranks"].append(rank)
-                per_lora_stats[idx]["key_count"] += 1
-                per_lora_stats[idx]["l2_norms"].append(l2)
-            for (i, j), (ov, conf, dot, na_sq, nb_sq) in pair_conflicts.items():
-                pair_accum[(i, j)][0] += ov
-                pair_accum[(i, j)][1] += conf
-                pair_accum[(i, j)][2] += dot
-                pair_accum[(i, j)][3] += na_sq
-                pair_accum[(i, j)][4] += nb_sq
-                pair_shared_prefixes[(i, j)] += 1
-            all_magnitude_samples.extend(mag_samples)
-
-            if len(partial_stats) > 0:
-                n_contributing = len(partial_stats)
-                pf_overlap = sum(ov for ov, conf, dot, na_sq, nb_sq in pair_conflicts.values())
-                pf_conflict = sum(conf for ov, conf, dot, na_sq, nb_sq in pair_conflicts.values())
-                pf_conflict_ratio = pf_conflict / pf_overlap if pf_overlap > 0 else 0.0
-                pf_l2s = [l2 for _, _, l2 in partial_stats if l2 > 0]
-                if len(pf_l2s) >= 2:
-                    pf_mag_ratio = max(pf_l2s) / min(pf_l2s)
-                else:
-                    pf_mag_ratio = 1.0
-                pf_cos_sims = []
-                for (ov, conf, dot, na_sq, nb_sq) in pair_conflicts.values():
-                    denom = (na_sq ** 0.5) * (nb_sq ** 0.5)
-                    if denom > 0:
-                        pf_cos_sims.append(dot / denom)
-                avg_cos_sim = sum(pf_cos_sims) / len(pf_cos_sims) if pf_cos_sims else 0.0
-                prefix_stats[prefix] = {
-                    "n_loras": n_contributing,
-                    "conflict_ratio": pf_conflict_ratio,
-                    "magnitude_ratio": pf_mag_ratio,
-                    "magnitude_samples": list(mag_samples),
-                    "avg_cos_sim": avg_cos_sim,
-                }
-
-        if use_gpu:
-            for lora_prefix in all_lora_prefixes:
-                result = self._analyze_prefix(lora_prefix, active_loras,
-                                              model_keys, clip_keys, model, clip, compute_device)
-                _collect_analysis_result(result)
-                if progress_callback:
-                    progress_callback()
-        else:
-            max_workers = min(4, max(1, len(all_lora_prefixes)))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(self._analyze_prefix, lora_prefix, active_loras,
-                                    model_keys, clip_keys, model, clip, compute_device): lora_prefix
-                    for lora_prefix in all_lora_prefixes
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    _collect_analysis_result(future.result())
-                    if progress_callback:
-                        progress_callback()
-
-        return {
-            "all_key_targets": all_key_targets,
-            "per_lora_stats": per_lora_stats,
-            "pair_accum": pair_accum,
-            "pair_shared_prefixes": pair_shared_prefixes,
-            "all_magnitude_samples": all_magnitude_samples,
-            "prefix_count": prefix_count,
-            "prefix_stats": prefix_stats,
-            "skipped_keys": skipped_keys,
-            "pairs": pairs,
-        }
-
     def _sample_conflict(self, diff_a, diff_b, device=None):
         """
         Compute sign conflict ratio and cosine similarity components between
@@ -2510,7 +3034,8 @@ def _generate_param_grid():
 
 
 def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
-                            magnitude_ratio, prefix_stats, arch_preset=None):
+                            magnitude_ratio, prefix_stats, arch_preset=None,
+                            avg_excess_conflict=None, avg_subspace_overlap=0.0):
     """
     Score a merge config against analysis metrics (no merge needed).
     Returns float score in [0, 1] where higher = better predicted quality.
@@ -2535,63 +3060,60 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
     mag_thresh = arch_preset["magnitude_ratio_total_sign"]
     ideal_density = arch_preset["dare_ideal_density"]
 
+    effective_conflict = avg_conflict_ratio
+    if avg_excess_conflict is not None:
+        effective_conflict = max(avg_excess_conflict, 0.0)
+        if avg_subspace_overlap > 0:
+            effective_conflict *= (0.5 + 0.5 * avg_subspace_overlap)
+
+    decision_conflicts = [
+        ps.get("decision_conflict", ps.get("excess_conflict", ps.get("conflict_ratio", 0.0)))
+        for ps in prefix_stats.values()
+        if ps.get("n_loras", 0) > 1
+    ] if prefix_stats else []
+
     # --- Mode fit score (0-0.4) ---
     if opt_mode == "per_prefix":
-        # Per-prefix auto-selects the best mode per layer.
-        # Key advantage: detects orthogonal LoRAs (high conflict + low cos_sim)
-        # where TIES would be wrong but per-prefix correctly uses weighted_avg/SLERP.
-        if abs(avg_cos_sim) < ortho_cos and avg_conflict_ratio > ties_thresh:
-            # Orthogonal LoRAs with high conflict — per-prefix is critical here.
-            # Global would pick TIES (wrong), per-prefix detects orthogonality.
+        if abs(avg_cos_sim) < ortho_cos and avg_subspace_overlap < 0.35 and effective_conflict < ortho_conf:
             score += 0.40
-        elif prefix_stats:
-            conflict_ratios = [ps["conflict_ratio"] for ps in prefix_stats.values()
-                               if ps.get("n_loras", 0) > 1]
-            if conflict_ratios and max(conflict_ratios) - min(conflict_ratios) > 0.15:
-                score += 0.35  # high variance = per-prefix shines
+        elif decision_conflicts:
+            if max(decision_conflicts) - min(decision_conflicts) > 0.10:
+                score += 0.35
             else:
-                score += 0.30  # uniform conflict = per-prefix still good
+                score += 0.30
         else:
             score += 0.30
     elif mode == "consensus":
-        if avg_cos_sim > consensus_cos and avg_conflict_ratio < consensus_conf:
+        if avg_cos_sim > consensus_cos and effective_conflict < consensus_conf and avg_subspace_overlap >= 0.35:
             score += 0.4
-        elif avg_cos_sim > consensus_cos * 0.6 and avg_conflict_ratio < ties_thresh:
+        elif avg_cos_sim > consensus_cos * 0.6 and effective_conflict < ties_thresh:
             score += 0.25
         else:
             score += 0.05
     elif mode == "slerp":
-        if avg_conflict_ratio < ties_thresh * 1.2:
+        if effective_conflict < ties_thresh * 1.2:
             score += 0.35
-        elif avg_conflict_ratio < ortho_conf * 0.83:
+        elif effective_conflict < ortho_conf * 0.83:
             score += 0.20
         else:
             score += 0.10
     elif mode == "weighted_average":
-        if abs(avg_cos_sim) < ortho_cos and avg_conflict_ratio < ortho_conf:
+        if abs(avg_cos_sim) < ortho_cos and avg_subspace_overlap < 0.35 and effective_conflict < ortho_conf:
             score += 0.30
-        elif avg_conflict_ratio < ortho_conf * 0.67:
+        elif effective_conflict < ortho_conf * 0.67:
             score += 0.20
         else:
             score += 0.10
     elif mode == "ties":
-        if avg_conflict_ratio > ties_thresh:
-            if abs(avg_cos_sim) < ortho_cos:
-                # High conflict BUT orthogonal LoRAs — conflict is noise, not real.
-                # TIES would aggressively prune, losing important information.
+        if effective_conflict > ties_thresh:
+            if abs(avg_cos_sim) < ortho_cos and avg_subspace_overlap < 0.35:
                 score += 0.15
             else:
                 score += 0.35
-        elif avg_conflict_ratio > ties_thresh * 0.6:
+        elif effective_conflict > ties_thresh * 0.6:
             score += 0.20
         else:
             score += 0.10
-
-    # --- Effective conflict (used by sparsification and quality scoring) ---
-    # When LoRAs are orthogonal, high conflict ratio is base-rate noise, not real
-    # conflict. Heavy processing fights noise and can amplify artifacts.
-    is_orthogonal = abs(avg_cos_sim) < ortho_cos
-    effective_conflict = avg_conflict_ratio * min(abs(avg_cos_sim) / ortho_cos, 1.0) if is_orthogonal else avg_conflict_ratio
 
     # --- Sparsification fit (0-0.15) ---
     if spars != "disabled":
@@ -2599,14 +3121,9 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
         score += conflict_benefit
         density_penalty = abs(density - ideal_density) * 0.05
         score += 0.05 - density_penalty
-        # Conflict-aware variants (dare_conflict, della_conflict) benefit from
-        # high conflict variance across prefixes — they adapt masking per-prefix.
-        if "_conflict" in spars and prefix_stats:
-            conflict_ratios = [ps["conflict_ratio"] for ps in prefix_stats.values()
-                               if ps.get("n_loras", 0) > 1]
-            if conflict_ratios and len(conflict_ratios) > 1:
-                variance = max(conflict_ratios) - min(conflict_ratios)
-                score += variance * 0.05  # up to ~0.05 bonus for high variance
+        if "_conflict" in spars and decision_conflicts and len(decision_conflicts) > 1:
+            variance = max(decision_conflicts) - min(decision_conflicts)
+            score += variance * 0.05
         # DELLA uses magnitude-aware masking — benefits when LoRAs have uneven norms
         if spars in ("della", "della_conflict"):
             if magnitude_ratio > mag_thresh:
@@ -2616,20 +3133,11 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
             score += 0.10
 
     # --- Quality fit (0-0.15) ---
-    # Enhanced/maximum resolve conflicts via orthogonalization, column-wise
-    # resolution, TALL masks, and SVD alignment.  When LoRAs are orthogonal
-    # there are no real conflicts — the extra processing treats noise as
-    # signal and can smooth away valid independent contributions.
     if quality == "maximum":
-        if is_orthogonal:
-            score += min(effective_conflict / 0.3, 1.0) * 0.10
-        else:
-            score += 0.05 + min(effective_conflict / 0.3, 1.0) * 0.10
+        conflict_benefit = min((effective_conflict + avg_subspace_overlap * 0.15) / 0.3, 1.0) * 0.10
+        score += 0.05 + conflict_benefit
     elif quality == "enhanced":
-        if is_orthogonal:
-            score += min(effective_conflict / 0.3, 1.0) * 0.10
-        else:
-            score += 0.08 + min(effective_conflict / 0.3, 1.0) * 0.07
+        score += 0.08 + min((effective_conflict + avg_subspace_overlap * 0.10) / 0.3, 1.0) * 0.07
     else:
         if effective_conflict < 0.10:
             score += 0.10
@@ -2660,7 +3168,8 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
     return score
 
 
-def _score_merge_result(model_patches, clip_patches, compute_svd=True, score_device=None):
+def _score_merge_result(model_patches, clip_patches, compute_svd=True,
+                        score_device=None, calibration_data=None):
     """
     Score an actual merge result by measuring output quality metrics.
     Returns dict with individual metrics and composite score in [0, 1].
@@ -2671,27 +3180,33 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True, score_dev
     faster norm/SVD/sparsity computation.
     """
     norms = []
+    importance_values = []
     effective_ranks = []
     sparsities = []
 
-    all_patches = list(model_patches.values()) + list(clip_patches.values())
+    all_patches = (
+        [(False, key, patch) for key, patch in model_patches.items()] +
+        [(True, key, patch) for key, patch in clip_patches.items()]
+    )
     total = len(all_patches)
     device_label = f", device={score_device}" if score_device else ""
     logging.info(f"[LoRA AutoTuner]   Scoring merge quality ({total} patches"
                  f"{', +SVD' if compute_svd else ''}{device_label})")
     log_interval = max(1, total // 4)  # Log at ~25%, 50%, 75%, 100%
-    for patch_idx, patch in enumerate(all_patches):
+    for patch_idx, (_is_clip, patch_key, patch) in enumerate(all_patches):
         if (patch_idx + 1) % log_interval == 0 or patch_idx + 1 == total:
             logging.info(f"[LoRA AutoTuner]     Scored {patch_idx + 1}/{total} patches")
         if patch is None:
             continue
+        target_key = patch_key[0] if isinstance(patch_key, tuple) else patch_key
+        calibration_entry = _LoRAMergeBase._resolve_calibration_entry(calibration_data, target_key)
         if isinstance(patch, tuple) and len(patch) >= 2:
             tensor = patch[1][0] if isinstance(patch[1], tuple) else patch[1]
         elif isinstance(patch, LoKrAdapter):
-            # LoKr norm: ||kron(A,B)||_F = ||A||_F * ||B||_F — avoids materializing full diff
-            v = patch.weights
-            w1, w2, alpha = v[0], v[1], v[2]
-            w1_a, w1_b, w2_a, w2_b, t2 = v[3], v[4], v[5], v[6], v[7]
+            weights = patch.weights
+            w1, w2, alpha = weights[0], weights[1], weights[2]
+            w1_a, w1_b = weights[3], weights[4]
+            w2_a, w2_b, t2 = weights[5], weights[6], weights[7]
             dim = None
             if w1 is None:
                 dim = w1_b.shape[0]
@@ -2707,14 +3222,20 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True, score_dev
             scale = alpha / dim if (alpha is not None and dim is not None) else 1.0
             fro_norm = (w1.float().norm().item() * w2.float().norm().item() * abs(scale))
             norms.append(fro_norm)
+            importance = _LoRAMergeBase._compute_patch_activation_importance(
+                patch, calibration_entry, score_device=score_device
+            ) if calibration_data else fro_norm
+            importance_values.append(importance)
             del w1, w2
             continue
         elif isinstance(patch, LoHaAdapter):
-            # LoHa: must expand to diff — Hadamard product has no cheap norm identity
             diff = _LoRAMergeBase._expand_patch_to_diff(patch)
             if score_device is not None:
                 diff = diff.to(score_device)
-            norms.append(diff.norm().item())
+            fro_norm = diff.norm().item()
+            norms.append(fro_norm)
+            importance = _LoRAMergeBase._compute_activation_importance(diff, calibration_entry) if calibration_data else fro_norm
+            importance_values.append(importance)
             max_val = diff.abs().max().item()
             threshold = max_val * 0.01
             if threshold > 0:
@@ -2738,6 +3259,10 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True, score_dev
                 gram_down = torch.mm(down_flat, down_flat.T)
                 fro_norm = (torch.trace(gram_up @ gram_down).clamp(min=0) ** 0.5 * abs(scale)).item()
                 norms.append(fro_norm)
+                importance = _LoRAMergeBase._compute_patch_activation_importance(
+                    patch, calibration_entry, score_device=score_device
+                ) if calibration_data else fro_norm
+                importance_values.append(importance)
                 # Estimate element-wise sparsity by sampling columns of the product
                 n_cols = down_flat.shape[1]
                 sample_k = min(64, n_cols)
@@ -2761,7 +3286,10 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True, score_dev
             t = t.to(score_device)
 
         # Frobenius norm
-        norms.append(t.norm().item())
+        fro_norm = t.norm().item()
+        norms.append(fro_norm)
+        importance = _LoRAMergeBase._compute_activation_importance(t, calibration_entry) if calibration_data else fro_norm
+        importance_values.append(importance)
 
         # Effective rank via spectral analysis (optional, expensive)
         if compute_svd and t.dim() == 2 and min(t.shape) > 1:
@@ -2791,6 +3319,15 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True, score_dev
         metrics["norm_mean"] = 0.0
         metrics["norm_cv"] = 1.0
 
+    if importance_values:
+        metrics["importance_mean"] = sum(importance_values) / len(importance_values)
+        metrics["importance_std"] = (sum((n - metrics["importance_mean"])**2 for n in importance_values)
+                                     / len(importance_values)) ** 0.5
+        metrics["importance_cv"] = metrics["importance_std"] / (metrics["importance_mean"] + 1e-10)
+    else:
+        metrics["importance_mean"] = 0.0
+        metrics["importance_cv"] = metrics["norm_cv"]
+
     if effective_ranks:
         metrics["effective_rank_mean"] = sum(effective_ranks) / len(effective_ranks)
     else:
@@ -2806,12 +3343,26 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True, score_dev
 
     # Composite score — rebalance weights when SVD is skipped
     score = 0.0
-    if effective_ranks:
+    if effective_ranks and calibration_data:
+        rank_score = min(metrics["effective_rank_mean"] / 40.0, 1.0)
+        cv_score = max(0.0, 1.0 - metrics["norm_cv"])
+        importance_score = max(0.0, 1.0 - metrics["importance_cv"])
+        score += rank_score * 0.30
+        score += cv_score * 0.15
+        score += importance_score * 0.30
+        score += metrics["sparsity_fit"] * 0.25
+    elif effective_ranks:
         rank_score = min(metrics["effective_rank_mean"] / 40.0, 1.0)
         score += rank_score * 0.4
         cv_score = max(0.0, 1.0 - metrics["norm_cv"])
         score += cv_score * 0.3
         score += metrics["sparsity_fit"] * 0.3
+    elif calibration_data:
+        cv_score = max(0.0, 1.0 - metrics["norm_cv"])
+        importance_score = max(0.0, 1.0 - metrics["importance_cv"])
+        score += cv_score * 0.30
+        score += importance_score * 0.45
+        score += metrics["sparsity_fit"] * 0.25
     else:
         # No SVD data: norm consistency 50%, sparsity 50%
         cv_score = max(0.0, 1.0 - metrics["norm_cv"])
@@ -2822,23 +3373,95 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True, score_dev
     return metrics
 
 
+def _load_python_callable(module_path, callable_name):
+    """Load a callable from either a Python file path or importable module name."""
+    if not module_path or not callable_name:
+        raise ValueError("module_path and callable_name are required")
+
+    if os.path.isfile(module_path):
+        module_name = f"lora_optimizer_eval_{hashlib.sha256(module_path.encode()).hexdigest()[:12]}"
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Unable to load evaluator module from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    else:
+        module = importlib.import_module(module_path)
+
+    fn = getattr(module, callable_name, None)
+    if fn is None or not callable(fn):
+        raise AttributeError(f"Callable '{callable_name}' not found in {module_path}")
+    return fn
+
+
+def _run_autotuner_evaluator(evaluator, model, clip, lora_data, config, analysis_summary):
+    """
+    Run an optional external evaluator. The callable receives keyword args:
+    model, clip, lora_data, config, context. It may return a float score or
+    a dict with {'score': float, 'details': ...}.
+    """
+    if not evaluator:
+        return None
+
+    module_path = evaluator.get("module_path")
+    callable_name = evaluator.get("callable_name")
+    if not module_path or not callable_name:
+        return None
+
+    try:
+        fn = _load_python_callable(module_path, callable_name)
+        result = fn(
+            model=model,
+            clip=clip,
+            lora_data=lora_data,
+            config=config,
+            context=evaluator.get("context", {}),
+            analysis_summary=analysis_summary,
+        )
+    except Exception as exc:
+        logging.warning(f"[LoRA AutoTuner] External evaluator failed: {exc}")
+        return {"score": None, "details": {"error": str(exc)}}
+
+    if isinstance(result, dict):
+        score = result.get("score")
+        details = result.get("details")
+    else:
+        score = result
+        details = None
+
+    try:
+        if score is None:
+            return {"score": None, "details": details}
+        score = float(score)
+    except (TypeError, ValueError):
+        logging.warning(f"[LoRA AutoTuner] External evaluator returned invalid score: {score!r}")
+        return {"score": None, "details": details}
+
+    return {
+        "score": max(0.0, min(1.0, score)),
+        "details": details,
+    }
+
+
 class LoRAOptimizer(_LoRAMergeBase):
     """
     Auto-optimizer that analyzes a LoRA stack (sign conflicts, magnitude
-    distributions, overlap) and automatically selects the best merge mode
+    distributions, overlap) and automatically selects merge modes
     and parameters, then performs the merge.
 
     Outputs the merged model/clip plus an analysis report explaining
     what was chosen and why.
 
     Two-pass streaming architecture:
-      Pass 1 — Analysis: computes diffs per weight prefix, samples conflict
-        and magnitude statistics, then discards diffs immediately. Only
-        lightweight scalars and small sample tensors are kept in memory.
-      Pass 2 — Merge: recomputes diffs per prefix and merges with the
-        auto-selected strategy. Each prefix's diffs are freed after merging.
-    Peak memory is ~one prefix's diffs at a time (~260MB) regardless of
-    the total number of LoRAs or weight prefixes.
+      Pass 1 — Analysis: resolves aliases to target groups, computes diffs
+        per group, samples conflict and magnitude statistics, then discards
+        diffs immediately. Only lightweight scalars and small sample tensors
+        are kept in memory.
+      Pass 2 — Merge: recomputes diffs per group and merges with the
+        auto-selected strategy. Each group's diffs are freed after merging.
+    Peak memory is roughly one target group at a time, but the exact peak
+    still depends on layer size, overlap, and enabled quality/compression
+    options.
 
     Limitation: the optimizer only analyzes LoRAs in its own stack. It has
     no visibility into LoRA patches already applied to the model by upstream
@@ -2872,9 +3495,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 }),
                 "auto_strength_floor": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Minimum scale factor for auto-strength when LoRAs are orthogonal (independent). "
-                               "-1 = auto (1.0 for video models like Wan/LTX to preserve motion, 0.85 for image models). "
-                               "Set manually to override — e.g. 0.9 for less reduction, 1.0 to disable reduction for orthogonal LoRAs entirely."
+                    "tooltip": "Minimum auto-strength scale factor for orthogonal LoRAs. -1 = architecture-aware default (1.0 for motion-heavy video architectures, lower for image models). Set manually to preserve more or less independent LoRA energy."
                 }),
                 "free_vram_between_passes": (["disabled", "enabled"], {
                     "default": "disabled",
@@ -2886,7 +3507,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 }),
                 "optimization_mode": (["per_prefix", "global", "weighted_sum_only"], {
                     "default": "per_prefix",
-                    "tooltip": "How the optimizer decides to combine LoRAs. 'per_prefix' (recommended): automatically picks the best method for each layer. 'global': uses one method everywhere. 'weighted_sum_only': simple addition, no TIES trimming — use this if your stack includes edit, distillation, or DPO LoRAs whose weights must be preserved exactly."
+                    "tooltip": "How the optimizer decides to combine LoRAs. 'per_prefix' (recommended): automatically picks a heuristic method per analyzed group. 'global': uses one method everywhere. 'weighted_sum_only': simple addition, no TIES trimming — use this if your stack includes edit, distillation, or DPO LoRAs whose weights must be preserved exactly."
                 }),
                 "cache_patches": (["enabled", "disabled"], {
                     "default": "enabled",
@@ -2894,7 +3515,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 }),
                 "compress_patches": (["non_ties", "all", "disabled"], {
                     "default": "non_ties",
-                    "tooltip": "Shrink the merged result to use less memory. 'non_ties' (recommended): compresses most layers with no quality loss. 'all': compresses everything, slightly lossy but saves the most memory. 'disabled': no compression, uses more RAM. Enable for large models."
+                    "tooltip": "Shrink the merged result to use less memory. 'non_ties' (recommended): keeps linear merges in exact low-rank form and only compresses nonlinear results when needed. 'all': compresses everything, slightly lossy but saves the most memory. 'disabled': no compression, uses more RAM. Enable for large models."
                 }),
                 "svd_device": (["gpu", "cpu"], {
                     "default": "gpu",
@@ -2929,7 +3550,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "tooltip": "Merge quality level. standard: element-wise conflict resolution. "
                                "enhanced: direction orthogonalization + column-wise conflict "
                                "resolution + selfish weight protection (minimal extra compute, no extra VRAM). "
-                               "maximum: adds SVD alignment before merge (best quality, "
+                               "maximum: adds SVD alignment before merge (highest quality mode, "
                                "uses more VRAM for SVD decomposition)."
                 }),
                 "behavior_profile": (["v1.2", "no_slerp", "classic"], {
@@ -2955,7 +3576,14 @@ class LoRAOptimizer(_LoRAMergeBase):
                 }),
                 "settings_source": (["manual", "from_autotuner"], {
                     "default": "manual",
-                    "tooltip": "manual: use widget settings. from_autotuner: use the AutoTuner's best config (connect tuner_data). Switch to manual to tweak from the AutoTuner's starting point."
+                    "tooltip": "manual: use widget settings. from_autotuner: use the AutoTuner's top-ranked config as the source of truth and treat this node as a passthrough."
+                }),
+                "decision_smoothing": ("FLOAT", {
+                    "default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Smooth per-group strategy metrics toward each block's average before Pass 2 decisions. 0 disables smoothing; 0.2-0.4 usually removes noisy mode flips without washing out real differences."
+                }),
+                "calibration_data": ("CALIBRATION_DATA", {
+                    "tooltip": "Optional activation calibration statistics. When connected, analysis and AutoTuner scoring use activation-aware importance instead of plain Frobenius magnitude where possible."
                 }),
             }
         }
@@ -2964,10 +3592,10 @@ class LoRAOptimizer(_LoRAMergeBase):
     RETURN_NAMES = ("model", "clip", "analysis_report", "tuner_data", "lora_data")
     FUNCTION = "execute_node"
     CATEGORY = "LoRA Optimizer"
-    DESCRIPTION = "Auto-analyzes LoRA stack and selects optimal merge strategy per weight group. Outputs merged model + analysis report. Best for style/character LoRAs — apply edit, distillation (LCM/Turbo/Hyper), or DPO LoRAs via a standard Load LoRA node instead."
+    DESCRIPTION = "Auto-analyzes a LoRA stack and selects heuristic merge strategies per weight group. Outputs merged model + analysis report. Best for style/character LoRAs — apply edit, distillation (LCM/Turbo/Hyper), or DPO LoRAs via a standard Load LoRA node instead."
 
     @staticmethod
-    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_quality="standard", behavior_profile="v1.2", architecture_preset="auto", auto_strength_floor=-1.0):
+    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_quality="standard", behavior_profile="v1.2", architecture_preset="auto", auto_strength_floor=-1.0, decision_smoothing=0.25, calibration_hash=""):
         """
         Build a deterministic SHA-256 hash (16 hex chars) from the stack
         configuration. Used by IS_CHANGED to let ComfyUI skip re-execution
@@ -2990,7 +3618,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     entries.append((str(item.get("name", "")), float(item.get("strength", 0)), cm, kf))
             entries.sort()
             h.update(json.dumps(entries).encode())
-        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}|cp={compress_patches}|sd={svd_device}|nk={normalize_keys}|sp={sparsification}|spd={sparsification_density}|dd={dare_dampening}|mso={merge_strategy_override}|mq={merge_quality}|bp={behavior_profile}|ap={architecture_preset}|asf={auto_strength_floor}".encode())
+        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}|cp={compress_patches}|sd={svd_device}|nk={normalize_keys}|sp={sparsification}|spd={sparsification_density}|dd={dare_dampening}|mso={merge_strategy_override}|mq={merge_quality}|bp={behavior_profile}|ap={architecture_preset}|asf={auto_strength_floor}|ds={decision_smoothing}|ch={calibration_hash}".encode())
         return h.hexdigest()[:16]
 
     @classmethod
@@ -3005,7 +3633,9 @@ class LoRAOptimizer(_LoRAMergeBase):
                    dare_dampening=0.0,
                    merge_strategy_override="", merge_quality="standard",
                    behavior_profile="v1.2", architecture_preset="auto",
-                   tuner_data=None, settings_source="manual"):
+                   tuner_data=None, settings_source="manual",
+                   decision_smoothing=0.25, calibration_data=None):
+        calibration_hash = cls._stable_data_hash(calibration_data) if calibration_data is not None else ""
         base_key = cls._compute_cache_key(lora_stack, output_strength,
                                           clip_strength_multiplier, auto_strength,
                                           optimization_mode, compress_patches,
@@ -3014,7 +3644,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                                           dare_dampening,
                                           merge_strategy_override, merge_quality,
                                           behavior_profile, architecture_preset,
-                                          auto_strength_floor)
+                                          auto_strength_floor, decision_smoothing, calibration_hash)
         cache_key = f"{base_key}|mid={id(model)}|ss={settings_source}"
         if settings_source == "from_autotuner" and tuner_data is not None:
             return f"{cache_key}|at={id(tuner_data)}"
@@ -3272,6 +3902,269 @@ class LoRAOptimizer(_LoRAMergeBase):
         return (lora_prefix, partial_stats, pair_conflicts, magnitude_samples,
                 (target_key, is_clip), skip_count)
 
+    @torch.no_grad()
+    def _analyze_target_group(self, target_group, active_loras, model, clip, device,
+                              clip_strength_multiplier=1.0, merge_quality="standard",
+                              calibration_data=None, n_magnitude_samples=1000):
+        """
+        Pass 1 analysis for one resolved target group. All aliases that hit the
+        same underlying weight are aggregated per LoRA before statistics are
+        computed, so mixed-trainer overlaps are analyzed as one merge unit.
+        """
+        prepared = self._prepare_group_diffs(
+            target_group, active_loras, model, clip, device,
+            clip_strength_multiplier=clip_strength_multiplier,
+            merge_quality=merge_quality,
+        )
+        if prepared is None:
+            return None
+
+        diffs = prepared["diffs"]
+        eff_strengths = prepared["eff_strengths"]
+        rank_sums = prepared["rank_sums"]
+        skip_count = prepared["skip_count"]
+        target_key = prepared["target_key"]
+        is_clip = prepared["is_clip"]
+        raw_n = prepared["raw_n_loras"]
+
+        if len(diffs) == 0:
+            if skip_count > 0 or raw_n > 0:
+                return (
+                    target_group["label_prefix"], [], {}, [], (target_key, is_clip),
+                    skip_count, raw_n, {}, {}
+                )
+            return None
+
+        partial_stats = []
+        per_lora_norm_sq = {}
+        per_lora_activation_sq = {}
+        calibration_entry = self._resolve_calibration_entry(calibration_data, target_key)
+        bases = {}
+        for i, diff in diffs.items():
+            norm_sq = diff.float().square().sum().item()
+            activation_sq = self._compute_activation_importance(diff, calibration_entry)
+            per_lora_norm_sq[i] = norm_sq
+            per_lora_activation_sq[i] = activation_sq
+            display_l2 = math.sqrt(norm_sq) * abs(active_loras[i]["strength"])
+            partial_stats.append((i, rank_sums.get(i, 0), display_l2, norm_sq, activation_sq))
+            bases[i] = self._compute_subspace_basis(diff, rank_hint=rank_sums.get(i, 1))
+
+        pair_conflicts = {}
+        lora_indices = sorted(diffs.keys())
+        for ai in range(len(lora_indices)):
+            for bi in range(ai + 1, len(lora_indices)):
+                i, j = lora_indices[ai], lora_indices[bi]
+                diff_i = diffs[i] if eff_strengths[i] >= 0 else -diffs[i]
+                diff_j = diffs[j] if eff_strengths[j] >= 0 else -diffs[j]
+                pair_conflicts[(i, j)] = self._sample_pair_metrics(
+                    diff_i, diff_j, basis_a=bases.get(i), basis_b=bases.get(j),
+                    device=device
+                )
+
+        magnitude_samples = []
+        seed = hash(target_group["label_prefix"]) & 0xFFFFFFFF
+        sample_dev = diffs[lora_indices[0]].device
+        mag_g = torch.Generator(device=sample_dev).manual_seed(seed)
+        for i in lora_indices:
+            flat = diffs[i].flatten().abs().float() * abs(eff_strengths[i])
+            del diffs[i]
+            n = flat.numel()
+            if n > n_magnitude_samples:
+                indices = torch.randint(0, n, (n_magnitude_samples,),
+                                        device=sample_dev, generator=mag_g)
+                flat = flat[indices]
+            magnitude_samples.append(flat.cpu())
+
+        return (
+            target_group["label_prefix"],
+            partial_stats,
+            pair_conflicts,
+            magnitude_samples,
+            (target_key, is_clip),
+            skip_count,
+            raw_n,
+            per_lora_norm_sq,
+            per_lora_activation_sq,
+        )
+
+    def _run_group_analysis(self, target_groups, active_loras, model, clip,
+                            compute_device, clip_strength_multiplier=1.0,
+                            merge_quality="standard", calibration_data=None,
+                            decision_smoothing=0.0, progress_cb=None):
+        """
+        Shared Pass 1 runner used by both the optimizer and AutoTuner.
+        Returns the same lightweight accumulators both call sites need.
+        """
+        use_gpu = compute_device.type != "cpu"
+        per_lora_stats = [{
+            "name": item["name"],
+            "strength": item["strength"],
+            "ranks": [],
+            "key_count": 0,
+            "l2_norms": [],
+        } for item in active_loras]
+
+        pairs = [(i, j) for i in range(len(active_loras))
+                         for j in range(i + 1, len(active_loras))]
+        branch_energy = {
+            "model": {
+                "norm_sq": [0.0] * len(active_loras),
+                "dot": {(i, j): 0.0 for i, j in pairs},
+                "importance": [0.0] * len(active_loras),
+            },
+            "clip": {
+                "norm_sq": [0.0] * len(active_loras),
+                "dot": {(i, j): 0.0 for i, j in pairs},
+                "importance": [0.0] * len(active_loras),
+            },
+        }
+        pair_accum = {
+            (i, j): {
+                "overlap": 0,
+                "conflict": 0,
+                "dot": 0.0,
+                "norm_a_sq": 0.0,
+                "norm_b_sq": 0.0,
+                "weighted_total": 0.0,
+                "weighted_conflict": 0.0,
+                "expected_conflict_weighted": 0.0,
+                "excess_conflict_weighted": 0.0,
+                "subspace_num": 0.0,
+                "subspace_den": 0.0,
+            } for i, j in pairs
+        }
+        all_magnitude_samples = []
+        all_key_targets = {}
+        prefix_stats = {}
+        skipped_keys = 0
+        prefix_count = 0
+
+        def _collect_analysis_result(result):
+            nonlocal skipped_keys, prefix_count
+            if result is None:
+                return
+            (prefix, partial_stats, pair_conflicts, mag_samples, target_info, skips,
+             raw_n, per_lora_norm_sq, per_lora_activation_sq) = result
+            is_clip = target_info[1]
+            branch_name = "clip" if is_clip else "model"
+            skipped_keys += skips
+            if len(partial_stats) > 0:
+                all_key_targets[prefix] = target_info
+                prefix_count += 1
+            for (idx, rank, l2, norm_sq, activation_sq) in partial_stats:
+                per_lora_stats[idx]["ranks"].append(rank)
+                per_lora_stats[idx]["key_count"] += 1
+                per_lora_stats[idx]["l2_norms"].append(l2)
+                branch_energy[branch_name]["norm_sq"][idx] += norm_sq
+                branch_energy[branch_name]["importance"][idx] += activation_sq
+            for (i, j), metrics in pair_conflicts.items():
+                acc = pair_accum[(i, j)]
+                acc["overlap"] += metrics["overlap"]
+                acc["conflict"] += metrics["conflict"]
+                acc["dot"] += metrics["dot"]
+                acc["norm_a_sq"] += metrics["norm_a_sq"]
+                acc["norm_b_sq"] += metrics["norm_b_sq"]
+                acc["weighted_total"] += metrics["weighted_total"]
+                acc["weighted_conflict"] += metrics["weighted_conflict"]
+                acc["expected_conflict_weighted"] += metrics["expected_conflict"] * metrics["weighted_total"]
+                acc["excess_conflict_weighted"] += metrics["excess_conflict"] * metrics["weighted_total"]
+                acc["subspace_num"] += metrics["subspace_overlap"] * metrics["subspace_weight"]
+                acc["subspace_den"] += metrics["subspace_weight"]
+                branch_energy[branch_name]["dot"][(i, j)] += metrics["dot"]
+            all_magnitude_samples.extend(mag_samples)
+
+            if len(partial_stats) > 0:
+                pf_overlap = sum(m["overlap"] for m in pair_conflicts.values())
+                pf_conflict = sum(m["conflict"] for m in pair_conflicts.values())
+                pf_conflict_ratio = pf_conflict / pf_overlap if pf_overlap > 0 else 0.0
+                pf_weighted_total = sum(m["weighted_total"] for m in pair_conflicts.values())
+                pf_weighted_conflict = sum(m["weighted_conflict"] for m in pair_conflicts.values())
+                pf_weighted_ratio = (pf_weighted_conflict / pf_weighted_total) if pf_weighted_total > 0 else pf_conflict_ratio
+                pf_expected_conflict = (
+                    sum(m["expected_conflict"] * m["weighted_total"] for m in pair_conflicts.values()) / pf_weighted_total
+                ) if pf_weighted_total > 0 else 0.0
+                pf_excess_conflict = (
+                    sum(m["excess_conflict"] * m["weighted_total"] for m in pair_conflicts.values()) / pf_weighted_total
+                ) if pf_weighted_total > 0 else 0.0
+
+                pf_l2s = [math.sqrt(v) for v in per_lora_norm_sq.values() if v > 0]
+                pf_mag_ratio = (max(pf_l2s) / min(pf_l2s)) if len(pf_l2s) >= 2 else 1.0
+                pf_activation_vals = [v for v in per_lora_activation_sq.values() if v > 0]
+                pf_activation_ratio = (max(pf_activation_vals) / min(pf_activation_vals)) if len(pf_activation_vals) >= 2 else pf_mag_ratio
+
+                pf_cos_sims = []
+                for metrics in pair_conflicts.values():
+                    denom = (metrics["norm_a_sq"] ** 0.5) * (metrics["norm_b_sq"] ** 0.5)
+                    if denom > 0:
+                        pf_cos_sims.append(metrics["dot"] / denom)
+                avg_cos_sim = sum(pf_cos_sims) / len(pf_cos_sims) if pf_cos_sims else 0.0
+                pf_subspace_den = sum(m["subspace_weight"] for m in pair_conflicts.values())
+                avg_subspace_overlap = (
+                    sum(m["subspace_overlap"] * m["subspace_weight"] for m in pair_conflicts.values()) / pf_subspace_den
+                ) if pf_subspace_den > 0 else 0.0
+
+                prefix_stats[prefix] = {
+                    "n_loras": len(partial_stats),
+                    "raw_n_loras": raw_n,
+                    "conflict_ratio": pf_conflict_ratio,
+                    "weighted_conflict_ratio": pf_weighted_ratio,
+                    "expected_conflict": pf_expected_conflict,
+                    "excess_conflict": pf_excess_conflict,
+                    "magnitude_ratio": pf_mag_ratio,
+                    "activation_ratio": pf_activation_ratio,
+                    "magnitude_samples": list(mag_samples),
+                    "avg_cos_sim": avg_cos_sim,
+                    "avg_subspace_overlap": avg_subspace_overlap,
+                    "per_lora_norm_sq": dict(per_lora_norm_sq),
+                    "per_lora_activation_sq": dict(per_lora_activation_sq),
+                    "pairwise_dots": {
+                        pair: vals["dot"] for pair, vals in pair_conflicts.items()
+                    },
+                }
+
+        group_items = list(target_groups.values())
+        if use_gpu:
+            for target_group in group_items:
+                result = self._analyze_target_group(
+                    target_group, active_loras, model, clip, compute_device,
+                    clip_strength_multiplier=clip_strength_multiplier,
+                    merge_quality=merge_quality,
+                    calibration_data=calibration_data,
+                )
+                _collect_analysis_result(result)
+                if progress_cb is not None:
+                    progress_cb()
+        else:
+            max_workers = min(4, max(1, len(group_items)))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._analyze_target_group, target_group, active_loras,
+                        model, clip, compute_device, clip_strength_multiplier,
+                        merge_quality, calibration_data
+                    ): target_group["label_prefix"]
+                    for target_group in group_items
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    _collect_analysis_result(future.result())
+                    if progress_cb is not None:
+                        progress_cb()
+
+        prefix_stats = self._apply_block_smoothing(prefix_stats, strength=decision_smoothing)
+
+        return {
+            "all_key_targets": all_key_targets,
+            "target_groups": dict(target_groups),
+            "prefix_stats": prefix_stats,
+            "per_lora_stats": per_lora_stats,
+            "pair_accum": pair_accum,
+            "branch_energy": branch_energy,
+            "all_magnitude_samples": all_magnitude_samples,
+            "prefix_count": prefix_count,
+            "skipped_keys": skipped_keys,
+            "pairs": pairs,
+        }
+
     def _estimate_density(self, all_key_diffs, arch_preset=None):
         """
         Estimate TIES density parameter from magnitude distribution.
@@ -3334,116 +4227,68 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         return max(arch_preset["density_clamp_min"], min(arch_preset["density_clamp_max"], above_noise))
 
-    def _compute_auto_strengths(self, active_loras, lora_stats, pairwise_similarities=None, arch_preset=None, detected_arch=None, auto_strength_floor=-1.0, is_full_rank=False):
-        """
-        Compute reduced per-LoRA strengths using interference-aware energy
-        normalization. Uses pairwise cosine similarity to account for
-        directional alignment between LoRAs:
-        - Aligned LoRAs (cos≈1) → more aggressive scaling (they reinforce)
-        - Orthogonal LoRAs (cos≈0) → same as classic L2 norm
-        - Opposing LoRAs (cos≈-1) → less scaling (they cancel out)
-
-        Returns (new_strengths, reasoning_lines) where new_strengths is a list
-        of floats (one per active LoRA) and reasoning_lines is a list of strings.
-        """
+    def _compute_branch_auto_scale(self, branch_name, strengths, norm_sq, dot_accum,
+                                   arch_preset=None, detected_arch=None,
+                                   auto_strength_floor=-1.0, is_full_rank=False):
+        """Exact streamed auto-strength scale for one branch."""
         if arch_preset is None:
             arch_preset = _ARCH_PRESETS["sd_unet"]
-        n = len(active_loras)
-        original_strengths = [item["strength"] for item in active_loras]
-        reasoning = []
-
-        # Compute raw (un-strength-weighted) L2 norms per LoRA
-        raw_l2 = []
-        for i, stat in enumerate(lora_stats):
-            s = abs(original_strengths[i])
-            l2 = stat["l2_mean"]
-            if s > 0 and l2 > 0:
-                raw_l2.append(l2 / s)
-            else:
-                raw_l2.append(0.0)
-
-        # Effective contribution: abs(strength) * raw_l2 = l2_mean (the roundtrip
-        # cancels out), but keeping the decomposition clarifies intent: raw_l2 is
-        # intrinsic LoRA magnitude, strength is the user-set scaling.
-        effective = [abs(original_strengths[i]) * raw_l2[i] for i in range(n)]
-
-        # Filter out zero contributions
+        n = len(strengths)
+        effective = [abs(strengths[i]) * math.sqrt(max(norm_sq[i], 0.0)) for i in range(n)]
         nonzero = [e for e in effective if e > 0]
+        reasoning = []
         if len(nonzero) <= 1:
-            # 0 or 1 contributing LoRAs: no reduction needed
-            reasoning.append("Single contributing LoRA or none — no strength adjustment needed")
-            return (list(original_strengths), reasoning)
+            reasoning.append(f"{branch_name}: single contributing branch or none — no adjustment needed")
+            return {
+                "scale": 1.0,
+                "new_strengths": list(strengths),
+                "reasoning": reasoning,
+            }
 
-        # Interference-aware combined energy using the vector-sum formula:
-        #   ||sum(v_i)||^2 = sum(||v_i||^2) + 2 * sum_{i<j}(||v_i|| * ||v_j|| * cos(v_i, v_j))
-        # This is the exact squared magnitude of the sum of vectors given their
-        # pairwise angles. When cos=0 (orthogonal), reduces to sum of squares.
-        energy_sq = sum(e * e for e in effective)
-        orthogonal_energy_sq = energy_sq  # save for reporting
+        energy_sq = 0.0
+        orthogonal_energy_sq = 0.0
+        pairwise_cos = []
+        for i in range(n):
+            energy_sq += (strengths[i] ** 2) * norm_sq[i]
+            orthogonal_energy_sq += (strengths[i] ** 2) * norm_sq[i]
+        for (i, j), dot in dot_accum.items():
+            if norm_sq[i] <= 0 or norm_sq[j] <= 0:
+                continue
+            energy_sq += 2.0 * strengths[i] * strengths[j] * dot
+            denom = math.sqrt(norm_sq[i]) * math.sqrt(norm_sq[j])
+            if denom > 0:
+                pairwise_cos.append(dot / denom)
 
-        if pairwise_similarities:
-            for (i, j), cos_sim in pairwise_similarities.items():
-                if effective[i] > 0 and effective[j] > 0:
-                    energy_sq += 2.0 * effective[i] * effective[j] * cos_sim
-
-        # Clamp to avoid sqrt of negative (possible if strong opposing LoRAs)
         energy_sq = max(energy_sq, 0.0)
         current_energy = math.sqrt(energy_sq)
-
-        # Reference energy: what the strongest single LoRA contributes alone
+        orthogonal_energy = math.sqrt(max(orthogonal_energy_sq, 0.0))
         reference_energy = max(effective)
+        scale = min(reference_energy / current_energy, 1.0) if current_energy > 0 else 1.0
 
-        # Scale factor — capped at 1.0 to prevent amplification.
-        # For opposing LoRAs (negative cos_sim), energy_sq shrinks and scale
-        # would exceed 1.0 (e.g. 1.58x at cos_sim=-0.8), boosting both LoRAs
-        # instead of letting them naturally attenuate each other.
-        if current_energy > 0:
-            scale = min(reference_energy / current_energy, 1.0)
-        else:
-            scale = 1.0
-
-        # Architecture-aware orthogonal floor: when LoRAs are orthogonal
-        # (independent), video models should preserve full energy because
-        # orthogonal video LoRAs teach independent motions.  Image models
-        # get a modest floor to prevent over-reduction while still dampening.
         floor_applied = False
-        if pairwise_similarities:
-            avg_cos = sum(pairwise_similarities.values()) / len(pairwise_similarities)
+        floor = None
+        if pairwise_cos:
+            avg_cos = sum(pairwise_cos) / len(pairwise_cos)
             alignment_thresh = arch_preset["alignment_threshold"]
             if abs(avg_cos) <= alignment_thresh:
                 if auto_strength_floor >= 0:
                     floor = auto_strength_floor
                 elif is_full_rank:
-                    # Full-rank patches already represent the complete weight delta;
-                    # scaling them down loses information.
                     floor = arch_preset.get("full_rank", {}).get("auto_strength_floor", 1.0)
                 else:
                     floor = _VIDEO_ARCH_ORTHOGONAL_FLOOR.get(
                         detected_arch,
-                        arch_preset.get("auto_strength_orthogonal_floor", 0.85))
+                        arch_preset.get("auto_strength_orthogonal_floor", 0.85),
+                    )
                 if scale < floor:
                     scale = floor
                     floor_applied = True
 
-        # Apply scale to all strengths
-        new_strengths = []
-        for i in range(n):
-            if effective[i] > 0:
-                new_strengths.append(original_strengths[i] * scale)
-            else:
-                new_strengths.append(original_strengths[i])
+        new_strengths = [s * scale if effective[i] > 0 else s for i, s in enumerate(strengths)]
 
-        # Build reasoning
-        reasoning.append(f"Scale factor: {scale:.4f}")
-        if floor_applied:
-            arch_label = detected_arch or "unknown"
-            if is_full_rank:
-                reasoning.append(f"  (full-rank orthogonal floor {floor:.2f} applied — preserving complete weight deltas)")
-            else:
-                reasoning.append(f"  (orthogonal floor {floor:.2f} applied for {arch_label} — preserving independent contributions)")
-        if pairwise_similarities:
-            avg_cos = sum(pairwise_similarities.values()) / len(pairwise_similarities)
-            orthogonal_energy = math.sqrt(orthogonal_energy_sq)
+        reasoning.append(f"{branch_name}: scale factor {scale:.4f}")
+        if pairwise_cos:
+            avg_cos = sum(pairwise_cos) / len(pairwise_cos)
             alignment_thresh = arch_preset["alignment_threshold"]
             if avg_cos > alignment_thresh:
                 alignment_desc = "mostly aligned (reinforcing)"
@@ -3451,18 +4296,165 @@ class LoRAOptimizer(_LoRAMergeBase):
                 alignment_desc = "mostly opposing (cancelling)"
             else:
                 alignment_desc = "mostly orthogonal (independent)"
-            reasoning.append(f"Method: interference-aware energy normalization")
-            reasoning.append(f"  Avg pairwise cosine similarity: {avg_cos:.3f} ({alignment_desc})")
-            reasoning.append(f"  Interference-aware energy: {current_energy:.4f} (orthogonal assumption: {orthogonal_energy:.4f})")
-        else:
-            reasoning.append("Method: L2-aware energy normalization (no similarity data)")
-        for i in range(n):
-            if effective[i] > 0 and abs(scale - 1.0) > 1e-9:
-                reasoning.append(f"  {active_loras[i]['name']}: {original_strengths[i]} -> {new_strengths[i]:.4f}")
-            else:
-                reasoning.append(f"  {active_loras[i]['name']}: {original_strengths[i]} (unchanged)")
+            if floor_applied:
+                arch_label = detected_arch or "unknown"
+                if is_full_rank:
+                    reasoning.append(
+                        f"{branch_name}: full-rank orthogonal floor {floor:.2f} applied "
+                        f"to preserve complete weight deltas"
+                    )
+                else:
+                    reasoning.append(
+                        f"{branch_name}: orthogonal floor {floor:.2f} applied for {arch_label} "
+                        f"to preserve independent contributions"
+                    )
+            reasoning.append(
+                f"{branch_name}: exact streamed energy {current_energy:.4f} "
+                f"(orthogonal baseline {orthogonal_energy:.4f}, avg cos {avg_cos:.3f} — {alignment_desc})"
+            )
+        return {
+            "scale": scale,
+            "new_strengths": new_strengths,
+            "reasoning": reasoning,
+        }
 
-        return (new_strengths, reasoning)
+    def _compute_auto_strengths(self, active_loras, branch_energy,
+                                clip_strength_multiplier=1.0, arch_preset=None,
+                                detected_arch=None, auto_strength_floor=-1.0,
+                                is_full_rank=False):
+        """
+        Compute exact streamed auto-strength scaling separately for model and
+        CLIP branches, using accumulated Frobenius norms and pairwise dots.
+        """
+        if arch_preset is None:
+            arch_preset = _ARCH_PRESETS["sd_unet"]
+
+        model_strengths = [item["strength"] for item in active_loras]
+        clip_strengths = [
+            item["clip_strength"] if item["clip_strength"] is not None else item["strength"]
+            for item in active_loras
+        ]
+
+        model_info = self._compute_branch_auto_scale(
+            "Model",
+            model_strengths,
+            branch_energy["model"]["norm_sq"],
+            branch_energy["model"]["dot"],
+            arch_preset=arch_preset,
+            detected_arch=detected_arch,
+            auto_strength_floor=auto_strength_floor,
+            is_full_rank=is_full_rank,
+        )
+        clip_info = self._compute_branch_auto_scale(
+            "CLIP",
+            clip_strengths,
+            branch_energy["clip"]["norm_sq"],
+            branch_energy["clip"]["dot"],
+            arch_preset=arch_preset,
+            detected_arch=detected_arch,
+            auto_strength_floor=auto_strength_floor,
+            is_full_rank=is_full_rank,
+        )
+
+        reasoning = []
+        reasoning.extend(model_info["reasoning"])
+        if any(v > 0 for v in branch_energy["clip"]["norm_sq"]):
+            reasoning.extend(clip_info["reasoning"])
+
+        return {
+            "model_scale": model_info["scale"],
+            "clip_scale": clip_info["scale"],
+            "model_strengths": model_info["new_strengths"],
+            "clip_strengths": clip_info["new_strengths"],
+            "original_model_strengths": model_strengths,
+            "original_clip_strengths": clip_strengths,
+            "names": [item["name"] for item in active_loras],
+            "clip_uses_global_multiplier": [
+                item["clip_strength"] is None for item in active_loras
+            ],
+            "clip_strength_multiplier": clip_strength_multiplier,
+            "reasoning": reasoning,
+        }
+
+    def _build_exact_linear_patch(self, target_group, active_loras, raw_n_loras,
+                                  mode, is_clip_key=False, model_scale=1.0):
+        """
+        Build an exact low-rank patch for linear merges by concatenating factors
+        instead of materializing a dense diff. Falls back to None when the group
+        contains unsupported parameterizations (for example LoCon mid matrices).
+        """
+        if mode not in ("weighted_sum", "weighted_average", "normalize"):
+            return None
+
+        pieces = []
+        lora_weights = {}
+        has_conflict_modes = False
+
+        for i, item in enumerate(active_loras):
+            kf = item.get("key_filter", "all")
+            if kf == "shared_only" and raw_n_loras < 2:
+                continue
+            if kf == "unique_only" and raw_n_loras != 1:
+                continue
+            if item.get("conflict_mode", "all") != "all":
+                has_conflict_modes = True
+                break
+
+            if is_clip_key:
+                base_weight = item["clip_strength"] if item["clip_strength"] is not None else item["strength"]
+            else:
+                base_weight = item["strength"] * model_scale
+
+            contributed = False
+            for alias in target_group["aliases"]:
+                lora_info = self._get_lora_key_info(item["lora"], alias)
+                if lora_info is None:
+                    continue
+                mat_up, mat_down, alpha, mid = lora_info
+                if mid is not None:
+                    return None
+                pieces.append((i, mat_up, mat_down, alpha))
+                contributed = True
+
+            if contributed:
+                lora_weights[i] = base_weight
+
+        if has_conflict_modes or not pieces:
+            return None
+
+        if mode == "weighted_average":
+            total_weight = sum(abs(w) for w in lora_weights.values())
+            if total_weight == 0:
+                return None
+            per_lora_scales = {idx: w / total_weight for idx, w in lora_weights.items()}
+        elif mode == "normalize":
+            denom = math.sqrt(sum(w * w for w in lora_weights.values()))
+            if denom == 0:
+                return None
+            per_lora_scales = {idx: w / denom for idx, w in lora_weights.items()}
+        else:
+            per_lora_scales = dict(lora_weights)
+
+        up_parts = []
+        down_parts = []
+        total_rank = 0
+        for lora_idx, mat_up, mat_down, alpha in pieces:
+            weight = per_lora_scales[lora_idx]
+            rank = mat_down.shape[0]
+            total_rank += rank
+            piece_scale = weight * (alpha / rank)
+            up_parts.append(mat_up * piece_scale)
+            down_parts.append(mat_down)
+
+        if total_rank <= 0:
+            return None
+
+        fused_up = torch.cat(up_parts, dim=1)
+        fused_down = torch.cat(down_parts, dim=0)
+        return {
+            "patch": LoRAAdapter(set(), (fused_up, fused_down, float(total_rank), None, None, None)),
+            "weights": per_lora_scales,
+        }
 
     @staticmethod
     def _extract_block_name(prefix):
@@ -3509,7 +4501,73 @@ class LoRAOptimizer(_LoRAMergeBase):
             return meaningful[0]
         return prefix[:30]
 
-    def _auto_select_params(self, avg_conflict_ratio, magnitude_ratio, all_key_diffs=None, magnitude_samples=None, avg_cos_sim=0.0, behavior_profile="v1.2", arch_preset=None, precomputed_density=None):
+    def _apply_block_smoothing(self, prefix_stats, strength=0.0):
+        """
+        Smooth noisy per-group decision metrics toward the average of their
+        surrounding logical block. Raw metrics are preserved; decision_* fields
+        are what Pass 2 should consume.
+        """
+        if not prefix_stats:
+            return prefix_stats
+
+        strength = max(0.0, min(1.0, float(strength or 0.0)))
+        block_groups = {}
+        for prefix, stat in prefix_stats.items():
+            block_name = self._extract_block_name(prefix)
+            stat["block_name"] = block_name
+            block_groups.setdefault(block_name, []).append((prefix, stat))
+
+        metric_keys = (
+            "conflict_ratio",
+            "weighted_conflict_ratio",
+            "expected_conflict",
+            "excess_conflict",
+            "avg_cos_sim",
+            "avg_subspace_overlap",
+            "magnitude_ratio",
+            "activation_ratio",
+        )
+
+        for entries in block_groups.values():
+            if not entries:
+                continue
+
+            weights = []
+            for _prefix, stat in entries:
+                weight = sum(stat.get("per_lora_activation_sq", {}).values())
+                if weight <= 0:
+                    weight = sum(stat.get("per_lora_norm_sq", {}).values())
+                weights.append(weight if weight > 0 else 1.0)
+
+            total_weight = sum(weights) if weights else 0.0
+            block_means = {}
+            for key in metric_keys:
+                values = [stat.get(key) for _prefix, stat in entries if stat.get(key) is not None]
+                if not values:
+                    continue
+                weighted_sum = 0.0
+                for weight, (_prefix, stat) in zip(weights, entries):
+                    weighted_sum += stat.get(key, 0.0) * weight
+                block_means[key] = weighted_sum / total_weight if total_weight > 0 else sum(values) / len(values)
+
+            for prefix, stat in entries:
+                stat["block_size"] = len(entries)
+                stat["block_smoothing_strength"] = strength
+                for key, mean_value in block_means.items():
+                    raw_value = stat.get(key, mean_value)
+                    smoothed = raw_value if strength <= 0 or len(entries) == 1 else ((1.0 - strength) * raw_value + strength * mean_value)
+                    stat[f"smoothed_{key}"] = smoothed
+                stat["decision_conflict"] = stat.get("smoothed_excess_conflict", stat.get("excess_conflict", stat.get("conflict_ratio", 0.0)))
+                stat["decision_cosine"] = stat.get("smoothed_avg_cos_sim", stat.get("avg_cos_sim", 0.0))
+                stat["decision_subspace_overlap"] = stat.get("smoothed_avg_subspace_overlap", stat.get("avg_subspace_overlap", 0.0))
+                stat["decision_magnitude_ratio"] = stat.get("smoothed_activation_ratio", stat.get("activation_ratio", stat.get("magnitude_ratio", 1.0)))
+        return prefix_stats
+
+    def _auto_select_params(self, avg_conflict_ratio, magnitude_ratio, all_key_diffs=None,
+                            magnitude_samples=None, avg_cos_sim=0.0,
+                            avg_excess_conflict=None, avg_subspace_overlap=0.0,
+                            behavior_profile="v1.2", arch_preset=None,
+                            precomputed_density=None):
         """
         Decision logic for auto-selecting merge parameters.
         Returns (mode, density, sign_method, reasoning_lines).
@@ -3521,13 +4579,20 @@ class LoRAOptimizer(_LoRAMergeBase):
             arch_preset = _ARCH_PRESETS["sd_unet"]
         reasoning = []
 
+        effective_conflict = avg_conflict_ratio
+        if avg_excess_conflict is not None:
+            effective_conflict = max(avg_excess_conflict, 0.0)
+            if avg_subspace_overlap > 0:
+                effective_conflict *= (0.5 + 0.5 * avg_subspace_overlap)
+
         # High similarity + low conflict → consensus mode (Fisher-proxy + magnitude calibration)
         if (behavior_profile == "v1.2"
                 and avg_cos_sim > arch_preset["consensus_cos_sim_min"]
-                and avg_conflict_ratio < arch_preset["consensus_conflict_max"]):
+                and effective_conflict < arch_preset["consensus_conflict_max"]
+                and avg_subspace_overlap >= 0.35):
             mode = "consensus"
             reasoning.append(f"Cosine similarity {avg_cos_sim:.2f} > {arch_preset['consensus_cos_sim_min']} "
-                             f"and conflict {avg_conflict_ratio:.1%} < {arch_preset['consensus_conflict_max']:.0%} -> consensus mode")
+                             f"and excess conflict {effective_conflict:.1%} < {arch_preset['consensus_conflict_max']:.0%} -> consensus mode")
             reasoning.append("  Fisher-proxy importance weighting + magnitude calibration + spectral cleanup")
             density = 0.5  # unused
             sign_method = "frequency"  # unused
@@ -3535,17 +4600,19 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         # Near-orthogonal LoRAs: ~50% sign conflict is the base rate for
         # independent vectors, not actual semantic conflict. TIES trimming
-        # destroys both signals. Use weighted_average as the global mode,
-        # upgraded to SLERP per-prefix to preserve magnitude (important for
-        # video LoRAs where motion energy matters).
+        # destroys both signals. Use weighted_average which divides by N,
+        # naturally reducing per-LoRA influence. NOT upgraded to SLERP:
+        # SLERP's norm correction preserves magnitude, giving ~1.6x more
+        # energy than weighted_average for 3 orthogonal vectors ("burned" look).
         if (behavior_profile in ("v1.2", "no_slerp")
                 and abs(avg_cos_sim) < arch_preset["orthogonal_cos_sim_max"]
-                and avg_conflict_ratio < arch_preset["orthogonal_conflict_max"]):
+                and effective_conflict < arch_preset["orthogonal_conflict_max"]
+                and avg_subspace_overlap < 0.35):
             mode = "weighted_average"
             reasoning.append(f"Cosine similarity {avg_cos_sim:.2f} near zero (orthogonal LoRAs) — "
-                             f"sign conflict {avg_conflict_ratio:.1%} is base-rate noise, not real conflict")
+                             f"excess conflict {effective_conflict:.1%} and subspace overlap {avg_subspace_overlap:.2f} indicate mostly independent updates")
             if behavior_profile == "v1.2":
-                reasoning.append("  Using weighted_average (upgraded to SLERP per-prefix to preserve magnitude)")
+                reasoning.append("  Using weighted_average to preserve both signals (no SLERP upgrade — orthogonal vectors need magnitude reduction)")
             else:
                 reasoning.append("  Using weighted_average to preserve both signals (SLERP upgrade disabled by profile)")
             density = 0.5
@@ -3553,13 +4620,15 @@ class LoRAOptimizer(_LoRAMergeBase):
             return (mode, density, sign_method, reasoning)
 
         # Select mode based on sign conflict
-        if avg_conflict_ratio > arch_preset["ties_conflict_threshold"]:
+        if effective_conflict > arch_preset["ties_conflict_threshold"]:
             mode = "ties"
-            reasoning.append(f"Sign conflict ratio {avg_conflict_ratio:.1%} > {arch_preset['ties_conflict_threshold']:.0%} threshold -> TIES mode selected")
+            reasoning.append(f"Excess conflict {effective_conflict:.1%} > {arch_preset['ties_conflict_threshold']:.0%} threshold -> TIES mode selected")
+            if avg_subspace_overlap > 0:
+                reasoning.append(f"  Subspace overlap {avg_subspace_overlap:.2f} suggests the conflicting LoRAs target similar directions")
             reasoning.append("  TIES resolves sign conflicts via trim + elect sign + disjoint merge")
         else:
             mode = "weighted_average"
-            reasoning.append(f"Sign conflict ratio {avg_conflict_ratio:.1%} <= {arch_preset['ties_conflict_threshold']:.0%} threshold -> weighted_average mode selected")
+            reasoning.append(f"Excess conflict {effective_conflict:.1%} <= {arch_preset['ties_conflict_threshold']:.0%} threshold -> weighted_average mode selected")
             reasoning.append("  Low conflict means LoRAs are mostly compatible, simple averaging works well")
 
         # Auto-density (TIES only)
@@ -3600,8 +4669,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                       merge_quality="standard",
                       compatibility_warnings=None,
                       behavior_profile="v1.2",
-                      architecture_preset=None,
-                      is_full_rank=False):
+                      architecture_preset=None):
         """Format analysis as a multi-line report string."""
         lines = []
         lines.append("=" * 50)
@@ -3631,19 +4699,13 @@ class LoRAOptimizer(_LoRAMergeBase):
                 'zimage': 'Z-Image Turbo (Lumina2)',
                 'flux': 'FLUX',
                 'wan': 'Wan 2.1/2.2',
+                'acestep': 'ACE-Step',
                 'sdxl': 'SDXL',
                 'ltx': 'LTX Video',
                 'qwen_image': 'Qwen-Image',
             }
             lines.append(f"Architecture: {arch_names.get(detected_arch, detected_arch)} (auto-detected)")
             lines.append(f"Key normalization: enabled")
-            lines.append("")
-
-        if is_full_rank:
-            global_avg_rank = (sum(s["avg_rank"] for s in lora_stats) / len(lora_stats)) if lora_stats else 0
-            lines.append("Full-rank LoRAs detected (avg rank {:.0f})".format(global_avg_rank))
-            lines.append("  Using full-rank merge path: SLERP upgrade disabled,")
-            lines.append("  orthogonal patches use weighted_sum, auto-strength floor raised")
             lines.append("")
 
         if compatibility_warnings:
@@ -3678,9 +4740,16 @@ class LoRAOptimizer(_LoRAMergeBase):
             lines.append("")
             lines.append("--- Auto-Strength Adjustment ---")
             for i, name in enumerate(auto_strength_info["names"]):
-                orig = auto_strength_info["original_strengths"][i]
-                new = auto_strength_info["new_strengths"][i]
-                lines.append(f"  {name}: {orig} -> {new:.4f}")
+                orig = auto_strength_info["original_model_strengths"][i]
+                new = auto_strength_info["model_strengths"][i]
+                line = f"  {name}: model {orig} -> {new:.4f}"
+                if i < len(auto_strength_info.get("original_clip_strengths", [])):
+                    clip_orig = auto_strength_info["original_clip_strengths"][i]
+                    clip_new = auto_strength_info["clip_strengths"][i]
+                    line += f", clip {clip_orig} -> {clip_new:.4f}"
+                    if auto_strength_info.get("clip_uses_global_multiplier", [False] * len(auto_strength_info["names"]))[i]:
+                        line += " (pre-global multiplier)"
+                lines.append(line)
             for r in auto_strength_info["reasoning"]:
                 lines.append(f"  {r}")
 
@@ -3692,16 +4761,31 @@ class LoRAOptimizer(_LoRAMergeBase):
                 lines.append(f"  {pc['pair']}:")
                 lines.append(f"    Overlapping positions: {pc['overlap']}")
                 lines.append(f"    Sign conflicts: {pc['conflicts']} ({pc['ratio']:.1%})")
+                if 'weighted_ratio' in pc:
+                    lines.append(f"    Magnitude-weighted conflict: {pc['weighted_ratio']:.1%}")
+                if 'expected_conflict' in pc:
+                    lines.append(f"    Excess conflict over cosine baseline: {pc.get('excess_conflict', 0.0):.1%} (expected {pc['expected_conflict']:.1%})")
                 if 'cosine_sim' in pc:
                     lines.append(f"    Cosine similarity: {pc['cosine_sim']:.3f}")
+                if 'subspace_overlap' in pc:
+                    lines.append(f"    Subspace overlap: {pc['subspace_overlap']:.2f}")
 
         # Collection Statistics
         lines.append("")
         lines.append("--- Collection Statistics ---")
         lines.append(f"  Total LoRAs: {collection_stats['n_loras']}")
-        lines.append(f"  Total unique keys: {collection_stats['total_keys']}")
+        lines.append(f"  Total target groups: {collection_stats['total_keys']}")
         lines.append(f"  Avg sign conflict ratio: {collection_stats['avg_conflict']:.1%}")
-        lines.append(f"  Magnitude ratio (max/min L2): {collection_stats['magnitude_ratio']:.2f}x")
+        if "avg_weighted_conflict" in collection_stats:
+            lines.append(f"  Avg weighted conflict ratio: {collection_stats['avg_weighted_conflict']:.1%}")
+        if "avg_excess_conflict" in collection_stats:
+            lines.append(f"  Avg excess conflict: {collection_stats['avg_excess_conflict']:.1%}")
+        if "avg_subspace_overlap" in collection_stats:
+            lines.append(f"  Avg subspace overlap: {collection_stats['avg_subspace_overlap']:.2f}")
+        importance_mode = collection_stats.get("importance_mode", "frobenius")
+        lines.append(f"  Importance ratio (max/min {importance_mode}): {collection_stats['magnitude_ratio']:.2f}x")
+        if collection_stats.get("decision_smoothing", 0.0) > 0:
+            lines.append(f"  Decision smoothing: {collection_stats['decision_smoothing']:.2f}")
 
         # Auto-Selected Parameters
         lines.append("")
@@ -3715,7 +4799,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             lines.append(f"  Density: {density:.2f}")
             lines.append(f"  Sign method: {sign_method}")
         if optimization_mode == "per_prefix":
-            lines.append("  (global fallback — each prefix uses its own parameters)")
+            lines.append("  (global fallback — each target group uses its own parameters)")
         if sparsification != "disabled":
             display_name = {
                 "dare": "DARE", "della": "DELLA",
@@ -3753,25 +4837,25 @@ class LoRAOptimizer(_LoRAMergeBase):
         # Per-Prefix Strategy breakdown (only in per_prefix mode)
         if optimization_mode == "per_prefix" and strategy_counts:
             lines.append("")
-            lines.append("--- Per-Prefix Strategy ---")
+            lines.append("--- Per-Group Strategy ---")
             total_pf = sum(strategy_counts.values())
             if total_pf > 0:
                 if strategy_counts.get("weighted_sum", 0) > 0:
                     n = strategy_counts["weighted_sum"]
-                    lines.append(f"  weighted_sum (single LoRA):      {n:>4} prefixes ({n/total_pf:.0%})")
+                    lines.append(f"  weighted_sum (single LoRA):      {n:>4} groups ({n/total_pf:.0%})")
                 if strategy_counts.get("slerp", 0) > 0:
                     n = strategy_counts["slerp"]
-                    lines.append(f"  slerp (low conflict):            {n:>4} prefixes ({n/total_pf:.0%})")
+                    lines.append(f"  slerp (low conflict):            {n:>4} groups ({n/total_pf:.0%})")
                 if strategy_counts.get("weighted_average", 0) > 0:
                     n = strategy_counts["weighted_average"]
-                    lines.append(f"  weighted_average (orthogonal):    {n:>4} prefixes ({n/total_pf:.0%})")
+                    lines.append(f"  weighted_average (orthogonal):    {n:>4} groups ({n/total_pf:.0%})")
                 if strategy_counts.get("consensus", 0) > 0:
                     n = strategy_counts["consensus"]
-                    lines.append(f"  consensus (high similarity):     {n:>4} prefixes ({n/total_pf:.0%})")
+                    lines.append(f"  consensus (high similarity):     {n:>4} groups ({n/total_pf:.0%})")
                 if strategy_counts.get("ties", 0) > 0:
                     n = strategy_counts["ties"]
-                    lines.append(f"  ties (high conflict):            {n:>4} prefixes ({n/total_pf:.0%})")
-                lines.append(f"  Total:                           {total_pf:>4} prefixes")
+                    lines.append(f"  ties (high conflict):            {n:>4} groups ({n/total_pf:.0%})")
+                lines.append(f"  Total:                           {total_pf:>4} groups")
 
         # Block Strategy Map (per_prefix mode only)
         if optimization_mode == "per_prefix" and prefix_decisions:
@@ -3868,25 +4952,27 @@ class LoRAOptimizer(_LoRAMergeBase):
                      compress_patches="non_ties", svd_device="gpu",
                      normalize_keys="enabled", sparsification="disabled",
                      sparsification_density=0.7, dare_dampening=0.0,
-                     merge_strategy_override="", merge_quality="standard",
-                     behavior_profile="v1.2", architecture_preset="auto",
-                     tuner_data=None, settings_source="manual"):
+                     merge_quality="standard", behavior_profile="v1.2",
+                     architecture_preset="auto", merge_strategy_override="",
+                     tuner_data=None, settings_source="manual",
+                     decision_smoothing=0.25, calibration_data=None):
         """
-        ComfyUI entry point. Routes between passthrough and merge modes:
-        - from_autotuner: passthrough (model already merged by AutoTuner upstream),
-          sync widgets from tuner_data
-        - manual: merge using widget settings (AutoTuner upstream in tuning_only
-          mode passes the base model through)
+        ComfyUI entry point. Supports an AutoTuner bridge mode:
+        - from_autotuner: passthrough, using the upstream AutoTuner merge and
+          syncing the optimizer widgets from tuner_data for manual refinement.
+        - manual: run the optimizer normally using the current widget values.
         """
-        # --- from_autotuner: passthrough mode ---
         if settings_source == "from_autotuner":
             if tuner_data is None or "top_n" not in tuner_data or len(tuner_data["top_n"]) == 0:
                 logging.warning("[AutoTuner Bridge] No valid tuner_data — falling back to manual merge")
             else:
-                config = tuner_data["top_n"][0]["config"]
                 entry = tuner_data["top_n"][0]
-                score = entry.get("score_measured", entry.get("score_heuristic", 0))
-                mode_display = ("per-prefix (auto)" if config["optimization_mode"] == "per_prefix"
+                config = entry["config"]
+                applied_config = dict(config)
+                if "auto_strength_floor" in tuner_data:
+                    applied_config["auto_strength_floor"] = tuner_data["auto_strength_floor"]
+                score = entry.get("score_final", entry.get("score_measured", entry.get("score_heuristic", 0.0)))
+                mode_display = ("per-group (auto)" if config["optimization_mode"] == "per_prefix"
                                 else config.get("merge_mode", "unknown"))
 
                 report_lines = [
@@ -3902,18 +4988,19 @@ class LoRAOptimizer(_LoRAMergeBase):
                         f"dampening: {config['dare_dampening']})"
                     )
                 report_lines.append(f"  auto_strength: {config['auto_strength']}")
+                if "auto_strength_floor" in tuner_data:
+                    report_lines.append(f"  auto_strength_floor: {tuner_data['auto_strength_floor']}")
+                if "decision_smoothing" in tuner_data:
+                    report_lines.append(f"  decision_smoothing: {tuner_data['decision_smoothing']}")
                 report_lines.append("")
                 report_lines.append("Switch settings_source to 'manual' to tweak from these settings.")
                 report = "\n".join(report_lines)
 
-                logging.info(f"[AutoTuner Bridge] Passthrough mode — model already merged by AutoTuner")
-
-                # Return model as-is + UI data for JS widget sync
+                logging.info("[AutoTuner Bridge] Passthrough mode — model already merged by AutoTuner")
                 return {"result": (model, clip, report, tuner_data, None),
-                        "ui": {"applied_settings": [json.dumps(config)]}}
+                        "ui": {"applied_settings": [json.dumps(applied_config)]}}
 
-        # --- manual: active merge mode ---
-        result = self.optimize_merge(
+        return self.optimize_merge(
             model, lora_stack, output_strength,
             clip=clip,
             clip_strength_multiplier=clip_strength_multiplier,
@@ -3933,17 +5020,17 @@ class LoRAOptimizer(_LoRAMergeBase):
             merge_quality=merge_quality,
             behavior_profile=behavior_profile,
             architecture_preset=architecture_preset,
+            decision_smoothing=decision_smoothing,
+            calibration_data=calibration_data,
         )
 
-        return result
-
-    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", auto_strength_floor=-1.0, free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_quality="standard", behavior_profile="v1.2", architecture_preset="auto", _analysis_cache=None, _diff_cache=None, _skip_report=False):
+    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", auto_strength_floor=-1.0, free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", compress_patches="non_ties", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_quality="standard", behavior_profile="v1.2", architecture_preset="auto", decision_smoothing=0.25, calibration_data=None, _analysis_cache=None, _diff_cache=None, _skip_report=False):
         """
         Main entry point. Two-pass streaming architecture:
-        Pass 1: Compute diffs per-prefix, sample conflicts + magnitudes, discard diffs
+        Pass 1: Resolve aliases to target groups, compute diffs, sample metrics, discard diffs
         Decision: Finalize stats, auto-select params from lightweight accumulators
-        Pass 2: Recompute diffs per-prefix, merge immediately, discard
-        Peak memory: ~260MB (one prefix's diffs at a time) vs ~50GB (all diffs).
+        Pass 2: Recompute diffs per target group, merge immediately, discard
+        Peak memory tracks the largest active target group, not the whole stack.
         """
         # Normalize stack format (standard tuples or LoRAStack dicts)
         if not lora_stack or len(lora_stack) == 0:
@@ -3969,13 +5056,14 @@ class LoRAOptimizer(_LoRAMergeBase):
             item = active_loras[0]
             lora_dict = item["lora"]
             strength = item["strength"]
+            resolved_output_strength = 1.0 if output_strength < 0 else output_strength
 
             if item["clip_strength"] is not None:
                 clip_str = item["clip_strength"]
             else:
                 clip_str = strength * clip_strength_multiplier
             new_model, new_clip = comfy.sd.load_lora_for_models(
-                model, clip, lora_dict, output_strength * strength, output_strength * clip_str
+                model, clip, lora_dict, resolved_output_strength * strength, resolved_output_strength * clip_str
             )
 
             report = (
@@ -3985,10 +5073,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                 "Single LoRA detected — bypassing analysis.\n"
                 f"  Name: {item['name']}\n"
                 f"  Strength: {strength}\n"
-                f"  Applied directly with output_strength={output_strength}\n"
+                f"  Applied directly with output_strength={resolved_output_strength}\n"
                 "\n" + "=" * 50
             )
-            return (new_model, new_clip, report, None)
+            return (new_model, new_clip, report, None, None)
 
         # Check instance-level patch cache (survives ComfyUI re-execution
         # triggered by downstream seed changes or similar non-LoRA changes)
@@ -4000,23 +5088,23 @@ class LoRAOptimizer(_LoRAMergeBase):
                                             dare_dampening,
                                             merge_strategy_override, merge_quality,
                                             behavior_profile, architecture_preset,
-                                            auto_strength_floor)
-        # Include model identity so switching base models invalidates the cache
+                                            auto_strength_floor,
+                                            decision_smoothing,
+                                            self._stable_data_hash(calibration_data) if calibration_data is not None else "")
         cache_key = f"{cache_key}|mid={id(model)}"
         if cache_patches == "enabled" and cache_key in self._merge_cache:
             model_patches, clip_patches, report, clip_strength_out, lora_data = self._merge_cache[cache_key]
-            # Resolve auto output_strength from cached suggested_max_strength
-            cached_os = output_strength
-            if cached_os < 0 and lora_data and lora_data.get("suggested_max_strength") is not None:
-                cached_os = lora_data["suggested_max_strength"]
-                clip_strength_out = cached_os * clip_strength_multiplier
-            elif cached_os < 0:
-                cached_os = 1.0
+            cached_output_strength = output_strength
+            if cached_output_strength < 0 and lora_data and lora_data.get("suggested_max_strength") is not None:
+                cached_output_strength = lora_data["suggested_max_strength"]
+                clip_strength_out = cached_output_strength * clip_strength_multiplier
+            elif cached_output_strength < 0:
+                cached_output_strength = 1.0
             new_model = model
             new_clip = clip
             if model is not None and len(model_patches) > 0:
                 new_model = model.clone()
-                new_model.add_patches(model_patches, cached_os)
+                new_model.add_patches(model_patches, cached_output_strength)
                 self._update_model_size(new_model, model_patches)
             if clip is not None and len(clip_patches) > 0:
                 new_clip = clip.clone()
@@ -4035,18 +5123,13 @@ class LoRAOptimizer(_LoRAMergeBase):
         if clip is not None:
             clip_keys = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, {})
 
-        # Collect all LoRA key prefixes
-        all_lora_prefixes = set()
-        for item in active_loras:
-            for key in item["lora"].keys():
-                for suffix in [".lora_up.weight", ".lora_down.weight", "_lora.up.weight",
-                              "_lora.down.weight", ".lora_B.weight", ".lora_A.weight",
-                              ".lora.up.weight", ".lora.down.weight", ".alpha"]:
-                    if key.endswith(suffix):
-                        prefix = key[:-len(suffix)]
-                        all_lora_prefixes.add(prefix)
-                        break
-        all_lora_prefixes = sorted(all_lora_prefixes)  # deterministic iteration order
+        # Build target groups so all aliases for the same underlying weight are
+        # analyzed and merged together.
+        all_lora_prefixes = self._collect_lora_prefixes(active_loras)
+        target_groups = self._build_target_groups(all_lora_prefixes, model_keys, clip_keys)
+        if not target_groups:
+            return (model, clip, "No compatible LoRA keys found. "
+                    "LoRAs may be incompatible with this model architecture.", None, None)
 
         compute_device = self._get_compute_device()
         use_gpu = compute_device.type != "cpu"
@@ -4054,36 +5137,57 @@ class LoRAOptimizer(_LoRAMergeBase):
         if _analysis_cache is not None:
             # Use pre-computed Pass 1 data (from AutoTuner)
             all_key_targets = _analysis_cache["all_key_targets"]
+            target_groups = _analysis_cache.get("target_groups") or {
+                prefix: {
+                    "target_key": target_info[0],
+                    "is_clip": target_info[1],
+                    "aliases": [prefix],
+                    "label_prefix": prefix,
+                }
+                for prefix, target_info in all_key_targets.items()
+            }
             prefix_stats = _analysis_cache["prefix_stats"]
             per_lora_stats = _analysis_cache["per_lora_stats"]
             pair_accum = _analysis_cache["pair_accum"]
+            branch_energy = _analysis_cache.get("branch_energy", {
+                "model": {"norm_sq": [0.0] * len(active_loras), "dot": {pair: 0.0 for pair in _analysis_cache.get("pair_accum", {}).keys()}, "importance": [0.0] * len(active_loras)},
+                "clip": {"norm_sq": [0.0] * len(active_loras), "dot": {pair: 0.0 for pair in _analysis_cache.get("pair_accum", {}).keys()}, "importance": [0.0] * len(active_loras)},
+            })
             all_magnitude_samples = _analysis_cache["all_magnitude_samples"]
             prefix_count = _analysis_cache["prefix_count"]
             skipped_keys = _analysis_cache["skipped_keys"]
-            pairs = [(i, j) for i in range(len(active_loras))
-                             for j in range(i + 1, len(active_loras))]
-            logging.info(f"[LoRA Optimizer] Using cached analysis ({prefix_count} prefixes, skipping Pass 1)")
+            pairs = _analysis_cache.get("pairs") or [
+                (i, j) for i in range(len(active_loras))
+                for j in range(i + 1, len(active_loras))
+            ]
+            logging.info(f"[LoRA Optimizer] Using cached analysis ({prefix_count} target groups, skipping Pass 1)")
 
         else:
             # =====================================================================
             # Pass 1 — Analysis (streaming: diffs computed, sampled, and discarded)
             # =====================================================================
             logging.info("[LoRA Optimizer] Pass 1: Analyzing weight diffs (streaming)...")
-            logging.info(f"[LoRA Optimizer]   {len(all_lora_prefixes)} key prefixes across {len(active_loras)} LoRAs")
+            logging.info(f"[LoRA Optimizer]   {len(target_groups)} target groups from {len(all_lora_prefixes)} aliases across {len(active_loras)} LoRAs")
             logging.info(f"[LoRA Optimizer]   Compute device: {compute_device}"
                          f" ({'sequential' if use_gpu else 'threaded'})")
             t_pass1 = time.time()
-
-            analysis = self._run_pass1_analysis(active_loras, all_lora_prefixes,
-                                                model_keys, clip_keys, model, clip, compute_device)
-            all_key_targets = analysis["all_key_targets"]
-            per_lora_stats = analysis["per_lora_stats"]
-            pair_accum = analysis["pair_accum"]
-            all_magnitude_samples = analysis["all_magnitude_samples"]
-            prefix_count = analysis["prefix_count"]
-            prefix_stats = analysis["prefix_stats"]
-            skipped_keys = analysis["skipped_keys"]
-            pairs = analysis["pairs"]
+            analysis_data = self._run_group_analysis(
+                target_groups, active_loras, model, clip, compute_device,
+                clip_strength_multiplier=clip_strength_multiplier,
+                merge_quality=merge_quality,
+                calibration_data=calibration_data,
+                decision_smoothing=decision_smoothing,
+            )
+            all_key_targets = analysis_data["all_key_targets"]
+            target_groups = analysis_data["target_groups"]
+            prefix_stats = analysis_data["prefix_stats"]
+            per_lora_stats = analysis_data["per_lora_stats"]
+            pair_accum = analysis_data["pair_accum"]
+            branch_energy = analysis_data["branch_energy"]
+            all_magnitude_samples = analysis_data["all_magnitude_samples"]
+            prefix_count = analysis_data["prefix_count"]
+            skipped_keys = analysis_data["skipped_keys"]
+            pairs = analysis_data["pairs"]
 
             if prefix_count == 0:
                 return (model, clip, "No compatible LoRA keys found. "
@@ -4093,8 +5197,8 @@ class LoRAOptimizer(_LoRAMergeBase):
             for i, stat in enumerate(per_lora_stats):
                 avg_r = sum(stat["ranks"]) / len(stat["ranks"]) if stat["ranks"] else 0
                 logging.info(f"[LoRA Optimizer]   {stat['name']} ({i+1}/{len(active_loras)}): "
-                             f"{stat['key_count']} keys, avg rank {avg_r:.0f}")
-            logging.info(f"[LoRA Optimizer]   Total: {prefix_count} prefixes ({time.time() - t_pass1:.1f}s)")
+                             f"{stat['key_count']} groups, avg rank {avg_r:.0f}")
+            logging.info(f"[LoRA Optimizer]   Total: {prefix_count} target groups ({time.time() - t_pass1:.1f}s)")
 
         # =====================================================================
         # Decision — finalize stats, auto-select params (scalars only)
@@ -4117,29 +5221,51 @@ class LoRAOptimizer(_LoRAMergeBase):
                 "key_filter": active_loras[i].get("key_filter", "all"),
             })
 
-        # Full-rank detection: when average rank exceeds threshold, switch to
-        # safer merge strategies that preserve information in high-dimensional patches.
         fr_preset = arch_preset.get("full_rank", {})
-        fr_rank_threshold = fr_preset.get("rank_threshold", 256)
+        fr_rank_threshold = fr_preset.get("rank_threshold", 512)
         global_avg_rank = (sum(s["avg_rank"] for s in lora_stats) / len(lora_stats)) if lora_stats else 0
         is_full_rank = global_avg_rank >= fr_rank_threshold
         if is_full_rank:
-            logging.info(f"[LoRA Optimizer] Full-rank LoRAs detected (avg rank {global_avg_rank:.0f} >= {fr_rank_threshold})")
+            logging.info(
+                f"[LoRA Optimizer] Full-rank LoRAs detected "
+                f"(avg rank {global_avg_rank:.0f} >= {fr_rank_threshold})"
+            )
             if fr_preset.get("disable_slerp_upgrade", False):
-                logging.info(f"[LoRA Optimizer]   SLERP upgrade disabled for full-rank patches")
+                logging.info("[LoRA Optimizer]   SLERP upgrade disabled for full-rank patches")
             if fr_preset.get("prefer_sum_orthogonal", False):
-                logging.info(f"[LoRA Optimizer]   Orthogonal full-rank patches will use weighted_sum (additive)")
+                logging.info("[LoRA Optimizer]   Orthogonal full-rank patches will use weighted_sum (additive)")
 
         # Pairwise conflict stats and cosine similarity from accumulated counts
         total_overlap = 0
         total_conflict = 0
+        total_weighted_total = 0.0
+        total_weighted_conflict = 0.0
+        total_expected_conflict_weighted = 0.0
+        total_excess_conflict_weighted = 0.0
+        total_subspace_num = 0.0
+        total_subspace_den = 0.0
         pairwise_conflicts = []
         pairwise_similarities = {}
         for i, j in pairs:
-            pair_overlap, pair_conflict, pair_dot, pair_na_sq, pair_nb_sq = pair_accum[(i, j)]
+            pair_metrics = pair_accum[(i, j)]
+            pair_overlap = pair_metrics["overlap"]
+            pair_conflict = pair_metrics["conflict"]
+            pair_dot = pair_metrics["dot"]
+            pair_na_sq = pair_metrics["norm_a_sq"]
+            pair_nb_sq = pair_metrics["norm_b_sq"]
             total_overlap += pair_overlap
             total_conflict += pair_conflict
+            total_weighted_total += pair_metrics["weighted_total"]
+            total_weighted_conflict += pair_metrics["weighted_conflict"]
+            total_expected_conflict_weighted += pair_metrics["expected_conflict_weighted"]
+            total_excess_conflict_weighted += pair_metrics["excess_conflict_weighted"]
+            total_subspace_num += pair_metrics["subspace_num"]
+            total_subspace_den += pair_metrics["subspace_den"]
             ratio = pair_conflict / pair_overlap if pair_overlap > 0 else 0
+            weighted_ratio = (pair_metrics["weighted_conflict"] / pair_metrics["weighted_total"]) if pair_metrics["weighted_total"] > 0 else ratio
+            expected_conflict = (pair_metrics["expected_conflict_weighted"] / pair_metrics["weighted_total"]) if pair_metrics["weighted_total"] > 0 else 0.0
+            excess_conflict = (pair_metrics["excess_conflict_weighted"] / pair_metrics["weighted_total"]) if pair_metrics["weighted_total"] > 0 else 0.0
+            subspace_overlap = (pair_metrics["subspace_num"] / pair_metrics["subspace_den"]) if pair_metrics["subspace_den"] > 0 else 0.0
             denom = math.sqrt(pair_na_sq) * math.sqrt(pair_nb_sq)
             cos_sim = pair_dot / denom if denom > 0 else 0.0
             pairwise_similarities[(i, j)] = cos_sim
@@ -4154,9 +5280,13 @@ class LoRAOptimizer(_LoRAMergeBase):
                 "overlap": pair_overlap,
                 "conflicts": pair_conflict,
                 "ratio": ratio,
+                "weighted_ratio": weighted_ratio,
+                "expected_conflict": expected_conflict,
+                "excess_conflict": excess_conflict,
                 "cosine_sim": cos_sim,
+                "subspace_overlap": subspace_overlap,
             })
-            logging.info(f"[LoRA Optimizer]   {pair_label} -> {ratio:.1%} conflict, cos_sim={cos_sim:.3f}")
+            logging.info(f"[LoRA Optimizer]   {pair_label} -> raw={ratio:.1%}, excess={excess_conflict:.1%}, cos_sim={cos_sim:.3f}, subspace={subspace_overlap:.2f}")
 
         # Compatibility warnings for opposing LoRAs
         compatibility_warnings = []
@@ -4173,10 +5303,20 @@ class LoRAOptimizer(_LoRAMergeBase):
                 )
 
         avg_conflict_ratio = total_conflict / total_overlap if total_overlap > 0 else 0
+        avg_weighted_conflict_ratio = total_weighted_conflict / total_weighted_total if total_weighted_total > 0 else avg_conflict_ratio
+        avg_expected_conflict = total_expected_conflict_weighted / total_weighted_total if total_weighted_total > 0 else 0.0
+        avg_excess_conflict = total_excess_conflict_weighted / total_weighted_total if total_weighted_total > 0 else 0.0
+        avg_subspace_overlap = total_subspace_num / total_subspace_den if total_subspace_den > 0 else 0.0
         logging.info(f"[LoRA Optimizer]   Average conflict ratio: {avg_conflict_ratio:.1%}")
+        logging.info(f"[LoRA Optimizer]   Excess conflict: {avg_excess_conflict:.1%} | subspace overlap: {avg_subspace_overlap:.2f}")
 
         # Magnitude ratio
-        valid_l2 = [m for m in l2_means if m > 0]
+        branch_measure = branch_energy["model"]["importance"] if calibration_data is not None else branch_energy["model"]["norm_sq"]
+        model_effective = [
+            abs(active_loras[i]["strength"]) * math.sqrt(max(branch_measure[i], 0.0))
+            for i in range(len(active_loras))
+        ]
+        valid_l2 = [m for m in model_effective if m > 0]
         if len(valid_l2) >= 2:
             magnitude_ratio = max(valid_l2) / min(valid_l2)
         else:
@@ -4186,7 +5326,13 @@ class LoRAOptimizer(_LoRAMergeBase):
             "n_loras": len(active_loras),
             "total_keys": prefix_count,
             "avg_conflict": avg_conflict_ratio,
+            "avg_weighted_conflict": avg_weighted_conflict_ratio,
+            "avg_expected_conflict": avg_expected_conflict,
+            "avg_excess_conflict": avg_excess_conflict,
+            "avg_subspace_overlap": avg_subspace_overlap,
             "magnitude_ratio": magnitude_ratio,
+            "importance_mode": "activation" if calibration_data is not None else "frobenius",
+            "decision_smoothing": decision_smoothing,
         }
 
         # Auto-select parameters (density estimated from pre-sampled magnitudes)
@@ -4195,6 +5341,8 @@ class LoRAOptimizer(_LoRAMergeBase):
         mode, density, sign_method, reasoning = self._auto_select_params(
             avg_conflict_ratio, magnitude_ratio, magnitude_samples=all_magnitude_samples,
             avg_cos_sim=global_avg_cos_sim, behavior_profile=behavior_profile,
+            avg_excess_conflict=avg_excess_conflict,
+            avg_subspace_overlap=avg_subspace_overlap,
             arch_preset=arch_preset
         )
         del all_magnitude_samples
@@ -4214,47 +5362,40 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         # Auto-strength adjustment
         auto_strength_info = None
-        scale_ratios = {}
+        model_auto_scale = 1.0
+        clip_auto_scale = 1.0
         if auto_strength == "enabled":
-            new_strengths, strength_reasoning = self._compute_auto_strengths(
-                active_loras, lora_stats, pairwise_similarities=pairwise_similarities,
+            auto_strength_info = self._compute_auto_strengths(
+                active_loras, branch_energy,
+                clip_strength_multiplier=clip_strength_multiplier,
                 arch_preset=arch_preset,
                 detected_arch=getattr(self, '_detected_arch', None),
                 auto_strength_floor=auto_strength_floor,
-                is_full_rank=is_full_rank)
-
-            for i in range(len(active_loras)):
-                orig = active_loras[i]["strength"]
-                if abs(orig) > 1e-9:
-                    scale_ratios[i] = new_strengths[i] / orig
-                else:
-                    scale_ratios[i] = 1.0
-
+                is_full_rank=is_full_rank,
+            )
+            model_auto_scale = auto_strength_info["model_scale"]
+            clip_auto_scale = auto_strength_info["clip_scale"]
             for i, stat in enumerate(lora_stats):
                 stat["original_strength"] = stat["strength"]
-                stat["strength"] = new_strengths[i]
+                stat["strength"] = auto_strength_info["model_strengths"][i]
 
-            auto_strength_info = {
-                "reasoning": strength_reasoning,
-                "original_strengths": [item["strength"] for item in active_loras],
-                "new_strengths": new_strengths,
-                "names": [item["name"] for item in active_loras],
-            }
-
-            logging.info(f"[LoRA Optimizer] Auto-strength: {strength_reasoning[0]}")
+            if auto_strength_info["reasoning"]:
+                logging.info(f"[LoRA Optimizer] Auto-strength: {auto_strength_info['reasoning'][0]}")
             for i in range(len(active_loras)):
-                logging.info(f"[LoRA Optimizer]   {active_loras[i]['name']}: "
-                             f"{active_loras[i]['strength']} -> {new_strengths[i]:.4f}")
+                logging.info(
+                    f"[LoRA Optimizer]   {active_loras[i]['name']}: "
+                    f"model {active_loras[i]['strength']} -> {auto_strength_info['model_strengths'][i]:.4f}"
+                )
 
         # Free GPU cache between passes if requested
         if free_vram_between_passes == "enabled" and use_gpu:
             torch.cuda.empty_cache()
 
         # Resolve compress_patches rank (sum of input LoRA ranks)
-        sum_rank = sum(int(stat["avg_rank"]) for stat in lora_stats if stat["avg_rank"] > 0)
         compress_rank = 0  # 0 = disabled
         if compress_patches in ("non_ties", "all"):
-            compress_rank = max(sum_rank, 64)  # floor at 64
+            sum_rank = sum(int(stat["avg_rank"]) for stat in lora_stats if stat["avg_rank"] > 0)
+            compress_rank = max(sum_rank, 1) if sum_rank > 0 else 0
             logging.info(f"[LoRA Optimizer] Patch compression: {compress_patches} (rank {compress_rank} from sum of input LoRA ranks)")
 
         # Resolve SVD device for compression
@@ -4265,9 +5406,9 @@ class LoRAOptimizer(_LoRAMergeBase):
             resolved_svd_device = None  # CPU is the default in _compress_to_lowrank
 
         # =====================================================================
-        # Pass 2 — Merge (recompute diffs per-prefix, merge, discard)
+        # Pass 2 — Merge (recompute diffs per target group, merge, discard)
         # =====================================================================
-        logging.info(f"[LoRA Optimizer] Pass 2: Merging {len(all_key_targets)} keys "
+        logging.info(f"[LoRA Optimizer] Pass 2: Merging {len(target_groups)} target groups "
                      f"({optimization_mode} strategy, "
                      f"{'sequential' if use_gpu else 'threaded'})...")
         t_pass2 = time.time()
@@ -4289,29 +5430,12 @@ class LoRAOptimizer(_LoRAMergeBase):
             logging.info(f"[LoRA Optimizer] VRAM patch budget: {vram_budget_bytes // (1024**2)}MB "
                          f"({vram_budget*100:.0f}% of {usable // (1024**2)}MB free)")
 
-        def _merge_one_prefix(lora_prefix, target_key, is_clip_key):
-            """Recompute diffs for one prefix, merge, return patch or None."""
+        def _merge_one_group(label_prefix, target_group):
+            """Recompute diffs for one target group, merge, return patch or None."""
             nonlocal gpu_patch_bytes
             should_keep = vram_budget_bytes > 0 and gpu_patch_bytes < vram_budget_bytes
-            offset = None
-            if isinstance(target_key, tuple):
-                actual_key = target_key[0]
-                if len(target_key) > 1:
-                    offset = target_key[1]
-            else:
-                actual_key = target_key
-
-            try:
-                if is_clip_key:
-                    target_weight = comfy.utils.get_attr(clip.cond_stage_model, actual_key)
-                else:
-                    target_weight = comfy.utils.get_attr(model.model, actual_key)
-                target_shape = list(target_weight.shape)
-                if offset is not None:
-                    target_shape[offset[0]] = offset[2]
-                target_shape = torch.Size(target_shape)
-            except (AttributeError, RuntimeError, IndexError):
-                return None
+            target_key = target_group["target_key"]
+            is_clip_key = target_group["is_clip"]
 
             # Determine strategy BEFORE computing diffs (use Pass 1 stats)
             pf_conflict = 0.0
@@ -4323,11 +5447,12 @@ class LoRAOptimizer(_LoRAMergeBase):
             pf_opposing = False
             if optimization_mode == "weighted_sum_only":
                 pf_mode = "weighted_sum"
-                pf_n_loras = prefix_stats.get(lora_prefix, {}).get("n_loras", 0)
-                pf_conflict = prefix_stats.get(lora_prefix, {}).get("conflict_ratio", 0.0)
-            elif optimization_mode == "per_prefix" and lora_prefix in prefix_stats:
-                pf = prefix_stats[lora_prefix]
-                pf_conflict = pf["conflict_ratio"]
+                pf_n_loras = prefix_stats.get(label_prefix, {}).get("n_loras", 0)
+                pf_conflict = prefix_stats.get(label_prefix, {}).get("decision_conflict",
+                                                                     prefix_stats.get(label_prefix, {}).get("conflict_ratio", 0.0))
+            elif optimization_mode == "per_prefix" and label_prefix in prefix_stats:
+                pf = prefix_stats[label_prefix]
+                pf_conflict = pf.get("decision_conflict", pf.get("conflict_ratio", 0.0))
                 pf_n_loras = pf["n_loras"]
                 if pf["n_loras"] <= 1:
                     pf_mode = "weighted_sum"
@@ -4335,31 +5460,32 @@ class LoRAOptimizer(_LoRAMergeBase):
                     pf_sign = "frequency"
                 else:
                     pf_mode, pf_density, pf_sign, _ = self._auto_select_params(
-                        pf["conflict_ratio"], pf["magnitude_ratio"],
+                        pf["conflict_ratio"], pf.get("decision_magnitude_ratio", pf["magnitude_ratio"]),
                         magnitude_samples=pf.get("magnitude_samples"),
-                        avg_cos_sim=pf.get("avg_cos_sim", 0.0),
+                        avg_cos_sim=pf.get("decision_cosine", pf.get("avg_cos_sim", 0.0)),
+                        avg_excess_conflict=pf.get("decision_conflict", pf.get("excess_conflict", pf.get("conflict_ratio", 0.0))),
+                        avg_subspace_overlap=pf.get("decision_subspace_overlap", pf.get("avg_subspace_overlap", 0.0)),
                         behavior_profile=behavior_profile,
                         arch_preset=arch_preset,
                         precomputed_density=pf.get("precomputed_density"),
                     )
-                    # Upgrade weighted_average → slerp for 2+ non-opposing LoRAs.
-                    # SLERP preserves magnitude better than weighted_average's /N reduction,
-                    # which is critical for video LoRAs where motion energy matters.
-                    # Skip for opposing LoRAs (cos < 0): SLERP interpolates between opposing
-                    # directions while preserving magnitude, amplifying artifacts.
-                    pf_raw_cos = pf.get("avg_cos_sim", 0.0)
+                    # Upgrade weighted_average → slerp for 2+ positively-aligned LoRAs.
+                    # SLERP preserves magnitude better than weighted_average's /N reduction.
+                    # Skip when inappropriate:
+                    #  - Orthogonal (|cos| < 0.25): SLERP's norm correction gives ~1.6x
+                    #    more energy than weighted_average for 3 orthogonal vectors.
+                    #  - Opposing (cos < 0): SLERP interpolates between opposing directions
+                    #    while preserving magnitude; combined with auto-strength boosting
+                    #    (scale > 1.0 for opposing pairs), this amplifies artifacts.
+                    # Both cases benefit from weighted_average's /N magnitude reduction.
+                    pf_raw_cos = pf.get("decision_cosine", pf.get("avg_cos_sim", 0.0))
                     pf_orthogonal = abs(pf_raw_cos) < arch_preset["orthogonal_cos_sim_max"]
                     pf_opposing = pf_raw_cos < 0
-                    # Full-rank gate: skip SLERP upgrade — for full-rank patches the
-                    # information is spread across all dimensions, and SLERP's
-                    # hypersphere interpolation loses signal from both LoRAs.
                     if (pf_mode == "weighted_average" and pf["n_loras"] >= 2
                             and behavior_profile == "v1.2"
-                            and not pf_opposing
+                            and not pf_orthogonal and not pf_opposing
                             and not (is_full_rank and fr_preset.get("disable_slerp_upgrade", False))):
                         pf_mode = "slerp"
-                    # Full-rank gate: orthogonal full-rank patches → weighted_sum.
-                    # Independent full-rank deltas should be added, not averaged.
                     if (is_full_rank and fr_preset.get("prefer_sum_orthogonal", False)
                             and pf_mode == "weighted_average" and pf_orthogonal):
                         pf_mode = "weighted_sum"
@@ -4370,177 +5496,67 @@ class LoRAOptimizer(_LoRAMergeBase):
                     and merge_strategy_override in ("ties", "weighted_average", "weighted_sum", "consensus", "slerp")):
                 pf_mode = merge_strategy_override
 
-            # LOW-RANK PATH: single-LoRA weighted_sum — keep low-rank matrices
-            # instead of expanding to full-rank diff. Saves ~128x memory per key.
-            # ComfyUI applies "lora" patches as: up @ down * (alpha/rank) * strength
-            if pf_mode == "weighted_sum" and pf_n_loras <= 1:
-                raw_n = prefix_stats.get(lora_prefix, {}).get("n_loras", 0)
-                for i, item in enumerate(active_loras):
-                    lora_info = self._get_lora_key_info(item["lora"], lora_prefix)
-                    if lora_info is None:
-                        continue
-                    kf = item.get("key_filter", "all")
-                    if kf == "shared_only" and raw_n < 2:
-                        continue
-                    if kf == "unique_only" and raw_n != 1:
-                        continue
-                    mat_up, mat_down, alpha, mid = lora_info
-                    if is_clip_key and item["clip_strength"] is not None:
-                        eff_strength = item["clip_strength"]
-                    else:
-                        eff_strength = item["strength"]
-                        if scale_ratios:
-                            eff_strength *= scale_ratios.get(i, 1.0)
-                    # Bake eff_strength into alpha so ComfyUI applies it correctly
-                    alpha_scaled = alpha * eff_strength
-                    patch = LoRAAdapter(set(), (mat_up, mat_down, alpha_scaled, mid, None, None))
+            pf = prefix_stats.get(label_prefix, {})
+            raw_n = pf.get("raw_n_loras", pf_n_loras)
+            if pf_n_loras <= 1 and pf_mode != "weighted_sum":
+                pf_mode = "weighted_sum"
+
+            linear_stats = None
+            if (pf_mode in ("weighted_sum", "weighted_average", "normalize")
+                    and sparsification == "disabled"
+                    and merge_quality == "standard"):
+                linear_patch_info = self._build_exact_linear_patch(
+                    target_group, active_loras, raw_n, pf_mode,
+                    is_clip_key=is_clip_key, model_scale=model_auto_scale,
+                )
+                if linear_patch_info is not None:
+                    patch = linear_patch_info["patch"]
+                    weights = linear_patch_info["weights"]
+                    input_norms_mean = (
+                        sum(math.sqrt(max(pf.get("per_lora_norm_sq", {}).get(i, 0.0), 0.0)) * abs(w)
+                            for i, w in weights.items()) / len(weights)
+                    ) if weights else 0.0
+                    energy_sq = 0.0
+                    for i, weight in weights.items():
+                        energy_sq += (weight ** 2) * pf.get("per_lora_norm_sq", {}).get(i, 0.0)
+                    for (i, j), dot in pf.get("pairwise_dots", {}).items():
+                        if i in weights and j in weights:
+                            energy_sq += 2.0 * weights[i] * weights[j] * dot
+                    merged_norm = math.sqrt(max(energy_sq, 0.0))
+                    linear_stats = (input_norms_mean, merged_norm)
                     if should_keep:
                         p_bytes = self._estimate_single_patch_bytes(patch)
                         if gpu_patch_bytes + p_bytes <= vram_budget_bytes:
                             patch = self._move_patch_to_device(patch, compute_device)
                             gpu_patch_bytes += p_bytes
-                    return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), False, 0.0, 0.0)
-                return None
-
-            # FULL-RANK PATH: compute diffs on GPU, merge
-            diffs_list = []
-            diff_to_lora = []  # maps diffs_list index -> active_loras index
-            storage_dtype = None  # native weight dtype before float32 upcast
-            raw_n = prefix_stats.get(lora_prefix, {}).get("n_loras", 0)
-            for i, item in enumerate(active_loras):
-                lora_info = self._get_lora_key_info(item["lora"], lora_prefix)
-                if lora_info is None:
-                    continue
-                kf = item.get("key_filter", "all")
-                if kf == "shared_only" and raw_n < 2:
-                    continue
-                if kf == "unique_only" and raw_n != 1:
-                    continue
-
-                # Check diff cache
-                cache_key = (lora_prefix, i)
-                if _diff_cache is not None and cache_key in _diff_cache:
-                    diff = _diff_cache.get(cache_key,
-                                           device=compute_device if use_gpu else None).float()
-                    if storage_dtype is None:
-                        storage_dtype = lora_info[0].dtype
-
-                    if is_clip_key and item["clip_strength"] is not None:
-                        eff_strength = item["clip_strength"]
-                    else:
-                        eff_strength = item["strength"]
-                        if scale_ratios:
-                            eff_strength *= scale_ratios.get(i, 1.0)
-
-                    diffs_list.append((diff, eff_strength))
-                    diff_to_lora.append(i)
-                    continue
-
-                mat_up, mat_down, alpha, mid = lora_info
-                rank = mat_down.shape[0]
-                if storage_dtype is None:
-                    storage_dtype = mat_up.dtype
-
-                if use_gpu:
-                    mat_up = mat_up.to(compute_device)
-                    mat_down = mat_down.to(compute_device)
-                    if mid is not None:
-                        mid = mid.to(compute_device)
-
-                if mid is not None:
-                    final_shape = [mat_down.shape[1], mat_down.shape[0],
-                                   mid.shape[2], mid.shape[3]]
-                    mat_down = (
-                        torch.mm(
-                            mat_down.transpose(0, 1).flatten(start_dim=1).float(),
-                            mid.transpose(0, 1).flatten(start_dim=1).float(),
-                        )
-                        .reshape(final_shape)
-                        .transpose(0, 1)
+                    return (
+                        target_key, is_clip_key, patch, pf_mode, label_prefix,
+                        pf_conflict, max(pf_n_loras, 1), False,
+                        linear_stats[0], linear_stats[1]
                     )
 
-                diff = torch.mm(
-                    mat_up.flatten(start_dim=1).float(),
-                    mat_down.flatten(start_dim=1).float()
-                )
-                del mat_up, mat_down  # Free LoRA matrices from GPU
-                try:
-                    diff = diff.reshape(target_shape)
-                except RuntimeError:
-                    continue
-
-                diff = diff * (alpha / rank)
-
-                # Store in diff cache for subsequent candidates
-                if _diff_cache is not None:
-                    _diff_cache.put((lora_prefix, i), diff)
-
-                if is_clip_key and item["clip_strength"] is not None:
-                    eff_strength = item["clip_strength"]
-                else:
-                    eff_strength = item["strength"]
-                    if scale_ratios:
-                        eff_strength *= scale_ratios.get(i, 1.0)
-
-                diffs_list.append((diff, eff_strength))
-                diff_to_lora.append(i)
-
-            if len(diffs_list) == 0:
+            prepared = self._prepare_group_diffs(
+                target_group, active_loras, model, clip, compute_device,
+                clip_strength_multiplier=clip_strength_multiplier,
+                merge_quality=merge_quality,
+                diff_cache=_diff_cache,
+                auto_scale=model_auto_scale if not is_clip_key else 1.0,
+            )
+            if prepared is None or len(prepared["diffs"]) == 0:
                 return None
 
-            # Conflict-mode masking (zero overhead when all use "all")
-            if len(diffs_list) > 1:
-                has_conflict_modes = any(
-                    active_loras[diff_to_lora[idx]].get("conflict_mode", "all") != "all"
-                    for idx in range(len(diffs_list))
-                )
-                if has_conflict_modes:
-                    # Sign voting for conflict-mode masking.
-                    # Negative eff_strength flips the effective direction, so we
-                    # negate the sign vote accordingly.
-                    if merge_quality != "standard" and diffs_list[0][0].dim() >= 2:
-                        # Column-wise: each output neuron (row) votes as a unit
-                        ref = diffs_list[0][0]
-                        out_dim = ref.shape[0]
-                        sign_sum = torch.zeros(out_dim, device=ref.device, dtype=torch.float32)
-                        for diff, weight in diffs_list:
-                            d = diff if weight >= 0 else -diff
-                            sign_sum += d.reshape(out_dim, -1).to(dtype=torch.float32).sum(dim=1).sign()
-                        majority_sign = torch.where(sign_sum >= 0, 1.0, -1.0)
-                        majority_sign = majority_sign.reshape(-1, *([1] * (ref.dim() - 1))).expand_as(ref)
-                        del sign_sum
-                    else:
-                        # Element-wise: each position votes independently
-                        sign_sum = torch.zeros_like(diffs_list[0][0])
-                        for diff, weight in diffs_list:
-                            sign_sum += diff.sign() if weight >= 0 else -diff.sign()
-                        majority_sign = torch.where(sign_sum >= 0, 1.0, -1.0)
-                        del sign_sum
+            diffs_list = []
+            storage_dtype = prepared["storage_dtype"]
+            for i in sorted(prepared["diffs"].keys()):
+                diffs_list.append((prepared["diffs"][i], prepared["eff_strengths"][i]))
 
-                    masked_diffs = []
-                    for idx, (diff, weight) in enumerate(diffs_list):
-                        cm = active_loras[diff_to_lora[idx]].get("conflict_mode", "all")
-                        if cm == "low_conflict":
-                            effective_diff = diff if weight >= 0 else -diff
-                            diff = diff * ((effective_diff * majority_sign) > 0).float()
-                        elif cm == "high_conflict":
-                            effective_diff = diff if weight >= 0 else -diff
-                            diff = diff * ((effective_diff * majority_sign) < 0).float()
-                        masked_diffs.append((diff, weight))
-                    diffs_list = masked_diffs
-                    del majority_sign
-
-            # Re-check single-LoRA case (diff computation may have failed for some)
-            if pf_mode == "weighted_sum" and len(diffs_list) <= 1:
-                pass  # weighted_sum with 1 diff is fine
-            elif len(diffs_list) <= 1 and pf_mode != "weighted_sum":
+            if len(diffs_list) <= 1 and pf_mode != "weighted_sum":
                 pf_mode = "weighted_sum"
 
-            # Create deterministic per-prefix RNG for reproducible sparsification
-            # Generator lives on compute_device so mask generation stays on GPU
+            # Create deterministic per-group RNG for reproducible sparsification
             sp_gen = None
             if sparsification != "disabled":
-                seed = int(hashlib.sha256(lora_prefix.encode()).hexdigest(), 16) % (2**63)
+                seed = int(hashlib.sha256(label_prefix.encode()).hexdigest(), 16) % (2**63)
                 gen_device = compute_device if compute_device is not None else torch.device('cpu')
                 sp_gen = torch.Generator(device=gen_device)
                 sp_gen.manual_seed(seed)
@@ -4557,7 +5573,8 @@ class LoRAOptimizer(_LoRAMergeBase):
             # in enhanced quality doesn't account for the directional cancellation
             # that weighted_average provides.
             pf_quality = merge_quality
-            if (pf_mode == "weighted_average" and pf_opposing):
+            if (pf_mode == "weighted_average"
+                    and (pf_orthogonal or pf_opposing)):
                 pf_quality = "standard"
 
             merged_diff = self._merge_diffs(
@@ -4565,11 +5582,11 @@ class LoRAOptimizer(_LoRAMergeBase):
                 density=pf_density, majority_sign_method=pf_sign,
                 compute_device=compute_device,
                 sparsification=sparsification,
-                sparsification_density=sparsification_density,
-                sparsification_generator=sp_gen,
-                merge_quality=pf_quality,
-                dare_dampening=dare_dampening,
-                keep_on_gpu=should_keep,
+                    sparsification_density=sparsification_density,
+                    sparsification_generator=sp_gen,
+                    merge_quality=pf_quality,
+                    dare_dampening=dare_dampening,
+                    keep_on_gpu=should_keep,
             )
             merged_norm = merged_diff.float().norm().item() if merged_diff is not None else 0.0
             diffs_list.clear()  # Free input diffs from GPU
@@ -4597,7 +5614,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     gpu_patch_bytes += p_bytes
                 else:
                     patch = self._move_patch_to_device(patch, torch.device("cpu"))
-            return (target_key, is_clip_key, patch, pf_mode, lora_prefix, pf_conflict, max(pf_n_loras, 1), is_compressed, input_norms_mean, merged_norm)
+            return (target_key, is_clip_key, patch, pf_mode, label_prefix, pf_conflict, max(pf_n_loras, 1), is_compressed, input_norms_mean, merged_norm)
 
         lowrank_count = 0
         total_input_energy = 0.0
@@ -4646,20 +5663,24 @@ class LoRAOptimizer(_LoRAMergeBase):
             prefix_decisions.append((prefix, used_mode, conflict, n_loras))
 
         if use_gpu:
-            prefix_list = list(all_key_targets.items())
+            group_items = list(target_groups.items())
             n_loras = len(active_loras)
-            for idx, (lora_prefix, (target_key, is_clip_key)) in enumerate(prefix_list):
-                # Prefetch next prefix's diffs from disk while merging current one
-                if _diff_cache is not None and idx + 1 < len(prefix_list):
-                    next_prefix = prefix_list[idx + 1][0]
-                    _diff_cache.prefetch([(next_prefix, i) for i in range(n_loras)])
-                _collect_merge_result(_merge_one_prefix(lora_prefix, target_key, is_clip_key))
+            for idx, (label_prefix, target_group) in enumerate(group_items):
+                if _diff_cache is not None and idx + 1 < len(group_items):
+                    next_group = group_items[idx + 1][1]
+                    prefetch_keys = [
+                        (alias, i)
+                        for alias in next_group["aliases"]
+                        for i in range(n_loras)
+                    ]
+                    _diff_cache.prefetch(prefetch_keys)
+                _collect_merge_result(_merge_one_group(label_prefix, target_group))
         else:
-            max_workers = min(4, max(1, len(all_key_targets)))
+            max_workers = min(4, max(1, len(target_groups)))
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(_merge_one_prefix, lora_prefix, target_key, is_clip_key): lora_prefix
-                    for lora_prefix, (target_key, is_clip_key) in all_key_targets.items()
+                    executor.submit(_merge_one_group, label_prefix, target_group): label_prefix
+                    for label_prefix, target_group in target_groups.items()
                 }
                 for future in concurrent.futures.as_completed(futures):
                     _collect_merge_result(future.result())
@@ -4725,16 +5746,23 @@ class LoRAOptimizer(_LoRAMergeBase):
                 model_patches = self._refuse_zimage_patches(model_patches)
                 logging.info(f"[LoRA Optimizer] Re-fused Z-Image QKV patches ({len(model_patches)} model patches)")
 
-        # Build reverse key map: target_key → lora_prefix
+        # Build reverse key map: target_key → canonical prefix metadata
         # (used by SaveMergedLoRA to reconstruct standard LoRA key names)
-        # Use the FULL target_key (including offset tuple) as the dict key so
-        # split Q/K/V patches targeting different slices of the same fused weight
-        # don't overwrite each other (e.g., Z-Image fused QKV).
         reverse_key_map = {}
-        for lora_prefix, (target_key, is_clip) in all_key_targets.items():
-            reverse_key_map[target_key] = lora_prefix
+        for label_prefix, target_group in target_groups.items():
+            target_key = target_group["target_key"]
+            tkey = target_key[0] if isinstance(target_key, tuple) else target_key
+            entry = {
+                "canonical_prefix": label_prefix,
+                "aliases": list(target_group["aliases"]),
+            }
+            reverse_key_map[target_key] = entry
+            reverse_key_map[tkey] = entry
 
-        # Auto output strength: -1 = use suggested max strength
+        # Apply patches
+        new_model = model
+        new_clip = clip
+
         auto_output_strength = False
         if output_strength < 0 and suggested_max_strength is not None:
             output_strength = suggested_max_strength
@@ -4744,18 +5772,11 @@ class LoRAOptimizer(_LoRAMergeBase):
             output_strength = 1.0
             logging.info("[LoRA Optimizer] Auto output_strength: no suggestion available, using 1.0")
 
-        # Apply patches
-        new_model = model
-        new_clip = clip
-
-        # If ALL LoRAs have explicit clip_strength (standard tuple format),
-        # clip strengths are already baked into the diffs — skip global multiplier.
-        # If ANY lack it (dict format), apply the multiplier for those LoRAs.
         all_explicit_clip = all(item["clip_strength"] is not None for item in active_loras)
         if all_explicit_clip:
-            clip_strength_out = output_strength
+            clip_strength_out = output_strength * clip_auto_scale
         else:
-            clip_strength_out = output_strength * clip_strength_multiplier
+            clip_strength_out = output_strength * clip_strength_multiplier * clip_auto_scale
 
         if model is not None and len(model_patches) > 0:
             new_model = model.clone()
@@ -4794,7 +5815,6 @@ class LoRAOptimizer(_LoRAMergeBase):
             compatibility_warnings=compatibility_warnings,
             behavior_profile=behavior_profile,
             architecture_preset=preset_key,
-            is_full_rank=is_full_rank,
         )
 
         # Bundle LORA_DATA for optional downstream saving
@@ -4805,7 +5825,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             "output_strength": output_strength,
             "clip_strength": clip_strength_out,
             "suggested_max_strength": suggested_max_strength,
-            "sum_rank": max(sum_rank, 64),
+            "sum_rank": compress_rank if compress_rank > 0 else 128,
         }
 
         # Cache patches for re-use (single entry to limit memory)
@@ -4860,18 +5880,12 @@ class LoRAOptimizerSimple(LoRAOptimizer):
                     "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
                     "tooltip": "Multiplier for CLIP LoRA strengths (stacks with per-LoRA clip_strength when provided)."
                 }),
-                "tuner_data": ("TUNER_DATA", {
-                    "tooltip": "Connect from a Load Tuner Data or LoRA AutoTuner node. When connected, uses the best AutoTuner config instead of defaults."
-                }),
             },
         }
 
-    RETURN_TYPES = ("MODEL", "CLIP", "STRING")
-    RETURN_NAMES = ("model", "clip", "analysis_report")
     FUNCTION = "optimize_merge"
     DESCRIPTION = (
         "Simplified LoRA Optimizer — merges a LoRA stack with good defaults. "
-        "Accepts optional tuner_data to use AutoTuner results. "
         "Use LoRA Optimizer (Advanced) for sparsification, merge quality, "
         "SVD device, and other fine-tuning options."
     )
@@ -4896,37 +5910,30 @@ class LoRAOptimizerSimple(LoRAOptimizer):
     )
 
     def optimize_merge(self, model, lora_stack, output_strength,
-                       clip=None, clip_strength_multiplier=1.0,
-                       tuner_data=None, **_kwargs):
-        settings_source = "from_autotuner" if tuner_data is not None else "manual"
-        result = super().optimize_merge(
+                       clip=None, clip_strength_multiplier=1.0, **_kwargs):
+        return super().optimize_merge(
             model, lora_stack, output_strength,
             clip=clip, clip_strength_multiplier=clip_strength_multiplier,
-            tuner_data=tuner_data, settings_source=settings_source,
             **self._SIMPLE_DEFAULTS,
         )
-        return result[:3]
 
     @classmethod
     def IS_CHANGED(cls, model, lora_stack, output_strength,
-                   clip=None, clip_strength_multiplier=1.0,
-                   tuner_data=None, **_kwargs):
+                   clip=None, clip_strength_multiplier=1.0, **_kwargs):
         return LoRAOptimizer.IS_CHANGED(
             model, lora_stack, output_strength,
             clip=clip, clip_strength_multiplier=clip_strength_multiplier,
-            tuner_data=tuner_data,
-            settings_source="from_autotuner" if tuner_data is not None else "manual",
             **cls._SIMPLE_DEFAULTS,
         )
 
 
 class LoRAAutoTuner(LoRAOptimizer):
     """
-    Automatic parameter sweep that finds the best merge configuration for
-    a given LoRA stack. Runs Pass 1 analysis once, scores all parameter
-    combinations via heuristic, then merges top-N candidates and measures
-    output quality. Outputs the #1 result as MODEL/CLIP, plus a ranked
-    report and TUNER_DATA for optional override via a Merge Selector node.
+    Automatic parameter sweep that ranks merge configurations for a given
+    LoRA stack. Runs Pass 1 analysis once, scores all parameter combinations
+    via heuristic, then merges top-N candidates and measures output quality.
+    Outputs the top-ranked result as MODEL/CLIP, plus a ranked report and
+    TUNER_DATA for optional override via a Merge Selector node.
     """
 
     @classmethod
@@ -4974,9 +5981,13 @@ class LoRAAutoTuner(LoRAOptimizer):
                 }),
                 "auto_strength_floor": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Minimum scale factor for auto-strength when LoRAs are orthogonal (independent). "
-                               "-1 = auto (1.0 for video models like Wan/LTX to preserve motion, 0.85 for image models). "
-                               "Set manually to override — e.g. 0.9 for less reduction, 1.0 to disable reduction for orthogonal LoRAs entirely."
+                    "tooltip": "Minimum auto-strength scale factor for orthogonal LoRAs. -1 = architecture-aware default. Increase toward 1.0 to preserve more independent LoRA energy."
+                }),
+                "calibration_data": ("CALIBRATION_DATA", {
+                    "tooltip": "Optional activation calibration statistics used for activation-aware analysis and measured scoring."
+                }),
+                "evaluator": ("AUTOTUNER_EVALUATOR", {
+                    "tooltip": "Optional external evaluator spec. Use this to blend prompt/reference scoring from your own generation code with the built-in merge metrics."
                 }),
                 "record_dataset": (["disabled", "enabled"], {
                     "default": "disabled",
@@ -5003,15 +6014,17 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "tooltip": "Controls how many prefixes Phase 2 scores per candidate. "
                                "All candidates are scored on the same subset so ranking stays fair.\n\n"
                                "• full — Score every prefix. Best accuracy, slowest. Use when merging very different LoRAs (e.g. style + character + concept) where block behavior varies a lot.\n"
-                               "• fast — Every 2nd prefix (~50%% faster). Higher accuracy than turbo, still much faster than full.\n"
+                               "• fast — Every 2nd prefix (~50%% faster). Good default for most merges.\n"
                                "• turbo — Every 3rd prefix (~67%% faster). Works well when your LoRAs have similar conflict across blocks (e.g. multiple characters from the same trainer).\n"
                                "• turbo+ — Every 4th prefix (~75%% faster). Best for large models (DiT/Flux/WAN) or when iterating quickly. May miss subtle block-level differences on SD/SDXL."
                 }),
                 "output_mode": (["merge", "tuning_only"], {
                     "default": "merge",
-                    "tooltip": "merge: output the best merged model (default). "
-                               "tuning_only: skip the final merge — output the base model unchanged and pass tuner_data to a downstream LoRA Optimizer for merging. "
-                               "Use tuning_only when chaining AutoTuner → Optimizer in a single model line."
+                    "tooltip": "merge: output the top-ranked merged model. tuning_only: skip the final merge and pass the base model through so a downstream optimizer can apply the selected AutoTuner settings."
+                }),
+                "decision_smoothing": ("FLOAT", {
+                    "default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Smooth per-group decision metrics toward each block average before candidate ranking and final merge. 0 disables smoothing."
                 }),
             },
         }
@@ -5021,19 +6034,21 @@ class LoRAAutoTuner(LoRAOptimizer):
     FUNCTION = "auto_tune"
     CATEGORY = "LoRA Optimizer"
     DESCRIPTION = (
-        "Automatically sweeps all merge parameters and finds the best "
-        "configuration for your LoRA stack. Outputs the best merge directly. "
-        "Connect TUNER_DATA to a Merge Selector node to try alternatives."
+        "Automatically sweeps all merge parameters and ranks "
+        "configurations for your LoRA stack. Outputs the top-ranked merge "
+        "directly. Connect TUNER_DATA to a Merge Selector node to try alternatives."
     )
 
     def auto_tune(self, model, lora_stack, output_strength, clip=None,
                   clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
                   scoring_svd="disabled", scoring_device="gpu",
                   architecture_preset="auto", auto_strength_floor=-1.0,
+                  calibration_data=None, evaluator=None,
                   record_dataset="disabled",
                   cache_patches="enabled",
                   diff_cache_mode="disabled", diff_cache_ram_pct=0.5, vram_budget=0.0,
-                  scoring_speed="full", output_mode="merge"):
+                  scoring_speed="full", output_mode="merge",
+                  decision_smoothing=0.25):
         import hashlib, json
 
         # --- Normalize & validate stack ---
@@ -5046,11 +6061,14 @@ class LoRAAutoTuner(LoRAOptimizer):
             # Single LoRA: nothing to tune, delegate directly
             if output_mode == "tuning_only":
                 return (model, clip, "Single LoRA detected -- tuning_only passthrough.", "", None, None)
-            merged_model, merged_clip, report, _, lora_data = super().optimize_merge(
+            merged_model, merged_clip, report, lora_data = super().optimize_merge(
                 model, lora_stack, output_strength,
                 clip=clip, clip_strength_multiplier=clip_strength_multiplier,
                 normalize_keys=normalize_keys, behavior_profile="v1.2",
                 architecture_preset=architecture_preset, vram_budget=vram_budget,
+                auto_strength_floor=auto_strength_floor,
+                decision_smoothing=decision_smoothing,
+                calibration_data=calibration_data,
             )
             return (merged_model, merged_clip,
                     "Single LoRA detected -- no parameters to tune.\n\n" + report, report, None, lora_data)
@@ -5060,24 +6078,24 @@ class LoRAAutoTuner(LoRAOptimizer):
                                 sort_keys=True)
         lora_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
-        # Check AutoTuner cache (output_mode excluded so mode switches reuse cached sweep)
+        calibration_hash = self._stable_data_hash(calibration_data) if calibration_data is not None else ""
+        evaluator_hash = self._stable_data_hash(evaluator) if evaluator is not None else ""
+
+        # Check AutoTuner cache
         at_cache_key = hashlib.sha256(
             f"{lora_hash}|os={output_strength}|csm={clip_strength_multiplier}"
             f"|top_n={top_n}|nk={normalize_keys}|ss={scoring_svd}"
             f"|ap={architecture_preset}|vb={vram_budget}"
-            f"|spd={scoring_speed}|mid={id(model)}".encode()
+            f"|spd={scoring_speed}|mid={id(model)}|asf={auto_strength_floor}|ds={decision_smoothing}|ch={calibration_hash}|eh={evaluator_hash}".encode()
         ).hexdigest()[:16]
         if cache_patches == "enabled" and hasattr(self, '_autotuner_cache') and at_cache_key in self._autotuner_cache:
             cached_result, cached_mode = self._autotuner_cache[at_cache_key]
             if output_mode == "tuning_only":
-                # Return base model + cached tuner_data (no merge needed)
                 logging.info("[LoRA AutoTuner] Using cached result (tuning_only passthrough)")
                 return (model, clip, cached_result[2], "", cached_result[4], None)
-            elif cached_mode == "merge":
-                # Cached has merged model, return as-is
+            if cached_mode == "merge":
                 logging.info("[LoRA AutoTuner] Using cached result")
                 return cached_result
-            # else: cached was tuning_only but now need merge — fall through to re-run
 
         # --- Pass 1: Analysis (run once, reuse for all configs) ---
         model_keys = self._get_model_keys(model)
@@ -5085,50 +6103,44 @@ class LoRAAutoTuner(LoRAOptimizer):
         if clip is not None:
             clip_keys = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, {})
 
-        # Collect all prefixes (match parent's suffix set)
-        all_lora_prefixes = set()
-        for item in active_loras:
-            for key in item["lora"].keys():
-                for suffix in [".lora_up.weight", ".lora_down.weight", "_lora.up.weight",
-                              "_lora.down.weight", ".lora_B.weight", ".lora_A.weight",
-                              ".lora.up.weight", ".lora.down.weight", ".alpha"]:
-                    if key.endswith(suffix):
-                        prefix = key[:-len(suffix)]
-                        all_lora_prefixes.add(prefix)
-                        break
-        all_lora_prefixes = sorted(all_lora_prefixes)
-
-        if not all_lora_prefixes:
-            return (model, clip, "No LoRA prefixes found.", "", None, None)
+        all_lora_prefixes = self._collect_lora_prefixes(active_loras)
+        target_groups = self._build_target_groups(all_lora_prefixes, model_keys, clip_keys)
+        if not target_groups:
+            return (model, clip, "No compatible LoRA target groups found.", "", None, None)
 
         # Determine compute device
         compute_device = self._get_compute_device()
         use_gpu = compute_device.type != "cpu"
 
-        # Run Pass 1 analysis
-        logging.info(f"[LoRA AutoTuner] Pass 1: Analyzing {len(all_lora_prefixes)} prefixes...")
+        logging.info(f"[LoRA AutoTuner] Pass 1: Analyzing {len(target_groups)} target groups...")
         t_start = time.time()
-        # Progress bar: analysis prefixes + top_n merges (+ 1 final merge when subsampling)
+        # Progress bar: analysis groups + top_n merges (+ 1 final merge when subsampling)
         n_pbar_merges = top_n + (1 if scoring_speed != "full" and top_n > 1 and output_mode != "tuning_only" else 0)
-        pbar = comfy.utils.ProgressBar(len(all_lora_prefixes) + n_pbar_merges)
-
-        analysis = self._run_pass1_analysis(active_loras, all_lora_prefixes,
-                                            model_keys, clip_keys, model, clip, compute_device,
-                                            progress_callback=lambda: pbar.update(1))
-        all_key_targets = analysis["all_key_targets"]
-        per_lora_stats = analysis["per_lora_stats"]
-        pair_accum = analysis["pair_accum"]
-        all_magnitude_samples = analysis["all_magnitude_samples"]
-        prefix_count = analysis["prefix_count"]
-        prefix_stats = analysis["prefix_stats"]
-        skipped_keys = analysis["skipped_keys"]
-        pairs = analysis["pairs"]
+        pbar = comfy.utils.ProgressBar(len(target_groups) + n_pbar_merges)
+        analysis_data = self._run_group_analysis(
+            target_groups, active_loras, model, clip, compute_device,
+            clip_strength_multiplier=clip_strength_multiplier,
+            merge_quality="standard",
+            calibration_data=calibration_data,
+            decision_smoothing=decision_smoothing,
+            progress_cb=lambda: pbar.update(1),
+        )
+        all_key_targets = analysis_data["all_key_targets"]
+        target_groups = analysis_data["target_groups"]
+        prefix_stats = analysis_data["prefix_stats"]
+        per_lora_stats = analysis_data["per_lora_stats"]
+        pair_accum = analysis_data["pair_accum"]
+        branch_energy = analysis_data["branch_energy"]
+        all_magnitude_samples = analysis_data["all_magnitude_samples"]
+        prefix_count = analysis_data["prefix_count"]
+        skipped_keys = analysis_data["skipped_keys"]
+        pairs = analysis_data["pairs"]
 
         if prefix_count == 0:
             return (model, clip, "No compatible LoRA keys found.", "", None, None)
 
         t_analysis = time.time() - t_start
-        logging.info(f"[LoRA AutoTuner] Analysis complete: {prefix_count} prefixes ({t_analysis:.1f}s)")
+        logging.info(f"[LoRA AutoTuner] Analysis complete: {prefix_count} target groups ({t_analysis:.1f}s)")
 
         # Finalize global stats
         l2_means = []
@@ -5136,30 +6148,59 @@ class LoRAAutoTuner(LoRAOptimizer):
             l2_mean = sum(stat["l2_norms"]) / len(stat["l2_norms"]) if stat["l2_norms"] else 0
             l2_means.append(l2_mean)
 
-        total_overlap = sum(pair_accum[p][0] for p in pairs)
-        total_conflict = sum(pair_accum[p][1] for p in pairs)
+        total_overlap = sum(pair_accum[p]["overlap"] for p in pairs)
+        total_conflict = sum(pair_accum[p]["conflict"] for p in pairs)
+        total_weighted_total = sum(pair_accum[p]["weighted_total"] for p in pairs)
+        total_weighted_conflict = sum(pair_accum[p]["weighted_conflict"] for p in pairs)
+        total_expected_conflict_weighted = sum(pair_accum[p]["expected_conflict_weighted"] for p in pairs)
+        total_excess_conflict_weighted = sum(pair_accum[p]["excess_conflict_weighted"] for p in pairs)
+        total_subspace_num = sum(pair_accum[p]["subspace_num"] for p in pairs)
+        total_subspace_den = sum(pair_accum[p]["subspace_den"] for p in pairs)
         avg_conflict_ratio = total_conflict / total_overlap if total_overlap > 0 else 0
+        avg_excess_conflict = total_excess_conflict_weighted / total_weighted_total if total_weighted_total > 0 else 0.0
+        avg_subspace_overlap = total_subspace_num / total_subspace_den if total_subspace_den > 0 else 0.0
 
         pairwise_similarities = {}
         for i, j in pairs:
-            ov, conf, dot, na_sq, nb_sq = pair_accum[(i, j)]
+            dot = pair_accum[(i, j)]["dot"]
+            na_sq = pair_accum[(i, j)]["norm_a_sq"]
+            nb_sq = pair_accum[(i, j)]["norm_b_sq"]
             denom = math.sqrt(na_sq) * math.sqrt(nb_sq)
             pairwise_similarities[(i, j)] = dot / denom if denom > 0 else 0.0
 
-        valid_l2 = [m for m in l2_means if m > 0]
+        branch_measure = branch_energy["model"]["importance"] if calibration_data is not None else branch_energy["model"]["norm_sq"]
+        model_effective = [
+            abs(active_loras[i]["strength"]) * math.sqrt(max(branch_measure[i], 0.0))
+            for i in range(len(active_loras))
+        ]
+        valid_l2 = [m for m in model_effective if m > 0]
         magnitude_ratio = max(valid_l2) / min(valid_l2) if len(valid_l2) >= 2 else 1.0
 
         avg_cos_sim = (sum(pairwise_similarities.values())
                        / len(pairwise_similarities)) if pairwise_similarities else 0.0
+        analysis_summary = {
+            "n_loras": len(active_loras),
+            "prefix_count": prefix_count,
+            "avg_conflict_ratio": avg_conflict_ratio,
+            "avg_excess_conflict": avg_excess_conflict,
+            "avg_subspace_overlap": avg_subspace_overlap,
+            "avg_cosine_sim": avg_cos_sim,
+            "magnitude_ratio": magnitude_ratio,
+            "importance_mode": "activation" if calibration_data is not None else "frobenius",
+            "decision_smoothing": decision_smoothing,
+        }
 
         _analysis_cache = {
             "all_key_targets": all_key_targets,
+            "target_groups": target_groups,
             "prefix_stats": prefix_stats,
             "per_lora_stats": per_lora_stats,
             "pair_accum": pair_accum,
+            "branch_energy": branch_energy,
             "all_magnitude_samples": all_magnitude_samples,
             "prefix_count": prefix_count,
             "skipped_keys": skipped_keys,
+            "pairs": pairs,
         }
 
         # Resolve architecture preset for scoring
@@ -5174,7 +6215,9 @@ class LoRAAutoTuner(LoRAOptimizer):
         for config in grid:
             h_score = _score_config_heuristic(
                 config, avg_conflict_ratio, avg_cos_sim,
-                magnitude_ratio, prefix_stats, arch_preset=tuner_arch_preset)
+                magnitude_ratio, prefix_stats, arch_preset=tuner_arch_preset,
+                avg_excess_conflict=avg_excess_conflict,
+                avg_subspace_overlap=avg_subspace_overlap)
             scored.append((h_score, config))
         scored.sort(key=lambda x: x[0], reverse=True)
         logging.info(f"[LoRA AutoTuner] Scored {len(grid)} combos in {time.time() - t_start:.1f}s")
@@ -5185,8 +6228,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                          f"{' +' + c['sparsification'] if c['sparsification'] != 'disabled' else ''}"
                          f" auto_str={c['auto_strength']} {c['optimization_mode']}")
 
-        # Pre-compute per-prefix density from magnitude samples before freeing them.
-        # Phase 2's per-prefix auto_select_params needs density but magnitude_samples
+        # Pre-compute per-group density from magnitude samples before freeing them.
+        # Phase 2's per-group auto_select_params needs density but magnitude_samples
         # are large — store the scalar result and free the raw samples.
         for pf in prefix_stats.values():
             samples = pf.get("magnitude_samples")
@@ -5202,8 +6245,8 @@ class LoRAAutoTuner(LoRAOptimizer):
         scoring_cache = _analysis_cache  # default: use full cache
         if use_subsampling:
             step = {"fast": 2, "turbo": 3, "turbo+": 4}[scoring_speed]
-            # Separate single-LoRA prefixes (always included, identical across candidates)
-            # from multi-LoRA prefixes (where merge strategy matters)
+            # Separate single-LoRA groups (always included, identical across candidates)
+            # from multi-LoRA groups (where merge strategy matters)
             single_lora_targets = {}
             multi_lora_targets = {}
             for pfx, tgt in all_key_targets.items():
@@ -5211,18 +6254,28 @@ class LoRAAutoTuner(LoRAOptimizer):
                     single_lora_targets[pfx] = tgt
                 else:
                     multi_lora_targets[pfx] = tgt
-            # Sort multi-LoRA prefixes by conflict_ratio descending (highest conflict first)
+            # Sort multi-LoRA groups by conflict_ratio descending (highest conflict first)
             sorted_multi = sorted(
                 multi_lora_targets.keys(),
-                key=lambda p: prefix_stats.get(p, {}).get("conflict_ratio", 0.0),
+                key=lambda p: prefix_stats.get(p, {}).get("decision_conflict", prefix_stats.get(p, {}).get("conflict_ratio", 0.0)),
                 reverse=True,
             )
-            # Keep every Nth prefix from the sorted list
+            # Keep every Nth group from the sorted list
             subsampled_multi = {p: multi_lora_targets[p] for p in sorted_multi[::step]}
             scoring_targets = {**single_lora_targets, **subsampled_multi}
-            scoring_cache = {**_analysis_cache, "all_key_targets": scoring_targets}
+            scoring_target_groups = {
+                label: target_groups[label]
+                for label in scoring_targets.keys()
+                if label in target_groups
+            }
+            scoring_cache = {
+                **_analysis_cache,
+                "all_key_targets": scoring_targets,
+                "target_groups": scoring_target_groups,
+                "prefix_count": len(scoring_target_groups),
+            }
             logging.info(f"[LoRA AutoTuner] Scoring speed '{scoring_speed}': "
-                         f"scoring {len(scoring_targets)}/{len(all_key_targets)} prefixes "
+                         f"scoring {len(scoring_targets)}/{len(all_key_targets)} groups "
                          f"({len(single_lora_targets)} single-LoRA + "
                          f"{len(subsampled_multi)}/{len(multi_lora_targets)} multi-LoRA)")
 
@@ -5255,7 +6308,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             # merge_strategy_override would force one mode everywhere, defeating per-prefix logic.
             strategy_override = config["merge_mode"] if config["optimization_mode"] == "global" else ""
 
-            merged_model, merged_clip, _report, _, lora_data = super().optimize_merge(
+            merged_model, merged_clip, _report, lora_data = super().optimize_merge(
                 model, lora_stack, output_strength,
                 clip=clip,
                 clip_strength_multiplier=clip_strength_multiplier,
@@ -5275,6 +6328,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                 normalize_keys=normalize_keys,
                 behavior_profile="v1.2",
                 architecture_preset=architecture_preset,
+                decision_smoothing=decision_smoothing,
+                calibration_data=calibration_data,
                 _analysis_cache=scoring_cache,
                 _diff_cache=_diff_cache,
                 _skip_report=True,
@@ -5287,19 +6342,38 @@ class LoRAAutoTuner(LoRAOptimizer):
             compute_svd = scoring_svd == "enabled"
             score_dev = torch.device("cuda") if scoring_device == "gpu" and torch.cuda.is_available() else None
             t_score = time.time()
-            measured = _score_merge_result(m_patches, c_patches, compute_svd=compute_svd, score_device=score_dev)
+            measured = _score_merge_result(
+                m_patches, c_patches, compute_svd=compute_svd,
+                score_device=score_dev, calibration_data=calibration_data
+            )
             t_score_elapsed = time.time() - t_score
+            external_eval = _run_autotuner_evaluator(
+                evaluator, merged_model, merged_clip, lora_data, config, analysis_summary
+            ) if evaluator else None
+            external_score = external_eval.get("score") if external_eval else None
+            combine_mode = evaluator.get("combine_mode", "blend") if evaluator else "blend"
+            eval_weight = max(0.0, min(1.0, float(evaluator.get("weight", 0.5)))) if evaluator else 0.5
+            final_score = measured["composite_score"]
+            if external_score is not None:
+                if combine_mode == "external_only":
+                    final_score = external_score
+                elif combine_mode == "multiply":
+                    final_score = final_score * external_score
+                else:
+                    final_score = (1.0 - eval_weight) * final_score + eval_weight * external_score
 
             t_elapsed = time.time() - t_merge
             logging.info(f"[LoRA AutoTuner]   Candidate #{rank_idx + 1}: "
-                         f"measured={measured['composite_score']:.3f} "
+                         f"measured={measured['composite_score']:.3f}"
+                         f"{f', external={external_score:.3f}' if external_score is not None else ''}"
+                         f", final={final_score:.3f} "
                          f"(merge {t_elapsed - t_score_elapsed:.1f}s + score {t_score_elapsed:.1f}s)")
             pbar.update(1)
 
             if use_subsampling or output_mode == "tuning_only":
-                # When subsampling or tuning_only, discard all candidates
+                # When subsampling, discard all candidates — final full merge comes after
                 del merged_model, merged_clip, lora_data
-            elif measured["composite_score"] > best_score:
+            elif final_score > best_score:
                 # Keep only the best model in memory, free the rest immediately
                 # Free previous best before replacing
                 del best_model, best_clip, best_lora_data
@@ -5310,8 +6384,8 @@ class LoRAAutoTuner(LoRAOptimizer):
             else:
                 # Discard this candidate's heavy objects immediately
                 del merged_model, merged_clip, lora_data
-            if measured["composite_score"] > best_score:
-                best_score = measured["composite_score"]
+            if final_score > best_score:
+                best_score = final_score
                 best_config = config
             del m_patches, c_patches  # Drop patch-dict references so tensors can free
             gc.collect()
@@ -5322,22 +6396,26 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "rank": rank_idx + 1,
                 "score_heuristic": h_score,
                 "score_measured": measured["composite_score"],
+                "score_external": external_score,
+                "score_final": final_score,
                 "config": config,
                 "metrics": {
                     "norm_preservation": measured.get("norm_mean", 0.0),
                     "effective_rank_mean": measured.get("effective_rank_mean", 0.0),
                     "sparsity_mean": measured.get("sparsity_mean", 0.0),
                     "norm_cv": measured.get("norm_cv", 0.0),
+                    "importance_cv": measured.get("importance_cv", measured.get("norm_cv", 0.0)),
                 },
+                "external_details": external_eval.get("details") if external_eval else None,
             })
 
-        # Final full merge when subsampling was used (skip if tuning_only)
+        # Final full merge when subsampling was used
         if use_subsampling and best_config is not None and output_mode != "tuning_only":
             logging.info(f"[LoRA AutoTuner] Final merge with winning config "
                          f"({best_config['merge_mode']}, {best_config['merge_quality']})...")
             t_final = time.time()
             strategy_override = best_config["merge_mode"] if best_config["optimization_mode"] == "global" else ""
-            best_model, best_clip, best_analysis_report, _, best_lora_data = super().optimize_merge(
+            best_model, best_clip, best_analysis_report, best_lora_data = super().optimize_merge(
                 model, lora_stack, output_strength,
                 clip=clip,
                 clip_strength_multiplier=clip_strength_multiplier,
@@ -5357,6 +6435,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                 normalize_keys=normalize_keys,
                 behavior_profile="v1.2",
                 architecture_preset=architecture_preset,
+                decision_smoothing=decision_smoothing,
+                calibration_data=calibration_data,
                 _analysis_cache=_analysis_cache,
                 _diff_cache=_diff_cache,
                 _skip_report=True,
@@ -5379,8 +6459,8 @@ class LoRAAutoTuner(LoRAOptimizer):
         if use_gpu:
             torch.cuda.empty_cache()
 
-        # Sort by measured score
-        results.sort(key=lambda x: x["score_measured"], reverse=True)
+        # Sort by final score
+        results.sort(key=lambda x: x["score_final"], reverse=True)
         for i, r in enumerate(results):
             r["rank"] = i + 1
 
@@ -5395,19 +6475,19 @@ class LoRAAutoTuner(LoRAOptimizer):
             "lora_hash": lora_hash,
             "normalize_keys": normalize_keys,
             "architecture_preset": architecture_preset,
-            "analysis_summary": {
-                "n_loras": len(active_loras),
-                "prefix_count": prefix_count,
-                "avg_conflict_ratio": avg_conflict_ratio,
-                "avg_cosine_sim": avg_cos_sim,
-                "magnitude_ratio": magnitude_ratio,
-            },
+            "auto_strength_floor": auto_strength_floor,
+            "calibration_hash": calibration_hash,
+            "decision_smoothing": decision_smoothing,
+            "analysis_summary": analysis_summary,
             "top_n": [{
                 "rank": r["rank"],
                 "score_heuristic": r["score_heuristic"],
                 "score_measured": r["score_measured"],
+                "score_external": r.get("score_external"),
+                "score_final": r["score_final"],
                 "config": r["config"],
                 "metrics": r["metrics"],
+                "external_details": r.get("external_details"),
             } for r in results],
         }
 
@@ -5425,7 +6505,6 @@ class LoRAAutoTuner(LoRAOptimizer):
             suggested_max_strength=suggested_max, scoring_speed=scoring_speed)
 
         if output_mode == "tuning_only":
-            # Passthrough: return base model unchanged, no merge result
             for r in results:
                 r.pop("merged_model", None)
                 r.pop("merged_clip", None)
@@ -5481,13 +6560,17 @@ class LoRAAutoTuner(LoRAOptimizer):
 
             # Summarize per-prefix conflict/cosine distributions
             conflict_ratios = []
+            excess_conflicts = []
             cos_sims = []
             mag_ratios = []
+            subspace_overlaps = []
             for pf in prefix_stats.values():
                 if pf.get("n_loras", 0) > 1:
-                    conflict_ratios.append(pf["conflict_ratio"])
+                    conflict_ratios.append(pf.get("decision_conflict", pf["conflict_ratio"]))
+                    excess_conflicts.append(pf.get("excess_conflict", 0.0))
                     cos_sims.append(pf.get("avg_cos_sim", 0.0))
                     mag_ratios.append(pf.get("magnitude_ratio", 1.0))
+                    subspace_overlaps.append(pf.get("avg_subspace_overlap", 0.0))
 
             entry = {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -5506,11 +6589,23 @@ class LoRAAutoTuner(LoRAOptimizer):
                                if len(conflict_ratios) > 1 else 0,
                         "n": len(conflict_ratios),
                     },
+                    "excess_conflicts": {
+                        "min": min(excess_conflicts) if excess_conflicts else 0,
+                        "max": max(excess_conflicts) if excess_conflicts else 0,
+                        "mean": sum(excess_conflicts) / len(excess_conflicts) if excess_conflicts else 0,
+                        "n": len(excess_conflicts),
+                    },
                     "cos_sims": {
                         "min": min(cos_sims) if cos_sims else 0,
                         "max": max(cos_sims) if cos_sims else 0,
                         "mean": sum(cos_sims) / len(cos_sims) if cos_sims else 0,
                         "n": len(cos_sims),
+                    },
+                    "subspace_overlaps": {
+                        "min": min(subspace_overlaps) if subspace_overlaps else 0,
+                        "max": max(subspace_overlaps) if subspace_overlaps else 0,
+                        "mean": sum(subspace_overlaps) / len(subspace_overlaps) if subspace_overlaps else 0,
+                        "n": len(subspace_overlaps),
                     },
                     "mag_ratios": {
                         "min": min(mag_ratios) if mag_ratios else 1,
@@ -5541,13 +6636,17 @@ class LoRAAutoTuner(LoRAOptimizer):
         s = analysis_summary
         lines.append(f"    LoRAs: {s['n_loras']} | Prefixes: {s['prefix_count']} "
                      f"| Avg conflict: {s['avg_conflict_ratio']:.1%}")
+        lines.append(f"    Excess conflict: {s.get('avg_excess_conflict', 0.0):.1%} "
+                     f"| Subspace overlap: {s.get('avg_subspace_overlap', 0.0):.2f}")
         lines.append(f"    Avg cosine similarity: {s['avg_cosine_sim']:.2f} "
-                     f"| Magnitude ratio: {s['magnitude_ratio']:.1f}x")
+                     f"| Importance ratio: {s['magnitude_ratio']:.1f}x ({s.get('importance_mode', 'frobenius')})")
         lines.append(f"    Output strength: {output_strength}")
         if suggested_max_strength is not None:
             lines.append(f"    Suggested max output_strength: {suggested_max_strength:.2f}")
         if scoring_speed != "full":
             lines.append(f"    Scoring speed: {scoring_speed} (subsampled prefix scoring)")
+        if s.get("decision_smoothing", 0.0) > 0:
+            lines.append(f"    Decision smoothing: {s['decision_smoothing']:.2f}")
         lines.append("")
         lines.append("  " + "-" * 38)
         lines.append(f"  Top {len(results)} Configurations")
@@ -5559,9 +6658,11 @@ class LoRAAutoTuner(LoRAOptimizer):
             m = r["metrics"]
             marker = " (applied to output)" if r["rank"] == 1 else ""
             star = " \u2605" if r["rank"] == 1 else ""
-            lines.append(f"  #{r['rank']}{star}{marker}"
-                         f"          Score: {r['score_measured']:.2f}")
-            mode_display = "per-prefix (auto)" if c["optimization_mode"] == "per_prefix" else c["merge_mode"]
+            score_line = f"  #{r['rank']}{star}{marker}          Score: {r['score_final']:.2f}"
+            if r.get("score_external") is not None:
+                score_line += f" (internal {r['score_measured']:.2f}, external {r['score_external']:.2f})"
+            lines.append(score_line)
+            mode_display = "per-group (auto)" if c["optimization_mode"] == "per_prefix" else c["merge_mode"]
             lines.append(f"    Mode: {mode_display} | Quality: {c['merge_quality']}")
             if c["sparsification"] != "disabled":
                 spars_info = f"{c['sparsification']} (density={c['sparsification_density']}"
@@ -5587,13 +6688,18 @@ class LoRAAutoTuner(LoRAOptimizer):
     def IS_CHANGED(cls, model, lora_stack, output_strength, clip=None,
                    clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
                    scoring_svd="disabled", scoring_device="gpu",
-                   architecture_preset="auto", record_dataset="disabled",
+                   architecture_preset="auto", auto_strength_floor=-1.0,
+                   calibration_data=None, evaluator=None, record_dataset="disabled",
                    cache_patches="enabled",
                    diff_cache_mode="disabled", diff_cache_ram_pct=0.5,
-                   vram_budget=0.0, scoring_speed="full", output_mode="merge"):
+                   vram_budget=0.0, scoring_speed="full", output_mode="merge",
+                   decision_smoothing=0.25):
+        calibration_hash = cls._stable_data_hash(calibration_data) if calibration_data is not None else ""
+        evaluator_hash = cls._stable_data_hash(evaluator) if evaluator is not None else ""
         return (id(model), id(lora_stack), output_strength, clip_strength_multiplier, top_n,
                 normalize_keys, scoring_svd, scoring_device, architecture_preset,
-                vram_budget, record_dataset, scoring_speed, output_mode)
+                vram_budget, record_dataset, scoring_speed, output_mode,
+                auto_strength_floor, decision_smoothing, calibration_hash, evaluator_hash)
 
 
 class LoRAMergeSelector(LoRAOptimizer):
@@ -5618,7 +6724,7 @@ class LoRAMergeSelector(LoRAOptimizer):
                 }),
                 "selection": ("INT", {
                     "default": 1, "min": 1, "max": 10, "step": 1,
-                    "tooltip": "Which ranked configuration to apply (1 = best, 2 = second best, etc.)."
+                    "tooltip": "Which ranked configuration to apply (1 = top-ranked, 2 = next-ranked, etc.)."
                 }),
                 "output_strength": ("FLOAT", {
                     "default": 1.0, "min": -1.0, "max": 10.0, "step": 0.05,
@@ -5632,6 +6738,17 @@ class LoRAMergeSelector(LoRAOptimizer):
                 "clip_strength_multiplier": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
                     "tooltip": "Multiplier for CLIP LoRA strengths."
+                }),
+                "auto_strength_floor": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Minimum auto-strength scale factor for orthogonal LoRAs. Leave at -1 to use the AutoTuner's stored setting when available."
+                }),
+                "decision_smoothing": ("FLOAT", {
+                    "default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Must match the AutoTuner run when per-group decisions depend on smoothing. 0 disables smoothing."
+                }),
+                "calibration_data": ("CALIBRATION_DATA", {
+                    "tooltip": "Optional activation calibration data. Connect the same object used during AutoTuner if candidate ranking depended on activation-aware importance."
                 }),
                 "vram_budget": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
@@ -5651,6 +6768,7 @@ class LoRAMergeSelector(LoRAOptimizer):
 
     def select_merge(self, model, lora_stack, tuner_data, selection,
                      output_strength, clip=None, clip_strength_multiplier=1.0,
+                     auto_strength_floor=-1.0, decision_smoothing=0.25, calibration_data=None,
                      vram_budget=0.0):
         import hashlib, json
 
@@ -5668,6 +6786,13 @@ class LoRAMergeSelector(LoRAOptimizer):
             logging.warning("[Merge Selector] LoRA stack has changed since AutoTuner ran. "
                             "Results may not match. Re-run AutoTuner for accurate results.")
 
+        expected_calibration_hash = tuner_data.get("calibration_hash", "")
+        if expected_calibration_hash:
+            current_calibration_hash = self._stable_data_hash(calibration_data) if calibration_data is not None else ""
+            if current_calibration_hash != expected_calibration_hash:
+                logging.warning("[Merge Selector] calibration_data differs from the AutoTuner run. "
+                                "Per-group decisions may not match the ranked result.")
+
         # Get selected config
         top_n = tuner_data["top_n"]
         if selection < 1 or selection > len(top_n):
@@ -5676,6 +6801,8 @@ class LoRAMergeSelector(LoRAOptimizer):
 
         entry = top_n[selection - 1]
         config = entry["config"]
+        resolved_smoothing = tuner_data.get("decision_smoothing", decision_smoothing)
+        resolved_auto_strength_floor = tuner_data.get("auto_strength_floor", auto_strength_floor)
 
         logging.info(f"[Merge Selector] Applying config #{selection}: "
                      f"{config['merge_mode']}, {config['merge_quality']}")
@@ -5684,11 +6811,12 @@ class LoRAMergeSelector(LoRAOptimizer):
         # In per_prefix mode, let the optimizer auto-select strategy per prefix.
         strategy_override = config["merge_mode"] if config["optimization_mode"] == "global" else ""
 
-        merged_model, merged_clip, _report, _, _lora_data = super().optimize_merge(
+        merged_model, merged_clip, _report, _lora_data = super().optimize_merge(
             model, lora_stack, output_strength,
             clip=clip,
             clip_strength_multiplier=clip_strength_multiplier,
             auto_strength=config["auto_strength"],
+            auto_strength_floor=resolved_auto_strength_floor,
             optimization_mode=config["optimization_mode"],
             sparsification=config["sparsification"],
             sparsification_density=config["sparsification_density"],
@@ -5703,12 +6831,14 @@ class LoRAMergeSelector(LoRAOptimizer):
             normalize_keys=tuner_data.get("normalize_keys", "disabled"),
             behavior_profile="v1.2",
             architecture_preset=tuner_data.get("architecture_preset", "auto"),
+            decision_smoothing=resolved_smoothing,
+            calibration_data=calibration_data,
         )
 
         # Build report for this selection
         lines = []
         lines.append(f"Merge Selector \u2014 Applied config #{selection}")
-        mode_display = "per-prefix (auto)" if config["optimization_mode"] == "per_prefix" else config["merge_mode"]
+        mode_display = "per-group (auto)" if config["optimization_mode"] == "per_prefix" else config["merge_mode"]
         lines.append(f"  Mode: {mode_display} | Quality: {config['merge_quality']}")
         if config["sparsification"] != "disabled":
             lines.append(f"  Sparsification: {config['sparsification']} "
@@ -5716,7 +6846,10 @@ class LoRAMergeSelector(LoRAOptimizer):
         lines.append(f"  Auto-strength: {config['auto_strength']} "
                      f"| Optimization: {config['optimization_mode']}")
         lines.append(f"  Heuristic score: {entry['score_heuristic']:.3f} "
-                     f"| Measured score: {entry['score_measured']:.3f}")
+                     f"| Final score: {entry.get('score_final', entry['score_measured']):.3f}")
+        if entry.get("score_external") is not None:
+            lines.append(f"  Internal score: {entry['score_measured']:.3f} "
+                         f"| External score: {entry['score_external']:.3f}")
         report = "\n".join(lines)
 
         return (merged_model, merged_clip, report, _lora_data)
@@ -5724,8 +6857,11 @@ class LoRAMergeSelector(LoRAOptimizer):
     @classmethod
     def IS_CHANGED(cls, model, lora_stack, tuner_data, selection,
                    output_strength, clip=None, clip_strength_multiplier=1.0,
+                   auto_strength_floor=-1.0, decision_smoothing=0.25, calibration_data=None,
                    vram_budget=0.0):
-        return (id(model), id(tuner_data), selection, output_strength, clip_strength_multiplier)
+        calibration_hash = cls._stable_data_hash(calibration_data) if calibration_data is not None else ""
+        return (id(tuner_data), selection, output_strength, clip_strength_multiplier,
+                auto_strength_floor, decision_smoothing, calibration_hash)
 
 
 class WanVideoLoRAOptimizer(LoRAOptimizer):
@@ -5735,7 +6871,7 @@ class WanVideoLoRAOptimizer(LoRAOptimizer):
 
     All merging algorithms (TIES, DARE/DELLA, SVD compression, auto-strength,
     conflict analysis) are inherited from LoRAOptimizer. Wan LoRA key
-    normalization (LyCORIS, diffusers, Fun LoRA, finetrainer) is
+    normalization (LyCORIS, diffusers, Fun LoRA, finetrainer, RS-LoRA) is
     already handled by the parent's _normalize_keys_wan.
     """
 
@@ -5797,7 +6933,7 @@ class WanVideoLoRAOptimizer(LoRAOptimizer):
         kwargs.pop("clip", None)
         kwargs.pop("clip_strength_multiplier", None)
         kwargs.pop("free_vram_between_passes", None)
-        model_out, _clip, report, _, lora_data = super().optimize_merge(
+        model_out, _clip, report, lora_data = super().optimize_merge(
             model, lora_stack, output_strength,
             clip=None, clip_strength_multiplier=1.0, **kwargs
         )
@@ -5827,11 +6963,11 @@ class SaveMergedLoRA:
         return {
             "required": {
                 "lora_data": ("LORA_DATA", {"tooltip": "Connect the lora_data output from LoRA Optimizer here."}),
-                "save_folder": (folder_choices, {"tooltip": "Which loras folder to save into. Lists all configured lora paths (from extra_model_paths.yaml and defaults)."}),
-                "filename": ("STRING", {"default": "merged_lora", "tooltip": "Name for the saved file. Subdirectories allowed (e.g. 'merged/my_lora'). Extension .safetensors is added automatically."}),
+                "save_folder": (folder_choices, {"tooltip": "Which loras folder to save into. Lists configured lora paths from ComfyUI and extra_model_paths.yaml."}),
+                "filename": ("STRING", {"default": "merged_lora", "tooltip": "Name for the saved file. Subdirectories are allowed (e.g. 'merged/my_lora'). Extension .safetensors is added automatically."}),
                 "save_rank": ("INT", {
                     "default": 0, "min": 0, "max": 2048, "step": 4,
-                    "tooltip": "0 = auto (adaptively finds the rank needed for <5%% reconstruction error — recommended). Non-zero = force this rank for any layers that need compression. Higher values = more accurate but larger file."
+                    "tooltip": "0 = auto (adaptively finds the rank needed for <5% reconstruction error — recommended). Non-zero = force this rank for any layers that need compression. Higher values = more accurate but larger file."
                 }),
                 "bake_strength": ("BOOLEAN", {
                     "default": True,
@@ -5852,12 +6988,7 @@ class SaveMergedLoRA:
             logging.warning("[Save Merged LoRA] No lora_data received (optimizer may have returned early). Nothing to save.")
             return ("",)
 
-        # Determine save path — subdirectories allowed, but must stay inside chosen folder
-        save_dir = save_folder
-        base = filename if filename.endswith('.safetensors') else f"{filename}.safetensors"
-        save_path = os.path.join(save_dir, base)
-        if not os.path.realpath(save_path).startswith(os.path.realpath(save_dir) + os.sep):
-            raise ValueError(f"[Save Merged LoRA] Path escapes loras directory: {filename}")
+        save_path = _resolve_safe_output_path(save_folder, filename, ".safetensors", "Save Merged LoRA")
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
         model_patches = lora_data["model_patches"]
@@ -5868,13 +6999,8 @@ class SaveMergedLoRA:
 
         auto_rank = save_rank == 0
 
-        # Auto mode: determine rank for compressing full-rank diffs.
-        # LoRAAdapter patches keep their existing rank (already compressed during merge).
-        # Full-rank diff patches (e.g. TIES) need adaptive estimation — element-wise
-        # operations like TIES trim/elect destroy low-rank structure, so sum_rank
-        # is not a reliable estimate of the effective rank.
+        # Auto mode: adapt rank for any full-rank diffs that need compression.
         if auto_rank:
-            # Check if there are any full-rank diffs that need compression
             has_diffs = any(
                 isinstance(patch, tuple) and patch[0] == "diff"
                 for patch in list(model_patches.values()) + list(clip_patches.values())
@@ -5885,24 +7011,19 @@ class SaveMergedLoRA:
                 logging.info(f"[Save Merged LoRA] Auto rank for diffs: {fallback_rank} "
                              f"(initial estimate {initial_rank}, adapted from sample diffs)")
             else:
-                # All patches are already low-rank (LoRAAdapter) — fallback_rank
-                # is only used for LoKr/LoHa expansion, use sum_rank or 128
                 fallback_rank = lora_data.get("sum_rank", 128)
                 logging.info(f"[Save Merged LoRA] Auto rank: {fallback_rank} (no full-rank diffs to compress)")
 
-        # Detect native storage dtype (fp16/bf16) from patches for output.
-        # SVD compression produces float32 internally, but saved LoRAs should
-        # match the original weight precision to avoid doubling file size.
         save_dtype = None
         for patch in list(model_patches.values()) + list(clip_patches.values()):
             if isinstance(patch, tuple) and patch[0] == "diff":
-                dt = patch[1][0].dtype
-            elif hasattr(patch, 'weights') and patch.weights[0] is not None:
-                dt = patch.weights[0].dtype
+                dtype = patch[1][0].dtype
+            elif hasattr(patch, "weights") and patch.weights[0] is not None:
+                dtype = patch.weights[0].dtype
             else:
                 continue
-            if dt not in (torch.float32, torch.float64):
-                save_dtype = dt
+            if dtype not in (torch.float32, torch.float64):
+                save_dtype = dtype
                 break
         if save_dtype is None:
             save_dtype = torch.float16
@@ -5912,18 +7033,19 @@ class SaveMergedLoRA:
 
         for is_clip, patches in [(False, model_patches), (True, clip_patches)]:
             for target_key, patch in patches.items():
-                # Look up by full target_key first (preserves offset info for split
-                # Q/K/V patches), then fall back to base key string for non-tuple keys.
-                lora_prefix = key_map.get(target_key)
-                if lora_prefix is None:
-                    tkey = target_key[0] if isinstance(target_key, tuple) else target_key
-                    lora_prefix = key_map.get(tkey, tkey)
+                tkey = target_key[0] if isinstance(target_key, tuple) else target_key
+                key_info = key_map.get(target_key)
+                if key_info is None:
+                    key_info = key_map.get(tkey, tkey)
+                if isinstance(key_info, dict):
+                    lora_prefix = key_info.get("canonical_prefix", tkey)
+                else:
+                    lora_prefix = key_info
 
                 if isinstance(patch, (LoKrAdapter, LoHaAdapter)):
-                    # Expand LoKr/LoHa to full diff and compress to standard LoRA format
                     diff_tensor = _LoRAMergeBase._expand_patch_to_diff(patch)
                     rank = fallback_rank if auto_rank else save_rank
-                    compressed = LoRAOptimizer._compress_to_lowrank(diff_tensor, rank)
+                    compressed = LoRAOptimizer._compress_to_lowrank(diff_tensor, rank, output_dtype=save_dtype)
                     mat_up, mat_down, alpha, mid, _, _ = compressed.weights
                     alpha = float(alpha)
                 elif isinstance(patch, LoRAAdapter):
@@ -5932,7 +7054,7 @@ class SaveMergedLoRA:
                 elif isinstance(patch, tuple) and len(patch) == 2 and patch[0] == "diff":
                     diff_tensor = patch[1][0]
                     rank = fallback_rank if auto_rank else save_rank
-                    compressed = LoRAOptimizer._compress_to_lowrank(diff_tensor, rank)
+                    compressed = LoRAOptimizer._compress_to_lowrank(diff_tensor, rank, output_dtype=save_dtype)
                     mat_up, mat_down, alpha, mid, _, _ = compressed.weights
                     alpha = float(alpha)
                 else:
@@ -5947,13 +7069,11 @@ class SaveMergedLoRA:
                 state_dict[f"{lora_prefix}.lora_down.weight"] = mat_down.to(save_dtype).cpu().contiguous()
                 state_dict[f"{lora_prefix}.alpha"] = torch.tensor(alpha)
 
-        # Validate saved data before writing
-        n_keys = len(state_dict) // 3
         unmapped_keys = []
         nan_keys = []
         zero_keys = []
         for is_clip, patches in [(False, model_patches), (True, clip_patches)]:
-            for target_key, patch in patches.items():
+            for target_key, _patch in patches.items():
                 direct = key_map.get(target_key)
                 if direct is None:
                     tkey = target_key[0] if isinstance(target_key, tuple) else target_key
@@ -5964,72 +7084,215 @@ class SaveMergedLoRA:
                     else:
                         unmapped_keys.append(f"{label} (fallback to base key)")
 
-        for skey, tensor in state_dict.items():
-            if skey.endswith('.alpha'):
+        for state_key, tensor in state_dict.items():
+            if state_key.endswith(".alpha"):
                 continue
             if torch.isnan(tensor).any():
-                nan_keys.append(skey)
+                nan_keys.append(state_key)
             if tensor.abs().max().item() == 0:
-                zero_keys.append(skey)
+                zero_keys.append(state_key)
 
         if unmapped_keys:
             logging.warning(f"[Save Merged LoRA] {len(unmapped_keys)} keys fell through to fallback mapping:")
-            for k in unmapped_keys[:5]:
-                logging.warning(f"  {k}")
+            for item in unmapped_keys[:5]:
+                logging.warning(f"  {item}")
         if nan_keys:
-            logging.error(f"[Save Merged LoRA] {len(nan_keys)} tensors contain NaN!")
-            for k in nan_keys[:5]:
-                logging.error(f"  {k}")
+            logging.error(f"[Save Merged LoRA] {len(nan_keys)} tensors contain NaN")
+            for item in nan_keys[:5]:
+                logging.error(f"  {item}")
         if zero_keys:
             logging.warning(f"[Save Merged LoRA] {len(zero_keys)} tensors are all zeros")
 
-        # Log first few saved key prefixes for debugging
-        prefixes = sorted(set(k.rsplit('.lora_', 1)[0] for k in state_dict if '.lora_' in k))
+        prefixes = sorted(set(key.rsplit(".lora_", 1)[0] for key in state_dict if ".lora_" in key))
         if prefixes:
             logging.info(f"[Save Merged LoRA] Sample prefixes: {prefixes[:3]} ... ({len(prefixes)} total)")
 
-        # Roundtrip SVD quality check: compare reconstructed diffs against originals
         svd_errors = []
         for is_clip, patches in [(False, model_patches), (True, clip_patches)]:
             for target_key, patch in patches.items():
-                lora_prefix = key_map.get(target_key)
-                if lora_prefix is None:
+                key_info = key_map.get(target_key)
+                if key_info is None:
+                    continue
+                if isinstance(key_info, dict):
+                    lora_prefix = key_info.get("canonical_prefix")
+                else:
+                    lora_prefix = key_info
+                if not lora_prefix:
                     continue
                 up_key = f"{lora_prefix}.lora_up.weight"
                 down_key = f"{lora_prefix}.lora_down.weight"
                 alpha_key = f"{lora_prefix}.alpha"
                 if up_key not in state_dict:
                     continue
-                # Reconstruct diff from saved up/down
                 saved_up = state_dict[up_key].float()
                 saved_down = state_dict[down_key].float()
                 saved_alpha = state_dict[alpha_key].item()
                 rank = saved_down.shape[0]
                 scale = saved_alpha / rank
                 reconstructed = torch.mm(saved_up, saved_down) * scale
-                # Get original diff for comparison
                 if isinstance(patch, tuple) and patch[0] == "diff":
-                    orig_diff = patch[1][0].float()
+                    original_diff = patch[1][0].float()
                     strength = clip_strength if is_clip else output_strength
-                    if bake_strength:
-                        orig_with_strength = orig_diff * strength
-                    else:
-                        orig_with_strength = orig_diff
-                    orig_norm = orig_with_strength.norm().item()
-                    if orig_norm > 0:
-                        error = (reconstructed - orig_with_strength).norm().item() / orig_norm
+                    reference = original_diff * strength if bake_strength else original_diff
+                    original_norm = reference.norm().item()
+                    if original_norm > 0:
+                        error = (reconstructed - reference).norm().item() / original_norm
                         svd_errors.append(error)
         if svd_errors:
-            avg_err = sum(svd_errors) / len(svd_errors)
-            max_err = max(svd_errors)
+            avg_error = sum(svd_errors) / len(svd_errors)
+            max_error = max(svd_errors)
             logging.info(f"[Save Merged LoRA] SVD reconstruction error: "
-                         f"avg={avg_err:.4f}, max={max_err:.4f} "
+                         f"avg={avg_error:.4f}, max={max_error:.4f} "
                          f"({len(svd_errors)} diffs checked)")
 
         save_file(state_dict, save_path)
-        logging.info(f"[Save Merged LoRA] Saved {n_keys} LoRA keys to {save_path}")
+        logging.info(f"[Save Merged LoRA] Saved {len(state_dict) // 3} LoRA keys to {save_path}")
 
         return (save_path,)
+
+
+class BuildAutoTunerPythonEvaluator:
+    """Builds an external AutoTuner evaluator spec from a Python callable."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "module_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Python file path or importable module name that contains the evaluator callable."
+                }),
+                "callable_name": ("STRING", {
+                    "default": "evaluate_candidate",
+                    "tooltip": "Callable to import. Signature: fn(model=..., clip=..., lora_data=..., config=..., context=..., analysis_summary=...) -> float or {'score': float, 'details': ...}."
+                }),
+            },
+            "optional": {
+                "combine_mode": (["blend", "external_only", "multiply"], {
+                    "default": "blend",
+                    "tooltip": "How AutoTuner combines the built-in score with the external evaluator score."
+                }),
+                "weight": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Blend weight for the external evaluator when combine_mode=blend."
+                }),
+                "context_json": ("STRING", {
+                    "default": "{}",
+                    "multiline": True,
+                    "tooltip": "Optional JSON object passed through to the evaluator as context."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("AUTOTUNER_EVALUATOR",)
+    RETURN_NAMES = ("evaluator",)
+    FUNCTION = "build"
+    CATEGORY = "LoRA Optimizer"
+    DESCRIPTION = "Builds a Python evaluator spec for LoRA AutoTuner so candidate ranking can incorporate prompt/reference scoring from external code."
+
+    def build(self, module_path, callable_name, combine_mode="blend", weight=0.5, context_json="{}"):
+        context = {}
+        if context_json and context_json.strip():
+            try:
+                context = json.loads(context_json)
+            except Exception as exc:
+                raise ValueError(f"Invalid evaluator context JSON: {exc}")
+        return ({
+            "module_path": module_path.strip(),
+            "callable_name": callable_name.strip(),
+            "combine_mode": combine_mode,
+            "weight": float(weight),
+            "context": context,
+        },)
+
+    @classmethod
+    def IS_CHANGED(cls, module_path, callable_name, combine_mode="blend", weight=0.5, context_json="{}"):
+        return _LoRAMergeBase._stable_data_hash({
+            "module_path": module_path,
+            "callable_name": callable_name,
+            "combine_mode": combine_mode,
+            "weight": weight,
+            "context_json": context_json,
+        })
+
+
+class SaveCalibrationData:
+    """Saves CALIBRATION_DATA to disk as JSON."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "calibration_data": ("CALIBRATION_DATA", {
+                    "tooltip": "Calibration data to save. Expected schema: {'targets': {'target.key': {'input_diag': [...]}}, 'default': {'scale': 1.0}}."
+                }),
+                "filename": ("STRING", {
+                    "default": "calibration_data",
+                    "tooltip": "Filename saved under models/lora_calibration_data/. Subdirectories are allowed."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("file_path",)
+    FUNCTION = "save_calibration_data"
+    CATEGORY = "LoRA Optimizer"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Saves activation calibration data as JSON for reuse across LoRA Optimizer and AutoTuner runs."
+
+    def save_calibration_data(self, calibration_data, filename):
+        if calibration_data is None:
+            return ("",)
+
+        def _jsonify(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.detach().cpu().tolist()
+            if isinstance(obj, dict):
+                return {k: _jsonify(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_jsonify(v) for v in obj]
+            return obj
+
+        save_path = _resolve_safe_output_path(
+            CALIBRATION_DATA_DIR, filename, ".json", "Save Calibration Data"
+        )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "w") as f:
+            json.dump(_jsonify(calibration_data), f, indent=2)
+        logging.info(f"[Save Calibration Data] Saved to: {save_path}")
+        return (save_path,)
+
+
+class LoadCalibrationData:
+    """Loads CALIBRATION_DATA from a JSON file."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "calibration_data_file": (folder_paths.get_filename_list("lora_calibration_data"), {
+                    "tooltip": "Select a calibration JSON file from models/lora_calibration_data/."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("CALIBRATION_DATA",)
+    RETURN_NAMES = ("calibration_data",)
+    FUNCTION = "load_calibration_data"
+    CATEGORY = "LoRA Optimizer"
+    DESCRIPTION = "Loads activation calibration data from disk so analysis and AutoTuner scoring can use activation-aware importance."
+
+    @classmethod
+    def IS_CHANGED(cls, calibration_data_file):
+        load_path = folder_paths.get_full_path_or_raise("lora_calibration_data", calibration_data_file)
+        return os.path.getmtime(load_path)
+
+    def load_calibration_data(self, calibration_data_file):
+        load_path = folder_paths.get_full_path_or_raise("lora_calibration_data", calibration_data_file)
+        with open(load_path, "r") as f:
+            calibration_data = json.load(f)
+        logging.info(f"[Load Calibration Data] Loaded from: {load_path}")
+        return (calibration_data,)
 
 
 class SaveTunerData:
@@ -6058,11 +7321,14 @@ class SaveTunerData:
     def save_tuner_data(self, tuner_data, save_folder, filename, overwrite=True):
         if tuner_data is None:
             return ("",)
-        save_dir = save_folder
-        base = filename if filename.endswith((".json", ".tuner")) else f"{filename}.tuner"
-        save_path = os.path.join(save_dir, base)
-        if not os.path.realpath(save_path).startswith(os.path.realpath(save_dir) + os.sep):
-            raise ValueError(f"[Save Tuner Data] Path escapes tuner_data directory: {filename}")
+        base_dir = os.path.realpath(save_folder)
+        base_name = filename if filename.endswith((".json", ".tuner")) else f"{filename}.tuner"
+        save_path = os.path.realpath(os.path.join(base_dir, base_name))
+        try:
+            if os.path.commonpath([base_dir, save_path]) != base_dir:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError(f"[Save Tuner Data] Path escapes tuner_data directory: {filename}") from exc
         if not overwrite and os.path.exists(save_path):
             stem, ext = os.path.splitext(save_path)
             counter = 1
@@ -6105,6 +7371,539 @@ class LoadTunerData:
         logging.info(f"[Load Tuner Data] Loaded from: {load_path} "
                      f"({len(tuner_data.get('top_n', []))} configs)")
         return (tuner_data,)
+
+
+class LoRACompatibilityAnalyzer(LoRAOptimizer):
+    """
+    Standalone pre-merge planning tool. Analyzes pairwise LoRA interactions
+    and recommends which LoRAs are safe to merge together.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "enabled": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Toggle on to run compatibility analysis. Off by default so normal queue execution stays cheap."
+                }),
+                "model": ("MODEL", {"tooltip": "Base model used for key mapping and target grouping."}),
+                "lora_stack": ("LORA_STACK", {"tooltip": "LoRA stack to analyze."}),
+            },
+            "optional": {
+                "clip": ("CLIP", {"tooltip": "Optional CLIP model for text-encoder LoRA keys."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE")
+    RETURN_NAMES = ("report", "compatibility_map")
+    FUNCTION = "analyze"
+    CATEGORY = "LoRA Optimizer"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Analyzes LoRA compatibility and suggests merge groups. No merge is performed."
+
+    @classmethod
+    def IS_CHANGED(cls, enabled, **kwargs):
+        if not enabled:
+            return "disabled"
+        return float("NaN")
+
+    def analyze(self, enabled, model, lora_stack, clip=None):
+        if not enabled:
+            return {"ui": {"groups": []}, "result": ("Analysis disabled. Toggle 'enabled' to run.", self._empty_image())}
+        if not lora_stack or len(lora_stack) == 0:
+            return {"ui": {"groups": []}, "result": ("No LoRAs in stack.", self._empty_image())}
+
+        normalized_stack = self._normalize_stack(lora_stack)
+        active_loras = [item for item in normalized_stack if item["strength"] != 0]
+        if len(active_loras) == 0:
+            return {"ui": {"groups": []}, "result": ("No active LoRAs in stack (all zero strength).", self._empty_image())}
+
+        n_loras = len(active_loras)
+        detected_arch = getattr(self, "_detected_arch", None) or "unknown"
+        preset_key, arch_preset = _resolve_arch_preset("auto", detected_arch)
+        logging.info(f"[Compatibility Analyzer] Architecture preset: {preset_key} ({arch_preset['display_name']})")
+
+        if n_loras == 1:
+            name = active_loras[0]["name"]
+            report = (
+                "=" * 55 + "\n"
+                "  LoRA Compatibility Analysis\n"
+                "=" * 55 + "\n\n"
+                f"Single LoRA: {name}\n"
+                "Nothing to compare — add more LoRAs to analyze compatibility.\n"
+                "\n" + "=" * 55
+            )
+            return {"ui": {"groups": []}, "result": (report, self._empty_image())}
+
+        logging.info(f"[Compatibility Analyzer] Analyzing {n_loras} LoRAs...")
+        t_start = time.time()
+
+        model_keys = self._get_model_keys(model)
+        clip_keys = {}
+        if clip is not None:
+            clip_keys = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, {})
+
+        all_lora_prefixes = self._collect_lora_prefixes(active_loras)
+        target_groups = self._build_target_groups(all_lora_prefixes, model_keys, clip_keys)
+        if not target_groups:
+            return {"ui": {"groups": []}, "result": (
+                "No compatible LoRA target groups found. LoRAs may be incompatible with this model architecture.",
+                self._empty_image(),
+            )}
+
+        compute_device = self._get_compute_device()
+        analysis = self._run_group_analysis(
+            target_groups, active_loras, model, clip, compute_device,
+            clip_strength_multiplier=1.0,
+            merge_quality="standard",
+            calibration_data=None,
+            decision_smoothing=0.0,
+        )
+        prefix_count = analysis["prefix_count"]
+        if prefix_count == 0:
+            return {"ui": {"groups": []}, "result": (
+                "No compatible LoRA target groups found. LoRAs may be incompatible with this model architecture.",
+                self._empty_image(),
+            )}
+
+        per_lora_stats = analysis["per_lora_stats"]
+        pair_accum = analysis["pair_accum"]
+        pairs = analysis["pairs"]
+        branch_energy = analysis["branch_energy"]
+
+        lora_stats = []
+        l2_means = []
+        for i, stat in enumerate(per_lora_stats):
+            avg_rank = sum(stat["ranks"]) / len(stat["ranks"]) if stat["ranks"] else 0
+            l2_mean = sum(stat["l2_norms"]) / len(stat["l2_norms"]) if stat["l2_norms"] else 0
+            l2_means.append(l2_mean)
+            lora_stats.append({
+                "name": stat["name"],
+                "strength": stat["strength"],
+                "key_count": stat["key_count"],
+                "avg_rank": avg_rank,
+                "l2_mean": l2_mean,
+            })
+
+        pairwise_conflicts = []
+        pairwise_similarities = {}
+        total_overlap = 0
+        total_conflict = 0
+        for i, j in pairs:
+            pair_metrics = pair_accum[(i, j)]
+            pair_overlap = pair_metrics["overlap"]
+            pair_conflict = pair_metrics["conflict"]
+            pair_dot = pair_metrics["dot"]
+            pair_na_sq = pair_metrics["norm_a_sq"]
+            pair_nb_sq = pair_metrics["norm_b_sq"]
+            total_overlap += pair_overlap
+            total_conflict += pair_conflict
+            ratio = pair_conflict / pair_overlap if pair_overlap > 0 else 0.0
+            denom = math.sqrt(pair_na_sq) * math.sqrt(pair_nb_sq)
+            cos_sim = pair_dot / denom if denom > 0 else 0.0
+            pairwise_similarities[(i, j)] = cos_sim
+            pairwise_conflicts.append({
+                "i": i,
+                "j": j,
+                "pair": f"{active_loras[i]['name']} vs {active_loras[j]['name']}",
+                "overlap": pair_overlap,
+                "conflicts": pair_conflict,
+                "ratio": ratio,
+                "cosine_sim": cos_sim,
+            })
+
+        avg_conflict_ratio = total_conflict / total_overlap if total_overlap > 0 else 0.0
+        avg_cos_sim = (sum(pairwise_similarities.values()) / len(pairwise_similarities)) if pairwise_similarities else 0.0
+        valid_l2 = [m for m in l2_means if m > 0]
+        magnitude_ratio = max(valid_l2) / min(valid_l2) if len(valid_l2) >= 2 else 1.0
+
+        collection_stats = {
+            "n_loras": n_loras,
+            "total_keys": prefix_count,
+            "avg_conflict": avg_conflict_ratio,
+            "avg_cos_sim": avg_cos_sim,
+            "magnitude_ratio": magnitude_ratio,
+        }
+
+        compat_matrix = self._compute_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras)
+        groups = self._cluster_loras(compat_matrix, threshold=0.05)
+
+        group_info = []
+        for group in groups:
+            info = {"indices": group}
+            if len(group) == 1:
+                idx = group[0]
+                info["type"] = "solo"
+                info["strength"] = active_loras[idx]["strength"]
+                opposing = []
+                for other_idx in range(n_loras):
+                    if other_idx == idx:
+                        continue
+                    key = (min(idx, other_idx), max(idx, other_idx))
+                    cos_sim = pairwise_similarities.get(key, 0.0)
+                    if cos_sim < -0.05:
+                        opposing.append((active_loras[other_idx]["name"], cos_sim))
+                opposing.sort(key=lambda item: item[1])
+                info["opposing"] = opposing
+            else:
+                info["type"] = "merge"
+                intra_cos = []
+                intra_conflict = []
+                intra_excess = []
+                intra_subspace = []
+                model_norm_sq = []
+                clip_norm_sq = []
+                model_dots = {}
+                clip_dots = {}
+                group_loras = [active_loras[idx] for idx in group]
+
+                for pos, orig_idx in enumerate(group):
+                    model_norm_sq.append(branch_energy["model"]["norm_sq"][orig_idx])
+                    clip_norm_sq.append(branch_energy["clip"]["norm_sq"][orig_idx])
+
+                for a_pos in range(len(group)):
+                    for b_pos in range(a_pos + 1, len(group)):
+                        left = group[a_pos]
+                        right = group[b_pos]
+                        pair_key = (min(left, right), max(left, right))
+                        metrics = pair_accum.get(pair_key, {})
+                        cos_sim = pairwise_similarities.get(pair_key, 0.0)
+                        ratio = (metrics.get("conflict", 0) / metrics.get("overlap", 1)) if metrics.get("overlap", 0) > 0 else 0.0
+                        weighted_total = metrics.get("weighted_total", 0.0)
+                        excess_conflict = (metrics.get("excess_conflict_weighted", 0.0) / weighted_total) if weighted_total > 0 else 0.0
+                        subspace_overlap = (metrics.get("subspace_num", 0.0) / metrics.get("subspace_den", 1.0)) if metrics.get("subspace_den", 0.0) > 0 else 0.0
+                        intra_cos.append(cos_sim)
+                        intra_conflict.append(ratio)
+                        intra_excess.append(excess_conflict)
+                        intra_subspace.append(subspace_overlap)
+                        model_dots[(a_pos, b_pos)] = branch_energy["model"]["dot"].get(pair_key, 0.0)
+                        clip_dots[(a_pos, b_pos)] = branch_energy["clip"]["dot"].get(pair_key, 0.0)
+
+                info["avg_cos_sim"] = sum(intra_cos) / len(intra_cos) if intra_cos else 0.0
+                info["avg_conflict"] = sum(intra_conflict) / len(intra_conflict) if intra_conflict else 0.0
+                info["avg_excess_conflict"] = sum(intra_excess) / len(intra_excess) if intra_excess else 0.0
+                info["avg_subspace_overlap"] = sum(intra_subspace) / len(intra_subspace) if intra_subspace else 0.0
+
+                avg_compat = sum(cs * (1.0 - cr) for cs, cr in zip(intra_cos, intra_conflict)) / len(intra_cos) if intra_cos else 0.0
+                if avg_compat > 0.2:
+                    info["confidence"] = "High"
+                elif avg_compat > 0.05:
+                    info["confidence"] = "Moderate"
+                else:
+                    info["confidence"] = "Low"
+
+                group_branch_energy = {
+                    "model": {"norm_sq": model_norm_sq, "dot": model_dots},
+                    "clip": {"norm_sq": clip_norm_sq, "dot": clip_dots},
+                }
+                auto_strength_info = self._compute_auto_strengths(
+                    group_loras,
+                    group_branch_energy,
+                    arch_preset=arch_preset,
+                    detected_arch=detected_arch,
+                )
+                info["strengths"] = {
+                    group[idx]: auto_strength_info["model_strengths"][idx]
+                    for idx in range(len(group))
+                }
+
+                mode, _, _, _ = self._auto_select_params(
+                    info["avg_conflict"],
+                    magnitude_ratio,
+                    magnitude_samples=analysis["all_magnitude_samples"],
+                    avg_cos_sim=info["avg_cos_sim"],
+                    avg_excess_conflict=info["avg_excess_conflict"],
+                    avg_subspace_overlap=info["avg_subspace_overlap"],
+                    arch_preset=arch_preset,
+                )
+                info["suggested_merge"] = mode
+
+            group_info.append(info)
+
+        warnings = []
+        for pc in pairwise_conflicts:
+            if pc["cosine_sim"] < -0.1:
+                warnings.append({
+                    "type": "opposing",
+                    "name_i": active_loras[pc["i"]]["name"],
+                    "name_j": active_loras[pc["j"]]["name"],
+                    "cos_sim": pc["cosine_sim"],
+                })
+
+        strong_loras = {}
+        if len(l2_means) >= 2:
+            valid_l2 = [m for m in l2_means if m > 0]
+            mean_l2 = sum(valid_l2) / len(valid_l2) if valid_l2 else 1.0
+            lora_avg_ratios = {
+                idx: (l2 / mean_l2)
+                for idx, l2 in enumerate(l2_means)
+                if l2 > 0 and mean_l2 > 0
+            }
+            for pc in pairwise_conflicts:
+                i, j = pc["i"], pc["j"]
+                l2_i = l2_means[i]
+                l2_j = l2_means[j]
+                if l2_i > 0 and l2_j > 0:
+                    ratio = max(l2_i, l2_j) / min(l2_i, l2_j)
+                    if ratio > 3.0:
+                        strong_idx = i if l2_i > l2_j else j
+                        weak_idx = j if l2_i > l2_j else i
+                        weak_name = active_loras[weak_idx]["name"]
+                        strong_loras.setdefault(strong_idx, [])
+                        if weak_name not in [name for name, _ in strong_loras[strong_idx]]:
+                            strong_loras[strong_idx].append((weak_name, ratio))
+            for strong_idx in sorted(strong_loras.keys()):
+                warnings.append({
+                    "type": "magnitude_group",
+                    "stronger": active_loras[strong_idx]["name"],
+                    "avg_ratio": lora_avg_ratios.get(strong_idx, 0.0),
+                    "weaker_list": [name for name, _ in strong_loras[strong_idx]],
+                })
+
+        logging.info(f"[Compatibility Analyzer] Analysis complete ({time.time() - t_start:.1f}s)")
+        report = self._build_compatibility_report(
+            active_loras, groups, group_info, lora_stats, pairwise_conflicts,
+            collection_stats, warnings, detected_arch, prefix_count,
+        )
+        raw_matrix = self._compute_raw_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras)
+        display_names = [os.path.splitext(os.path.basename(item["name"]))[0] for item in active_loras]
+        heatmap = self._generate_heatmap(raw_matrix, display_names, groups)
+
+        groups_for_ui = []
+        for info in group_info:
+            if info["type"] != "merge":
+                continue
+            groups_for_ui.append({
+                "loras": [
+                    {"name": active_loras[idx]["name"], "strength": round(info["strengths"][idx], 4)}
+                    for idx in info["indices"]
+                ],
+                "suggested_merge": info.get("suggested_merge", "weighted_average"),
+                "confidence": info.get("confidence", "Low"),
+            })
+
+        return {"ui": {"groups": groups_for_ui}, "result": (report, heatmap)}
+
+    @staticmethod
+    def _empty_image():
+        return torch.zeros(1, 1, 1, 3, dtype=torch.float32)
+
+    @staticmethod
+    def _compute_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras):
+        conflict_by_pair = {(pc["i"], pc["j"]): pc["ratio"] for pc in pairwise_conflicts}
+        matrix = [[0.0] * n_loras for _ in range(n_loras)]
+        for (i, j), cos_sim in pairwise_similarities.items():
+            conflict_ratio = conflict_by_pair.get((i, j), 0.0)
+            compat = cos_sim * (1.0 - conflict_ratio)
+            if cos_sim > -0.1:
+                compat += 0.1
+            matrix[i][j] = compat
+            matrix[j][i] = compat
+        return matrix
+
+    @staticmethod
+    def _compute_raw_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras):
+        conflict_by_pair = {(pc["i"], pc["j"]): pc["ratio"] for pc in pairwise_conflicts}
+        matrix = [[0.0] * n_loras for _ in range(n_loras)]
+        for (i, j), cos_sim in pairwise_similarities.items():
+            conflict_ratio = conflict_by_pair.get((i, j), 0.0)
+            compat = cos_sim * (1.0 - conflict_ratio)
+            matrix[i][j] = compat
+            matrix[j][i] = compat
+        return matrix
+
+    @staticmethod
+    def _cluster_loras(compat_matrix, threshold=0.05):
+        n = len(compat_matrix)
+        groups = [[i] for i in range(n)]
+        while len(groups) > 1:
+            best_score = -float("inf")
+            best_pair = None
+            for left_idx in range(len(groups)):
+                for right_idx in range(left_idx + 1, len(groups)):
+                    total = 0.0
+                    count = 0
+                    for a in groups[left_idx]:
+                        for b in groups[right_idx]:
+                            total += compat_matrix[a][b]
+                            count += 1
+                    avg_compat = total / count if count > 0 else 0.0
+                    if avg_compat > best_score:
+                        best_score = avg_compat
+                        best_pair = (left_idx, right_idx)
+            if best_score < threshold or best_pair is None:
+                break
+            left_idx, right_idx = best_pair
+            merged = groups[left_idx] + groups[right_idx]
+            groups = [group for idx, group in enumerate(groups) if idx not in best_pair]
+            groups.append(merged)
+        groups.sort(key=lambda group: (-len(group), group[0]))
+        return groups
+
+    @staticmethod
+    def _generate_heatmap(compat_matrix, lora_names, groups):
+        from PIL import Image, ImageDraw
+        import numpy as np
+
+        n = len(compat_matrix)
+        if n == 0:
+            return torch.zeros(1, 1, 1, 3, dtype=torch.float32)
+
+        display_order = []
+        for group in groups:
+            display_order.extend(group)
+
+        cell_size = 80
+        tmp_img = Image.new("RGB", (1, 1))
+        tmp_draw = ImageDraw.Draw(tmp_img)
+        max_label_w = max(tmp_draw.textlength(name) for name in lora_names) if lora_names else 100
+        margin = int(max_label_w) + 20
+        col_header_h = margin
+        img_w = margin + n * cell_size
+        img_h = col_header_h + n * cell_size
+
+        img = Image.new("RGB", (img_w, img_h), (30, 30, 30))
+        draw = ImageDraw.Draw(img)
+
+        def compat_to_color(value):
+            t = max(0.0, min(1.0, (value + 0.4) / 0.9))
+            if t < 0.5:
+                s = t / 0.5
+                return (int(200 + 20 * s), int(180 * s), 0)
+            s = (t - 0.5) / 0.5
+            return (int(220 * (1 - s)), int(180 + 20 * s), 0)
+
+        for row in range(n):
+            for col in range(n):
+                orig_i = display_order[row]
+                orig_j = display_order[col]
+                x = margin + col * cell_size
+                y = col_header_h + row * cell_size
+                if orig_i == orig_j:
+                    color = (80, 80, 80)
+                    value_text = "-"
+                else:
+                    value = compat_matrix[orig_i][orig_j]
+                    color = compat_to_color(value)
+                    value_text = f"{value:.2f}"
+                draw.rectangle([x, y, x + cell_size - 1, y + cell_size - 1], fill=color)
+                bbox = draw.textbbox((0, 0), value_text)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+                tx = x + (cell_size - text_w) // 2
+                ty = y + (cell_size - text_h) // 2
+                brightness = color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
+                text_color = (0, 0, 0) if brightness > 128 else (255, 255, 255)
+                draw.text((tx, ty), value_text, fill=text_color)
+
+        for pos in range(n):
+            label = lora_names[display_order[pos]]
+            draw.text((5, col_header_h + pos * cell_size + cell_size // 2 - 5), label, fill=(220, 220, 220))
+
+        for pos in range(n):
+            label = lora_names[display_order[pos]]
+            bbox = tmp_draw.textbbox((0, 0), label)
+            text_w = bbox[2] - bbox[0] + 4
+            text_h = bbox[3] - bbox[1] + 4
+            txt_img = Image.new("RGBA", (text_w, text_h), (30, 30, 30, 255))
+            txt_draw = ImageDraw.Draw(txt_img)
+            txt_draw.text((2, 2), label, fill=(220, 220, 220, 255))
+            rotated = txt_img.rotate(90, expand=True)
+            paste_x = margin + pos * cell_size + (cell_size - rotated.width) // 2
+            paste_y = col_header_h - rotated.height - 5
+            img.paste(rotated.convert("RGB"), (paste_x, max(0, paste_y)))
+
+        pos = 0
+        for group in groups:
+            if len(group) > 1:
+                x0 = margin + pos * cell_size - 1
+                y0 = col_header_h + pos * cell_size - 1
+                x1 = margin + (pos + len(group)) * cell_size
+                y1 = col_header_h + (pos + len(group)) * cell_size
+                for offset in range(3):
+                    draw.rectangle([x0 - offset, y0 - offset, x1 + offset, y1 + offset], outline=(255, 255, 255))
+            pos += len(group)
+
+        arr = np.array(img, dtype=np.float32) / 255.0
+        return torch.from_numpy(arr).unsqueeze(0)
+
+    def _build_compatibility_report(self, active_loras, groups, group_info,
+                                    lora_stats, pairwise_conflicts,
+                                    collection_stats, warnings,
+                                    detected_arch, prefix_count):
+        def _display_name(name):
+            return name.replace(".safetensors", "")
+
+        lines = []
+        lines.append("=" * 55)
+        lines.append("  LoRA Compatibility Analysis")
+        lines.append("=" * 55)
+        lines.append("")
+        lines.append(f"Analyzed: {len(active_loras)} LoRAs across {prefix_count} target groups")
+        arch_display = detected_arch.upper() if detected_arch and detected_arch != "unknown" else "Unknown"
+        lines.append(f"Architecture: {arch_display}")
+        lines.append(f"Avg conflict: {collection_stats['avg_conflict']:.0%} | Avg cosine similarity: {collection_stats['avg_cos_sim']:.2f}")
+        lines.append("")
+        lines.append("-" * 30 + " Recommended Groups " + "-" * 30)
+        lines.append("")
+
+        group_num = 0
+        solo_entries = []
+        for info in group_info:
+            if info["type"] == "solo":
+                solo_entries.append(info)
+                continue
+            group_num += 1
+            label = "Merge together" if info["confidence"] != "Low" else "Safe to combine"
+            lines.append(f"Group {group_num} -- {label} (compatibility: {info['confidence']})")
+            for idx in info["indices"]:
+                strength = info["strengths"].get(idx, active_loras[idx]["strength"])
+                lines.append(f"  * {_display_name(active_loras[idx]['name']):<28s} strength {strength:.2f}")
+            lines.append(f"  Avg cosine sim: {info['avg_cos_sim']:.2f} | Avg conflict: {info['avg_conflict']:.0%}")
+            lines.append(f"  Suggested merge: {info['suggested_merge']}")
+            lines.append("")
+
+        if solo_entries:
+            lines.append("Solo -- Use independently")
+            for info in solo_entries:
+                idx = info["indices"][0]
+                lines.append(f"  * {_display_name(active_loras[idx]['name']):<28s} strength {info['strength']:.2f}")
+                if info["opposing"]:
+                    opposing = [f"{_display_name(name)} (cos: {cos:.2f})" for name, cos in info["opposing"][:3]]
+                    lines.append(f"    Opposes: {', '.join(opposing)}")
+            lines.append("")
+
+        if warnings:
+            lines.append("-" * 30 + " Warnings " + "-" * 30)
+            lines.append("")
+            for warning in warnings:
+                if warning["type"] == "opposing":
+                    lines.append(f"! {_display_name(warning['name_i'])} vs {_display_name(warning['name_j'])}: Opposing (cos_sim: {warning['cos_sim']:.2f})")
+                    lines.append("  These cancel each other out and usually degrade quality when merged together.")
+                    lines.append("")
+                elif warning["type"] == "magnitude_group":
+                    lines.append(f"! {_display_name(warning['stronger'])} ({warning['avg_ratio']:.1f}x avg) overshadows:")
+                    lines.append(f"  {', '.join(_display_name(name) for name in warning['weaker_list'])}")
+                    lines.append("  Consider lowering its strength or raising the weaker LoRAs.")
+                    lines.append("")
+
+        lines.append("-" * 30 + " Pairwise Compatibility " + "-" * 30)
+        lines.append("")
+        sorted_pairs = sorted(pairwise_conflicts, key=lambda item: item["cosine_sim"] * (1.0 - item["ratio"]), reverse=True)
+        pair_labels = [_display_name(item["pair"]) for item in sorted_pairs]
+        max_pair_w = max((len(label) for label in pair_labels), default=45)
+        for item, label in zip(sorted_pairs, pair_labels):
+            compat = round(item["cosine_sim"] * (1.0 - item["ratio"]), 2) + 0.0
+            cos_sim = round(item["cosine_sim"], 2) + 0.0
+            indicator = " [OK]" if compat > 0.2 else (" [!!]" if compat < -0.05 else "")
+            lines.append(
+                f"  {label:<{max_pair_w}s}  cos:{cos_sim:6.2f}  "
+                f"conflict:{item['ratio']:5.0%}  compat:{compat:6.2f}{indicator}"
+            )
+        lines.append("")
+        lines.append("=" * 55)
+        return "\n".join(lines)
 
 
 class MergedLoRAToHook:
@@ -6232,633 +8031,6 @@ class MergedLoRAToWanVideo:
         return (new_model,)
 
 
-class LoRACompatibilityAnalyzer(LoRAOptimizer):
-    """
-    Standalone pre-merge planning tool. Analyzes pairwise LoRA interactions
-    (cosine similarity, sign conflicts, magnitude ratios) and recommends
-    which LoRAs to merge together vs. use independently.
-
-    No merge happens — analysis only. Inherits from LoRAOptimizer to reuse
-    _analyze_prefix, _compute_auto_strengths, and _auto_select_params.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "enabled": ("BOOLEAN", {"default": False,
-                    "tooltip": "Toggle on to run the analysis. Off by default so it doesn't slow down normal queue execution."}),
-                "model": ("MODEL", {"tooltip": "Base model for key mapping and target shapes."}),
-                "lora_stack": ("LORA_STACK", {"tooltip": "The LoRA stack to analyze for compatibility."}),
-            },
-            "optional": {
-                "clip": ("CLIP", {"tooltip": "Text encoder. Connect for CLIP key analysis."}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING", "IMAGE")
-    RETURN_NAMES = ("report", "compatibility_map")
-    FUNCTION = "analyze"
-    CATEGORY = "LoRA Optimizer"
-    OUTPUT_NODE = True
-    DESCRIPTION = "Analyzes pairwise LoRA compatibility and recommends merge groups. No merge is performed — use this to plan which LoRAs to combine before merging."
-
-    @classmethod
-    def IS_CHANGED(cls, enabled, **kwargs):
-        if not enabled:
-            return "disabled"  # stable value → cached, effectively skipped
-        return float("NaN")  # always re-execute when enabled
-
-    def analyze(self, enabled, model, lora_stack, clip=None):
-        if not enabled:
-            return {"ui": {"groups": []}, "result": ("Analysis disabled. Toggle 'enabled' to run.", self._empty_image())}
-
-        if not lora_stack or len(lora_stack) == 0:
-            return {"ui": {"groups": []}, "result": ("No LoRAs in stack.", self._empty_image())}
-
-        normalized_stack = self._normalize_stack(lora_stack)
-        active_loras = [item for item in normalized_stack if item["strength"] != 0]
-
-        if len(active_loras) == 0:
-            return {"ui": {"groups": []}, "result": ("No active LoRAs in stack (all zero strength).", self._empty_image())}
-
-        n_loras = len(active_loras)
-        detected_arch = getattr(self, '_detected_arch', None) or 'unknown'
-        preset_key, arch_preset = _resolve_arch_preset("auto", detected_arch)
-
-        if n_loras == 1:
-            name = active_loras[0]["name"]
-            report = (
-                "=" * 55 + "\n"
-                "  LoRA Compatibility Analysis\n"
-                "=" * 55 + "\n\n"
-                f"Single LoRA: {name}\n"
-                "Nothing to compare — add more LoRAs to analyze compatibility.\n"
-                "\n" + "=" * 55
-            )
-            return {"ui": {"groups": []}, "result": (report, self._empty_image())}
-
-        # --- Setup ---
-        logging.info(f"[Compatibility Analyzer] Analyzing {n_loras} LoRAs...")
-        t_start = time.time()
-
-        model_keys = self._get_model_keys(model)
-        clip_keys = {}
-        if clip is not None:
-            clip_keys = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, {})
-
-        all_lora_prefixes = set()
-        for item in active_loras:
-            for key in item["lora"].keys():
-                for suffix in [".lora_up.weight", ".lora_down.weight", "_lora.up.weight",
-                              "_lora.down.weight", ".lora_B.weight", ".lora_A.weight",
-                              ".lora.up.weight", ".lora.down.weight", ".alpha"]:
-                    if key.endswith(suffix):
-                        prefix = key[:-len(suffix)]
-                        all_lora_prefixes.add(prefix)
-                        break
-        all_lora_prefixes = sorted(all_lora_prefixes)
-        compute_device = self._get_compute_device()
-
-        # --- Pass 1 Analysis ---
-        analysis = self._run_pass1_analysis(active_loras, all_lora_prefixes,
-                                            model_keys, clip_keys, model, clip, compute_device)
-        prefix_count = analysis["prefix_count"]
-
-        if prefix_count == 0:
-            return {"ui": {"groups": []}, "result": (
-                "No compatible LoRA keys found. "
-                "LoRAs may be incompatible with this model architecture.",
-                self._empty_image())}
-
-        # --- Finalize stats ---
-        per_lora_stats = analysis["per_lora_stats"]
-        pair_accum = analysis["pair_accum"]
-        pair_shared_prefixes = analysis["pair_shared_prefixes"]
-        pairs = analysis["pairs"]
-
-        lora_stats = []
-        l2_means = []
-        for i, stat in enumerate(per_lora_stats):
-            avg_rank = sum(stat["ranks"]) / len(stat["ranks"]) if stat["ranks"] else 0
-            l2_mean = sum(stat["l2_norms"]) / len(stat["l2_norms"]) if stat["l2_norms"] else 0
-            l2_means.append(l2_mean)
-            lora_stats.append({
-                "name": stat["name"],
-                "strength": stat["strength"],
-                "key_count": stat["key_count"],
-                "avg_rank": avg_rank,
-                "l2_mean": l2_mean,
-            })
-
-        # Full-rank detection for compatibility analyzer
-        ca_fr_preset = arch_preset.get("full_rank", {})
-        ca_global_avg_rank = (sum(s["avg_rank"] for s in lora_stats) / len(lora_stats)) if lora_stats else 0
-        ca_is_full_rank = ca_global_avg_rank >= ca_fr_preset.get("rank_threshold", 256)
-        if ca_is_full_rank:
-            logging.info(f"[Compatibility Analyzer] Full-rank LoRAs detected (avg rank {ca_global_avg_rank:.0f})")
-
-        total_overlap = 0
-        total_conflict = 0
-        pairwise_conflicts = []
-        pairwise_similarities = {}
-        for i, j in pairs:
-            pair_overlap, pair_conflict, pair_dot, pair_na_sq, pair_nb_sq = pair_accum[(i, j)]
-            total_overlap += pair_overlap
-            total_conflict += pair_conflict
-            ratio = pair_conflict / pair_overlap if pair_overlap > 0 else 0
-            denom = math.sqrt(pair_na_sq) * math.sqrt(pair_nb_sq)
-            cos_sim = pair_dot / denom if denom > 0 else 0.0
-            pairwise_similarities[(i, j)] = cos_sim
-            name_i = active_loras[i]['name']
-            name_j = active_loras[j]['name']
-            if name_i == name_j:
-                pair_label = (f"{name_i} [#{i+1}, str={active_loras[i]['strength']}] vs "
-                              f"{name_j} [#{j+1}, str={active_loras[j]['strength']}]")
-            else:
-                pair_label = f"{name_i} vs {name_j}"
-            pairwise_conflicts.append({
-                "i": i, "j": j,
-                "pair": pair_label,
-                "overlap": pair_overlap,
-                "conflicts": pair_conflict,
-                "ratio": ratio,
-                "cosine_sim": cos_sim,
-                "shared_prefixes": pair_shared_prefixes[(i, j)],
-            })
-
-        avg_conflict_ratio = total_conflict / total_overlap if total_overlap > 0 else 0
-        valid_l2 = [m for m in l2_means if m > 0]
-        magnitude_ratio = max(valid_l2) / min(valid_l2) if len(valid_l2) >= 2 else 1.0
-        avg_cos_sim = (sum(pairwise_similarities.values()) / len(pairwise_similarities)
-                       if pairwise_similarities else 0.0)
-
-        collection_stats = {
-            "n_loras": n_loras,
-            "total_keys": prefix_count,
-            "avg_conflict": avg_conflict_ratio,
-            "avg_cos_sim": avg_cos_sim,
-            "magnitude_ratio": magnitude_ratio,
-        }
-
-        # --- Compatibility matrix ---
-        compat_matrix = self._compute_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras)
-
-        # --- Clustering ---
-        groups = self._cluster_loras(compat_matrix, threshold=0.05)
-
-        # --- Per-group recommendations ---
-        group_info = []
-        for group in groups:
-            info = {"indices": group}
-            if len(group) == 1:
-                idx = group[0]
-                info["type"] = "solo"
-                info["strength"] = active_loras[idx]["strength"]
-                # Find opposing LoRAs
-                opposing = []
-                for other_idx in range(n_loras):
-                    if other_idx == idx:
-                        continue
-                    key = (min(idx, other_idx), max(idx, other_idx))
-                    cs = pairwise_similarities.get(key, 0.0)
-                    if cs < -0.05:
-                        opposing.append((active_loras[other_idx]["name"], cs))
-                opposing.sort(key=lambda x: x[1])
-                info["opposing"] = opposing
-            else:
-                info["type"] = "merge"
-                # Compute intra-group stats
-                conflict_by_pair = {(pc["i"], pc["j"]): pc["ratio"] for pc in pairwise_conflicts}
-                intra_cos = []
-                intra_conflict = []
-                for a_pos in range(len(group)):
-                    for b_pos in range(a_pos + 1, len(group)):
-                        key = (min(group[a_pos], group[b_pos]), max(group[a_pos], group[b_pos]))
-                        cs = pairwise_similarities.get(key, 0.0)
-                        cr = conflict_by_pair.get(key, 0.0)
-                        intra_cos.append(cs)
-                        intra_conflict.append(cr)
-                info["avg_cos_sim"] = sum(intra_cos) / len(intra_cos) if intra_cos else 0.0
-                info["avg_conflict"] = sum(intra_conflict) / len(intra_conflict) if intra_conflict else 0.0
-                avg_compat = sum(cs * (1.0 - cr) for cs, cr in zip(intra_cos, intra_conflict)) / len(intra_cos) if intra_cos else 0.0
-                if avg_compat > 0.2:
-                    info["confidence"] = "High"
-                elif avg_compat > 0.05:
-                    info["confidence"] = "Moderate"
-                else:
-                    info["confidence"] = "Low"
-
-                # Auto-strengths for group
-                group_loras = [active_loras[idx] for idx in group]
-                group_lora_stats = [lora_stats[idx] for idx in group]
-                group_pw_sim = {}
-                for a_pos in range(len(group)):
-                    for b_pos in range(a_pos + 1, len(group)):
-                        orig_key = (min(group[a_pos], group[b_pos]), max(group[a_pos], group[b_pos]))
-                        group_pw_sim[(a_pos, b_pos)] = pairwise_similarities.get(orig_key, 0.0)
-                new_strengths, _ = self._compute_auto_strengths(
-                    group_loras, group_lora_stats,
-                    pairwise_similarities=group_pw_sim,
-                    arch_preset=arch_preset, detected_arch=detected_arch,
-                    is_full_rank=ca_is_full_rank)
-                info["strengths"] = {group[k]: new_strengths[k] for k in range(len(group))}
-
-                # Suggested merge strategy
-                group_avg_cos = info["avg_cos_sim"]
-                group_avg_conflict = info["avg_conflict"]
-                mag_samples = analysis["all_magnitude_samples"]
-                mode, _, _, _ = self._auto_select_params(
-                    group_avg_conflict,
-                    magnitude_ratio,
-                    magnitude_samples=mag_samples,
-                    avg_cos_sim=group_avg_cos,
-                    arch_preset=arch_preset)
-                info["suggested_merge"] = mode
-
-            group_info.append(info)
-
-        # --- Warnings ---
-        def _disambiguate(idx_a, idx_b):
-            """Return display names, adding [#N] suffix when names collide."""
-            na = active_loras[idx_a]["name"]
-            nb = active_loras[idx_b]["name"]
-            if na == nb:
-                na = f"{na} [#{idx_a+1}]"
-                nb = f"{nb} [#{idx_b+1}]"
-            return na, nb
-
-        warnings = []
-        for pc in pairwise_conflicts:
-            if pc["cosine_sim"] < -0.1:
-                na, nb = _disambiguate(pc["i"], pc["j"])
-                warnings.append({
-                    "type": "opposing",
-                    "name_i": na,
-                    "name_j": nb,
-                    "cos_sim": pc["cosine_sim"],
-                })
-        # Magnitude imbalance warnings — consolidated per strong LoRA
-        # Compute per-LoRA average magnitude ratio vs all others
-        lora_avg_ratios = {}  # idx -> avg ratio relative to mean
-        if len(l2_means) >= 2:
-            valid_l2 = [m for m in l2_means if m > 0]
-            mean_l2 = sum(valid_l2) / len(valid_l2) if valid_l2 else 1.0
-            for idx, l2 in enumerate(l2_means):
-                if l2 > 0 and mean_l2 > 0:
-                    lora_avg_ratios[idx] = l2 / mean_l2
-
-        strong_loras = {}  # strong_idx -> [(weak_name, ratio)]
-        for pc in pairwise_conflicts:
-            i, j = pc["i"], pc["j"]
-            l2_i = l2_means[i]
-            l2_j = l2_means[j]
-            if l2_i > 0 and l2_j > 0:
-                ratio = max(l2_i, l2_j) / min(l2_i, l2_j)
-                if ratio > 3.0:
-                    strong_idx = i if l2_i > l2_j else j
-                    weak_idx = j if l2_i > l2_j else i
-                    weak_name = active_loras[weak_idx]["name"]
-                    if strong_idx not in strong_loras:
-                        strong_loras[strong_idx] = []
-                    if weak_name not in [w for w, _ in strong_loras[strong_idx]]:
-                        strong_loras[strong_idx].append((weak_name, ratio))
-        for strong_idx in sorted(strong_loras.keys()):
-            weak_list = strong_loras[strong_idx]
-            strong_name = active_loras[strong_idx]["name"]
-            avg_ratio = lora_avg_ratios.get(strong_idx, 0.0)
-            warnings.append({
-                "type": "magnitude_group",
-                "stronger": strong_name,
-                "avg_ratio": avg_ratio,
-                "weaker_list": [w for w, _ in weak_list],
-            })
-
-        elapsed = time.time() - t_start
-        logging.info(f"[Compatibility Analyzer] Analysis complete ({elapsed:.1f}s)")
-
-        # --- Build report ---
-        report = self._build_compatibility_report(
-            active_loras, groups, group_info, lora_stats, pairwise_conflicts,
-            collection_stats, warnings, detected_arch, prefix_count)
-
-        # --- Generate heatmap (use raw compat without baseline for visual differentiation) ---
-        raw_matrix = self._compute_raw_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras)
-        display_names = [os.path.splitext(os.path.basename(item["name"]))[0] for item in active_loras]
-        heatmap = self._generate_heatmap(raw_matrix, display_names, groups)
-
-        # --- Build group data for UI (auto-create LoRA Stack nodes) ---
-        groups_for_ui = []
-        for gi in group_info:
-            if gi["type"] != "merge":
-                continue
-            groups_for_ui.append({
-                "loras": [
-                    {"name": active_loras[idx]["name"], "strength": round(gi["strengths"][idx], 4)}
-                    for idx in gi["indices"]
-                ],
-                "suggested_merge": gi.get("suggested_merge", "weighted_average"),
-                "confidence": gi.get("confidence", "Low"),
-            })
-
-        return {"ui": {"groups": groups_for_ui}, "result": (report, heatmap)}
-
-    @staticmethod
-    def _empty_image():
-        """Return a minimal 1x1 black IMAGE tensor."""
-        return torch.zeros(1, 1, 1, 3, dtype=torch.float32)
-
-    @staticmethod
-    def _compute_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras):
-        """Compute N×N compatibility matrix: compat[i][j] = cos_sim * (1 - conflict_ratio) + baseline.
-
-        Non-opposing LoRAs (cos_sim > -0.1) get a +0.1 baseline because orthogonal
-        LoRAs are safe to merge — they don't interfere with each other.
-        """
-        conflict_by_pair = {}
-        for pc in pairwise_conflicts:
-            conflict_by_pair[(pc["i"], pc["j"])] = pc["ratio"]
-
-        matrix = [[0.0] * n_loras for _ in range(n_loras)]
-        for (i, j), cos_sim in pairwise_similarities.items():
-            conflict_ratio = conflict_by_pair.get((i, j), 0.0)
-            compat = cos_sim * (1.0 - conflict_ratio)
-            if cos_sim > -0.1:
-                compat += 0.1  # non-opposing LoRAs are safe to merge
-            matrix[i][j] = compat
-            matrix[j][i] = compat
-        return matrix
-
-    @staticmethod
-    def _compute_raw_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras):
-        """Compute N×N raw compatibility matrix without baseline (for heatmap display)."""
-        conflict_by_pair = {}
-        for pc in pairwise_conflicts:
-            conflict_by_pair[(pc["i"], pc["j"])] = pc["ratio"]
-
-        matrix = [[0.0] * n_loras for _ in range(n_loras)]
-        for (i, j), cos_sim in pairwise_similarities.items():
-            conflict_ratio = conflict_by_pair.get((i, j), 0.0)
-            compat = cos_sim * (1.0 - conflict_ratio)
-            matrix[i][j] = compat
-            matrix[j][i] = compat
-        return matrix
-
-    @staticmethod
-    def _cluster_loras(compat_matrix, threshold=0.05):
-        """Greedy agglomerative clustering. Returns list of groups (lists of indices)."""
-        n = len(compat_matrix)
-        groups = [[i] for i in range(n)]
-
-        while len(groups) > 1:
-            best_score = -float('inf')
-            best_pair = None
-            for ga_idx in range(len(groups)):
-                for gb_idx in range(ga_idx + 1, len(groups)):
-                    ga, gb = groups[ga_idx], groups[gb_idx]
-                    total = 0.0
-                    count = 0
-                    for a in ga:
-                        for b in gb:
-                            total += compat_matrix[a][b]
-                            count += 1
-                    avg_compat = total / count if count > 0 else 0.0
-                    if avg_compat > best_score:
-                        best_score = avg_compat
-                        best_pair = (ga_idx, gb_idx)
-
-            if best_score < threshold:
-                break
-
-            # Merge the best pair
-            ga_idx, gb_idx = best_pair
-            merged = groups[ga_idx] + groups[gb_idx]
-            groups = [g for idx, g in enumerate(groups) if idx != ga_idx and idx != gb_idx]
-            groups.append(merged)
-
-        # Sort groups: multi-member first (by size desc), then singletons
-        groups.sort(key=lambda g: (-len(g), g[0]))
-        return groups
-
-    @staticmethod
-    def _generate_heatmap(compat_matrix, lora_names, groups):
-        """Generate N×N heatmap as torch IMAGE tensor using PIL."""
-        from PIL import Image, ImageDraw, ImageFont
-        import numpy as np
-
-        n = len(compat_matrix)
-        if n == 0:
-            return torch.zeros(1, 1, 1, 3, dtype=torch.float32)
-
-        # Reorder indices by group membership so group borders are contiguous
-        display_order = []
-        for g in groups:
-            display_order.extend(g)
-
-        cell_size = 80
-
-        # Compute margin from longest label
-        tmp_img = Image.new("RGB", (1, 1))
-        tmp_draw = ImageDraw.Draw(tmp_img)
-        max_label_w = max(tmp_draw.textlength(name) for name in lora_names) if lora_names else 100
-        margin = int(max_label_w) + 20  # padding
-        col_header_h = margin  # same space for rotated column headers
-        img_w = margin + n * cell_size
-        img_h = col_header_h + n * cell_size
-
-        img = Image.new("RGB", (img_w, img_h), (30, 30, 30))
-        draw = ImageDraw.Draw(img)
-
-        # Color mapping: continuous red (-0.4) → yellow (0.05) → green (+0.5)
-        def compat_to_color(val):
-            # Normalize to 0..1 range: -0.4 → 0, +0.5 → 1
-            t = max(0.0, min(1.0, (val + 0.4) / 0.9))
-            if t < 0.5:
-                # Red to yellow (t: 0→0.5)
-                s = t / 0.5  # 0..1
-                r = int(200 + 20 * s)
-                g = int(180 * s)
-                return (r, g, 0)
-            else:
-                # Yellow to green (t: 0.5→1)
-                s = (t - 0.5) / 0.5  # 0..1
-                r = int(220 * (1 - s))
-                g = int(180 + 20 * s)
-                return (r, g, 0)
-
-        # Draw cells (using reordered indices)
-        for row in range(n):
-            for col in range(n):
-                orig_i = display_order[row]
-                orig_j = display_order[col]
-                x = margin + col * cell_size
-                y = col_header_h + row * cell_size
-                if orig_i == orig_j:
-                    color = (80, 80, 80)
-                    val_text = "-"
-                else:
-                    val = compat_matrix[orig_i][orig_j]
-                    color = compat_to_color(val)
-                    val_text = f"{val:.2f}"
-
-                draw.rectangle([x, y, x + cell_size - 1, y + cell_size - 1], fill=color)
-                # Center text in cell
-                bbox = draw.textbbox((0, 0), val_text)
-                tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
-                tx = x + (cell_size - tw) // 2
-                ty = y + (cell_size - th) // 2
-                # Text color: white on dark, black on light
-                brightness = color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
-                text_color = (0, 0, 0) if brightness > 128 else (255, 255, 255)
-                draw.text((tx, ty), val_text, fill=text_color)
-
-        # Draw row labels (full name, right-aligned against grid)
-        for pos in range(n):
-            label = lora_names[display_order[pos]]
-            y = col_header_h + pos * cell_size + cell_size // 2 - 5
-            draw.text((5, y), label, fill=(220, 220, 220))
-
-        # Draw column labels (rotated 90° for readability)
-        for pos in range(n):
-            label = lora_names[display_order[pos]]
-            # Render text onto a temporary image, rotate, paste
-            bbox = tmp_draw.textbbox((0, 0), label)
-            tw = bbox[2] - bbox[0] + 4
-            th = bbox[3] - bbox[1] + 4
-            txt_img = Image.new("RGBA", (tw, th), (30, 30, 30, 255))
-            txt_draw = ImageDraw.Draw(txt_img)
-            txt_draw.text((2, 2), label, fill=(220, 220, 220, 255))
-            rotated = txt_img.rotate(90, expand=True)
-            paste_x = margin + pos * cell_size + (cell_size - rotated.width) // 2
-            paste_y = col_header_h - rotated.height - 5
-            img.paste(rotated.convert("RGB"), (paste_x, max(0, paste_y)))
-
-        # Draw group borders (contiguous after reordering)
-        pos = 0
-        for group in groups:
-            if len(group) > 1:
-                x0 = margin + pos * cell_size - 1
-                y0 = col_header_h + pos * cell_size - 1
-                x1 = margin + (pos + len(group)) * cell_size
-                y1 = col_header_h + (pos + len(group)) * cell_size
-                for offset in range(3):
-                    draw.rectangle([x0 - offset, y0 - offset, x1 + offset, y1 + offset],
-                                   outline=(255, 255, 255))
-            pos += len(group)
-
-        # Convert PIL → torch tensor [1, H, W, 3] float32
-        arr = np.array(img, dtype=np.float32) / 255.0
-        tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, H, W, 3]
-        return tensor
-
-    def _build_compatibility_report(self, active_loras, groups, group_info,
-                                     lora_stats, pairwise_conflicts,
-                                     collection_stats, warnings,
-                                     detected_arch, prefix_count):
-        """Build human-readable compatibility report."""
-        n_loras = len(active_loras)
-        lines = []
-
-        def _dn(name):
-            """Display name: strip .safetensors extension."""
-            return name.replace(".safetensors", "")
-
-        lines.append("=" * 55)
-        lines.append("  LoRA Compatibility Analysis")
-        lines.append("=" * 55)
-        lines.append("")
-        lines.append(f"Analyzed: {n_loras} LoRAs across {prefix_count} prefixes")
-        arch_display = detected_arch.upper() if detected_arch and detected_arch != 'unknown' else "Unknown"
-        lines.append(f"Architecture: {arch_display}")
-        lines.append(f"Avg conflict: {collection_stats['avg_conflict']:.0%} | "
-                     f"Avg cosine similarity: {collection_stats['avg_cos_sim']:.2f}")
-        lines.append("")
-
-        # --- Recommended Groups ---
-        lines.append("-" * 30 + " Recommended Groups " + "-" * 30)
-        lines.append("")
-
-        group_num = 0
-        solo_entries = []
-        for gi in group_info:
-            indices = gi["indices"]
-            if gi["type"] == "solo":
-                solo_entries.append(gi)
-                continue
-
-            group_num += 1
-            confidence = gi["confidence"]
-            label = "Safe to combine" if confidence == "Low" else "Merge together"
-            lines.append(f"Group {group_num} -- {label} (compatibility: {confidence})")
-            for idx in indices:
-                strength = gi["strengths"].get(idx, active_loras[idx]["strength"])
-                name = _dn(active_loras[idx]["name"])
-                lines.append(f"  * {name:<28s} strength {strength:.2f}")
-            lines.append(f"  Avg cosine sim: {gi['avg_cos_sim']:.2f} | "
-                        f"Avg conflict: {gi['avg_conflict']:.0%}")
-            lines.append(f"  Suggested merge: {gi['suggested_merge']}")
-            lines.append("")
-
-        if solo_entries:
-            lines.append("Solo -- Use independently")
-            for gi in solo_entries:
-                idx = gi["indices"][0]
-                name = _dn(active_loras[idx]["name"])
-                strength = gi["strength"]
-                lines.append(f"  * {name:<28s} strength {strength:.2f}")
-                if gi["opposing"]:
-                    opp_strs = [f"{_dn(oname)} (cos: {cs:.2f})" for oname, cs in gi["opposing"][:3]]
-                    lines.append(f"    Opposes: {', '.join(opp_strs)}")
-            lines.append("")
-
-        # --- Warnings ---
-        if warnings:
-            lines.append("-" * 30 + " Warnings " + "-" * 30)
-            lines.append("")
-            for w in warnings:
-                if w["type"] == "opposing":
-                    lines.append(f"! {_dn(w['name_i'])} vs {_dn(w['name_j'])}: Opposing (cos_sim: {w['cos_sim']:.2f})")
-                    lines.append(f"  These cancel each other out -- using both will degrade quality.")
-                    lines.append("")
-                elif w["type"] == "magnitude_group":
-                    lines.append(f"! {_dn(w['stronger'])} ({w['avg_ratio']:.1f}x avg) overshadows:")
-                    lines.append(f"  {', '.join(_dn(n) for n in w['weaker_list'])}")
-                    lines.append(f"  Consider lowering its strength or raising weaker LoRAs.")
-                    lines.append("")
-                elif w["type"] == "magnitude":
-                    lines.append(f"! {_dn(w['stronger'])} is {w['ratio']:.1f}x stronger than {_dn(w['weaker'])}")
-                    lines.append(f"  {_dn(w['weaker'])} may be overshadowed at equal strengths.")
-                    lines.append("")
-
-        # --- Pairwise Compatibility Table ---
-        lines.append("-" * 30 + " Pairwise Compatibility " + "-" * 30)
-        lines.append("")
-
-        # Sort by compat score descending
-        sorted_pairs = sorted(pairwise_conflicts, key=lambda p: p["cosine_sim"] * (1.0 - p["ratio"]), reverse=True)
-        # Compute max pair label width for right-aligned columns
-        pair_labels = [_dn(pc["pair"]) for pc in sorted_pairs]
-        max_pair_w = max((len(p) for p in pair_labels), default=45)
-        for pc, pair_label in zip(sorted_pairs, pair_labels):
-            conflict = pc["ratio"]
-            cos = round(pc["cosine_sim"], 2) + 0.0  # avoid -0.00
-            compat = round(pc["cosine_sim"] * (1.0 - conflict), 2) + 0.0  # avoid -0.00
-            indicator = ""
-            if compat > 0.2:
-                indicator = " [OK]"
-            elif compat < -0.05:
-                indicator = " [!!]"
-            if pc.get("shared_prefixes", 1) == 0:
-                indicator += " (no shared keys)"
-            lines.append(f"  {pair_label:<{max_pair_w}s}  "
-                        f"cos:{cos:6.2f}  conflict:{conflict:5.0%}  compat:{compat:6.2f}{indicator}")
-        lines.append("")
-        lines.append("=" * 55)
-
-        return "\n".join(lines)
-
-
 class LoRAConflictEditor(_LoRAMergeBase):
     """
     Analyzes pairwise sign conflicts between LoRAs in a stack and enriches
@@ -6925,12 +8097,14 @@ class LoRAConflictEditor(_LoRAMergeBase):
             if isinstance(first, (tuple, list)):
                 for entry in lora_stack:
                     cm = entry[3] if len(entry) > 3 else "all"
+                    kf = entry[4] if len(entry) > 4 else "all"
                     cs = float(entry[2]) if entry[2] is not None else -1.0
-                    entries.append((str(entry[0]), float(entry[1]), cs, cm))
+                    entries.append((str(entry[0]), float(entry[1]), cs, cm, kf))
             elif isinstance(first, dict):
                 for item in lora_stack:
                     cm = item.get("conflict_mode", "all")
-                    entries.append((str(item.get("name", "")), float(item.get("strength", 0)), cm))
+                    kf = item.get("key_filter", "all")
+                    entries.append((str(item.get("name", "")), float(item.get("strength", 0)), cm, kf))
             entries.sort()
             h.update(json.dumps(entries).encode())
         h.update(f"|ms={merge_strategy}".encode())
@@ -6966,7 +8140,10 @@ class LoRAConflictEditor(_LoRAMergeBase):
             else:
                 # clip_strength may be None (dict-format LoRAs use global multiplier);
                 # preserve None so the optimizer applies clip_strength_multiplier correctly
-                enriched = [(item["name"], item["strength"], item["clip_strength"], resolved)]
+                enriched = [(
+                    item["name"], item["strength"], item["clip_strength"],
+                    resolved, item.get("key_filter", "all")
+                )]
             report = (
                 "=" * 46 + "\n"
                 "LORA CONFLICT EDITOR - ANALYSIS REPORT\n"
@@ -7175,7 +8352,8 @@ class LoRAConflictEditor(_LoRAMergeBase):
                     enriched.append(item)
                 else:
                     enriched.append((item["name"], item["strength"],
-                                     item["clip_strength"], item.get("conflict_mode", "all")))
+                                     item["clip_strength"], item.get("conflict_mode", "all"),
+                                     item.get("key_filter", "all")))
             else:
                 mode = resolved_modes[active_idx]
                 if is_dict_format:
@@ -7188,6 +8366,7 @@ class LoRAConflictEditor(_LoRAMergeBase):
                         item["strength"],
                         item["clip_strength"],
                         mode,
+                        item.get("key_filter", "all"),
                     ))
                 active_idx += 1
 
@@ -7268,6 +8447,9 @@ NODE_CLASS_MAPPINGS = {
     "LoRAOptimizer": LoRAOptimizer,
     "LoRAOptimizerSimple": LoRAOptimizerSimple,
     "SaveMergedLoRA": SaveMergedLoRA,
+    "BuildAutoTunerPythonEvaluator": BuildAutoTunerPythonEvaluator,
+    "SaveCalibrationData": SaveCalibrationData,
+    "LoadCalibrationData": LoadCalibrationData,
     "LoRAConflictEditor": LoRAConflictEditor,
     "MergedLoRAToHook": MergedLoRAToHook,
     "MergedLoRAToWanVideo": MergedLoRAToWanVideo,
@@ -7285,6 +8467,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoRAOptimizer": "LoRA Optimizer (Advanced)",
     "LoRAOptimizerSimple": "LoRA Optimizer",
     "SaveMergedLoRA": "Save Merged LoRA",
+    "BuildAutoTunerPythonEvaluator": "Build AutoTuner Python Evaluator",
+    "SaveCalibrationData": "Save Calibration Data",
+    "LoadCalibrationData": "Load Calibration Data",
     "LoRAConflictEditor": "LoRA Conflict Editor",
     "MergedLoRAToHook": "Merged LoRA to Hook",
     "MergedLoRAToWanVideo": "(WIP) Merged LoRA → WanVideo",
