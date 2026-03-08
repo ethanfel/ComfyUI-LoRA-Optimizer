@@ -51,7 +51,7 @@ _ARCH_PRESETS = {
         "auto_strength_orthogonal_floor": 0.85,
         "display_name": "SD/SDXL UNet",
         "full_rank": {
-            "rank_threshold": 256,
+            "rank_threshold": 512,
             "disable_slerp_upgrade": True,
             "prefer_sum_orthogonal": True,
             "auto_strength_floor": 1.0,
@@ -73,7 +73,7 @@ _ARCH_PRESETS = {
         "auto_strength_orthogonal_floor": 0.85,
         "display_name": "DiT (Flux/WAN/Z-Image/LTX/HunyuanVideo)",
         "full_rank": {
-            "rank_threshold": 256,
+            "rank_threshold": 512,
             "disable_slerp_upgrade": True,
             "prefer_sum_orthogonal": True,
             "auto_strength_floor": 1.0,
@@ -95,7 +95,7 @@ _ARCH_PRESETS = {
         "auto_strength_orthogonal_floor": 0.9,
         "display_name": "LLM (Qwen/LLaMA)",
         "full_rank": {
-            "rank_threshold": 256,
+            "rank_threshold": 512,
             "disable_slerp_upgrade": True,
             "prefer_sum_orthogonal": True,
             "auto_strength_floor": 1.0,
