@@ -820,7 +820,7 @@ class _LoRAMergeBase:
         Canonical format: diffusion_model.blocks.N.{self_attn,cross_attn,ffn}.*
 
         Handles LyCORIS, diffusers, Fun LoRA, finetrainer formats.
-        Also applies RS-LoRA alpha compensation if detected.
+
         """
         normalized = {}
         for k, v in lora_sd.items():
@@ -933,23 +933,13 @@ class _LoRAMergeBase:
 
             normalized[new_k] = v
 
-        # RS-LoRA compensation: detect and fix alpha scaling.
-        # RS-LoRA files omit ALL alpha keys and rely on sqrt(rank) scaling.
-        # Only apply compensation if the file has zero alpha keys (reliable
-        # heuristic — standard LoRAs either include explicit alphas or use
-        # rank as default alpha, which _get_lora_key_info handles).
-        has_any_alpha = any(nk.endswith('.alpha') for nk in normalized)
-        has_any_lora = any(nk.endswith('.lora_A.weight') for nk in normalized)
-        if not has_any_alpha and has_any_lora:
-            # Find rank from any lora_A weight
-            sample_key = next(nk for nk in normalized if nk.endswith('.lora_A.weight'))
-            rank = normalized[sample_key].shape[0]
-            # alpha/rank = rank^1.5/rank = sqrt(rank), matching RS-LoRA scaling
-            corrected_alpha = torch.tensor(rank * (rank ** 0.5))
-            for nk in list(normalized.keys()):
-                if nk.endswith('.lora_A.weight'):
-                    alpha_key = nk.replace('.lora_A.weight', '.alpha')
-                    normalized[alpha_key] = corrected_alpha
+        # Note: RS-LoRA compensation removed. RS-LoRA files omit alpha and
+        # rely on sqrt(rank) scaling, but we can't distinguish them from
+        # standard PEFT LoRAs that also omit alpha. False positives cause
+        # ~4x weight amplification (rank 16) to ~5.66x (rank 32). When alpha
+        # is missing, _get_lora_key_info defaults alpha=rank (scale=1.0),
+        # which is correct for standard LoRAs and only slightly weak for
+        # RS-LoRA.
 
         return normalized
 
@@ -2546,6 +2536,19 @@ class _LoRAMergeBase:
                     diffs_with_weights[idx] = (diff.to(device=dev, dtype=torch.float32), weight)
                 conflict_mask = self._compute_conflict_mask(diffs_with_weights)
 
+                # Guard: if conflict mask covers >40% of positions, the "conflicts"
+                # are likely base-rate noise from orthogonal LoRAs (expected ~50%
+                # sign disagreement for uncorrelated vectors).  Skip sparsification
+                # entirely — there are no real conflicts to resolve.
+                conflict_frac = conflict_mask.float().mean().item()
+                if conflict_frac > 0.40:
+                    del conflict_mask
+                    is_conflict = False
+                    logging.info(f"[LoRA Optimizer]   Skipping conflict-aware sparsification "
+                                 f"(conflict mask covers {conflict_frac:.0%} of positions — "
+                                 f"likely base-rate noise from orthogonal LoRAs)")
+
+            if is_conflict:
                 is_dare = sparsification == "dare_conflict"
                 sparsify_fn = (self._dare_sparsify_conflict if is_dare
                                else self._della_sparsify_conflict)
@@ -5541,6 +5544,13 @@ class LoRAOptimizer(_LoRAMergeBase):
                     if (is_full_rank and fr_preset.get("prefer_sum_orthogonal", False)
                             and pf_mode == "weighted_average" and pf_orthogonal):
                         pf_mode = "weighted_sum"
+                    # For orthogonal LoRAs with near-zero excess conflict, use
+                    # weighted_sum (additive) so both concepts contribute fully.
+                    # weighted_average divides by N, halving each contribution.
+                    pf_excess = pf.get("excess_conflict", pf.get("decision_conflict", None))
+                    if (pf_mode == "weighted_average" and pf_orthogonal
+                            and pf_excess is not None and pf_excess < 0.05):
+                        pf_mode = "weighted_sum"
 
             # Apply merge strategy override from Conflict Editor (takes priority over auto-selection)
             # Skip when user explicitly chose additive (protects DPO/edit LoRAs)
@@ -6923,7 +6933,7 @@ class WanVideoLoRAOptimizer(LoRAOptimizer):
 
     All merging algorithms (TIES, DARE/DELLA, SVD compression, auto-strength,
     conflict analysis) are inherited from LoRAOptimizer. Wan LoRA key
-    normalization (LyCORIS, diffusers, Fun LoRA, finetrainer, RS-LoRA) is
+    normalization (LyCORIS, diffusers, Fun LoRA, finetrainer) is
     already handled by the parent's _normalize_keys_wan.
     """
 
