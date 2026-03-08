@@ -5534,21 +5534,24 @@ class LoRAOptimizer(_LoRAMergeBase):
                         arch_preset=arch_preset,
                         precomputed_density=pf.get("precomputed_density"),
                     )
-                    # Upgrade weighted_average → slerp for 2+ positively-aligned LoRAs.
-                    # SLERP preserves magnitude better than weighted_average's /N reduction.
-                    # Skip when inappropriate:
-                    #  - Orthogonal (|cos| < 0.25): SLERP's norm correction gives ~1.6x
-                    #    more energy than weighted_average for 3 orthogonal vectors.
-                    #  - Opposing (cos < 0): SLERP interpolates between opposing directions
-                    #    while preserving magnitude; combined with auto-strength boosting
-                    #    (scale > 1.0 for opposing pairs), this amplifies artifacts.
-                    # Both cases benefit from weighted_average's /N magnitude reduction.
+                    # Upgrade weighted_average → slerp for 2+ non-opposing LoRAs.
+                    # SLERP preserves magnitude better than weighted_average's /N reduction,
+                    # which is critical for video LoRAs where motion energy matters.
+                    # Skip for genuinely opposing LoRAs (cos significantly negative):
+                    # SLERP interpolates between opposing directions while preserving
+                    # magnitude, amplifying artifacts.  For orthogonal LoRAs (|cos| < threshold),
+                    # per-prefix cos_sim scatters around zero — slightly negative values are
+                    # noise, not real opposition.  Only block SLERP when cos_sim is below
+                    # the negative of the orthogonal threshold (genuinely anti-correlated).
                     pf_raw_cos = pf.get("decision_cosine", pf.get("avg_cos_sim", 0.0))
                     pf_orthogonal = abs(pf_raw_cos) < arch_preset["orthogonal_cos_sim_max"]
-                    pf_opposing = pf_raw_cos < 0
+                    pf_opposing = pf_raw_cos < -arch_preset["orthogonal_cos_sim_max"]
+                    # Full-rank gate: skip SLERP upgrade — for full-rank patches the
+                    # information is spread across all dimensions, and SLERP's
+                    # hypersphere interpolation loses signal from both LoRAs.
                     if (pf_mode == "weighted_average" and pf["n_loras"] >= 2
                             and strategy_set == "full"
-                            and not pf_orthogonal and not pf_opposing
+                            and not pf_opposing
                             and not (is_full_rank and fr_preset.get("disable_slerp_upgrade", False))):
                         pf_mode = "slerp"
                     if (is_full_rank and fr_preset.get("prefer_sum_orthogonal", False)
