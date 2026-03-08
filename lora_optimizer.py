@@ -2544,9 +2544,7 @@ class _LoRAMergeBase:
                 if conflict_frac > 0.40:
                     del conflict_mask
                     is_conflict = False
-                    logging.info(f"[LoRA Optimizer]   Skipping conflict-aware sparsification "
-                                 f"(conflict mask covers {conflict_frac:.0%} of positions — "
-                                 f"likely base-rate noise from orthogonal LoRAs)")
+                    self._sparsification_skipped = getattr(self, '_sparsification_skipped', 0) + 1
 
             if is_conflict:
                 is_dare = sparsification == "dare_conflict"
@@ -5763,6 +5761,11 @@ class LoRAOptimizer(_LoRAMergeBase):
                          f"{strategy_counts.get('weighted_average', 0)} avg, "
                          f"{strategy_counts.get('consensus', 0)} cons, "
                          f"{strategy_counts.get('ties', 0)} ties")
+        spars_skipped = getattr(self, '_sparsification_skipped', 0)
+        if spars_skipped > 0:
+            logging.info(f"[LoRA Optimizer]   Conflict-aware sparsification skipped for "
+                         f"{spars_skipped} groups (base-rate noise from orthogonal LoRAs)")
+            self._sparsification_skipped = 0
         if compressed_count > 0:
             passthrough_count = lowrank_count - compressed_count
             logging.info(f"[LoRA Optimizer]   SVD-compressed: {compressed_count} patches "
