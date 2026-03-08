@@ -519,6 +519,25 @@ class _LoRAMergeBase:
                for k in keys):
             return 'zimage'
 
+        # Qwen-Image: transformer_blocks with img_mlp/txt_mlp/img_mod/txt_mod
+        # Must be checked BEFORE FLUX — both use transformer.transformer_blocks
+        # but Qwen has dual-stream markers (img_mlp, txt_mlp, img_mod, txt_mod, add_q_proj).
+        # Also detect Qwen LoRAs that only target attention (to_q/to_k/to_v) without
+        # dual-stream markers — these have transformer.transformer_blocks but lack
+        # FLUX-specific double_blocks/single_blocks patterns.
+        _has_qwen_markers = any('transformer_blocks' in k and
+               any(x in k for x in ['img_mlp', 'txt_mlp', 'img_mod', 'txt_mod', 'add_q_proj'])
+               for k in keys)
+        if _has_qwen_markers:
+            return 'qwen_image'
+        # Qwen attention-only LoRAs: transformer.transformer_blocks with to_q/to_k/to_v
+        # but NO double_blocks/single_blocks (which would indicate FLUX)
+        _has_transformer_blocks = any('transformer.transformer_blocks' in k for k in keys)
+        _has_flux_blocks = any('double_blocks' in k or 'single_blocks' in k for k in keys)
+        if _has_transformer_blocks and not _has_flux_blocks:
+            # transformer.transformer_blocks without FLUX block patterns = Qwen-Image
+            return 'qwen_image'
+
         # FLUX: double/single blocks in various trainer formats
         if any('transformer.single_transformer_blocks' in k or 'transformer.transformer_blocks' in k
                for k in keys):
@@ -552,12 +571,6 @@ class _LoRAMergeBase:
                 and 'middle_block' not in k and 'mid_block' not in k
                 for k in keys):
             return 'ltx'
-
-        # Qwen-Image: transformer_blocks with img_mlp/txt_mlp/img_mod/txt_mod
-        if any('transformer_blocks' in k and
-               any(x in k for x in ['img_mlp', 'txt_mlp', 'img_mod', 'txt_mod', 'add_q_proj'])
-               for k in keys):
-            return 'qwen_image'
 
         # SDXL: text encoders or UNet block patterns
         if 'lora_te1_' in keys_str or 'lora_te2_' in keys_str:
