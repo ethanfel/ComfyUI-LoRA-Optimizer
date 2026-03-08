@@ -1913,6 +1913,19 @@ class _LoRAMergeBase:
                     diffs_with_weights[idx] = (diff.to(device=dev, dtype=torch.float32), weight)
                 conflict_mask = self._compute_conflict_mask(diffs_with_weights)
 
+                # Guard: if conflict mask covers >40% of positions, the "conflicts"
+                # are likely base-rate noise from orthogonal LoRAs (expected ~50%
+                # sign disagreement for uncorrelated vectors).  Skip sparsification
+                # entirely — there are no real conflicts to resolve.
+                conflict_frac = conflict_mask.float().mean().item()
+                if conflict_frac > 0.40:
+                    del conflict_mask
+                    is_conflict = False
+                    logging.info(f"[LoRA Optimizer]   Skipping conflict-aware sparsification "
+                                 f"(conflict mask covers {conflict_frac:.0%} of positions — "
+                                 f"likely base-rate noise from orthogonal LoRAs)")
+
+            if is_conflict:
                 is_dare = sparsification == "dare_conflict"
                 sparsify_fn = (self._dare_sparsify_conflict if is_dare
                                else self._della_sparsify_conflict)
@@ -4402,6 +4415,13 @@ class LoRAOptimizer(_LoRAMergeBase):
                     # Independent full-rank deltas should be added, not averaged.
                     if (is_full_rank and fr_preset.get("prefer_sum_orthogonal", False)
                             and pf_mode == "weighted_average" and pf_orthogonal):
+                        pf_mode = "weighted_sum"
+                    # For orthogonal LoRAs with near-zero excess conflict, use
+                    # weighted_sum (additive) so both concepts contribute fully.
+                    # weighted_average divides by N, halving each contribution.
+                    pf_excess = pf.get("excess_conflict", pf.get("decision_conflict", None))
+                    if (pf_mode == "weighted_average" and pf_orthogonal
+                            and pf_excess is not None and pf_excess < 0.05):
                         pf_mode = "weighted_sum"
 
             # Apply merge strategy override from Conflict Editor (takes priority over auto-selection)
