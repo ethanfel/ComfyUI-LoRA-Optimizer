@@ -403,9 +403,16 @@ class _DiffCache:
         self._cache_dir = None
         self._disk_failed = False
         if mode in ("disk", "auto"):
-            import tempfile
+            import tempfile, atexit, weakref
             self._cache_dir = tempfile.mkdtemp(prefix="lora_diff_cache_",
                                                    dir=folder_paths.get_temp_directory())
+            # Clean up temp directory on process exit (guards against crash-orphaned files)
+            _dir = self._cache_dir
+            def _cleanup(d=_dir):
+                import shutil
+                shutil.rmtree(d, ignore_errors=True)
+            atexit.register(_cleanup)
+            weakref.finalize(self, _cleanup)
         if mode == "auto":
             try:
                 import psutil
@@ -454,7 +461,7 @@ class _DiffCache:
             return val.to(device) if device is not None else val
         if key in self._ram_store:
             val = self._ram_store[key]
-            return val.to(device) if device is not None else val.clone()
+            return val.to(device) if device is not None else val
         if key in self._disk_store:
             import numpy as np
             arr = np.load(self._disk_store[key], mmap_mode='r')
@@ -479,7 +486,7 @@ class _DiffCache:
                 self._disk_failed = True
                 logging.warning(f"[DiffCache] Disk cache failed, falling back to RAM — {e}")
         # RAM storage (also used as fallback when disk fails)
-        self._ram_store[key] = cached.clone()
+        self._ram_store[key] = cached
         self._ram_bytes += tensor_bytes
 
     def size_mb(self):
@@ -1914,7 +1921,7 @@ class _LoRAMergeBase:
         n = flat.numel()
         k = max(1, int(n * density))
         if k >= n:
-            return tensor.clone()
+            return tensor
         _, indices = torch.topk(flat.abs(), k)
         mask = torch.zeros_like(flat, dtype=torch.bool)
         mask[indices] = True
@@ -2288,8 +2295,7 @@ class _LoRAMergeBase:
             if selfish_mask.any():
                 selfish_additions.add_(d.to(dtype=torch.float32) * w * selfish_mask.float())
                 has_selfish = True
-            consensus_d = d.clone()
-            consensus_d[selfish_mask] = 0
+            consensus_d = torch.where(selfish_mask, torch.zeros(1, device=d.device, dtype=d.dtype), d)
             consensus_diffs.append((consensus_d, w))
 
         return consensus_diffs, selfish_additions if has_selfish else None
@@ -2329,9 +2335,10 @@ class _LoRAMergeBase:
         del flat
 
         # Modified Gram-Schmidt orthogonalization (numerically stable)
+        # Operates in-place on directions (not used after this loop)
         ortho = []
-        for i, d in enumerate(directions):
-            q = d.clone()
+        for i in range(len(directions)):
+            q = directions[i]
             for j in range(len(ortho)):
                 proj = torch.dot(q, ortho[j])
                 q = q - proj * ortho[j]
@@ -2341,6 +2348,7 @@ class _LoRAMergeBase:
             else:
                 q = torch.zeros_like(q)
             ortho.append(q)
+        del directions
 
         # Recombine: orthogonalized direction * original magnitude
         result = []
@@ -2954,6 +2962,15 @@ class _LoRAMergeBase:
                         item["lora"] = self._normalize_keys(item["lora"], arch)
                 else:
                     logging.info("[LoRA Optimizer] Architecture: unknown (no key normalization applied)")
+
+            # Update loaded_loras cache to point at normalized dicts so the
+            # pre-normalization copies can be garbage-collected.  This avoids
+            # keeping both raw and normalized state dicts in memory (saves
+            # 500MB-3GB for large models like Qwen).
+            for item in normalized:
+                name = item["name"]
+                if name in self.loaded_loras:
+                    self.loaded_loras[name] = item["lora"]
         else:
             self._detected_arch = None
 
