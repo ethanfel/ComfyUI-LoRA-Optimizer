@@ -491,12 +491,13 @@ class LoRASettingsNodeTests(unittest.TestCase):
         settings = result[0]
         expected_keys = {"normalize_keys", "architecture_preset",
                          "auto_strength_floor", "decision_smoothing",
-                         "vram_budget", "cache_patches"}
+                         "smooth_slerp_gate", "vram_budget", "cache_patches"}
         self.assertEqual(set(settings.keys()), expected_keys)
         self.assertEqual(settings["normalize_keys"], "enabled")
         self.assertEqual(settings["architecture_preset"], "auto")
         self.assertAlmostEqual(settings["auto_strength_floor"], -1.0)
         self.assertAlmostEqual(settings["decision_smoothing"], 0.25)
+        self.assertFalse(settings["smooth_slerp_gate"])
         self.assertAlmostEqual(settings["vram_budget"], 0.0)
         self.assertEqual(settings["cache_patches"], "enabled")
 
@@ -560,6 +561,7 @@ class LoRASettingsNodeTests(unittest.TestCase):
             "architecture_preset": "dit",
             "auto_strength_floor": 0.5,
             "decision_smoothing": 0.8,
+            "smooth_slerp_gate": True,
             "vram_budget": 0.3,
             "cache_patches": "disabled",
         }
@@ -646,7 +648,8 @@ class LoRASettingsNodeTests(unittest.TestCase):
             self.assertEqual(default, simple[key],
                              f"Default mismatch for {key}: settings={default}, simple={simple[key]}")
         # Keys on LoRAMergeSettings
-        for key in ["normalize_keys", "architecture_preset", "cache_patches"]:
+        for key in ["normalize_keys", "architecture_preset", "cache_patches",
+                     "smooth_slerp_gate"]:
             spec = merge_inputs["required"][key]
             if isinstance(spec[0], list):
                 default = spec[1].get("default", spec[0][0])

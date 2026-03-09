@@ -3536,6 +3536,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Smooth per-group strategy metrics toward each block's average before Pass 2 decisions. 0 disables smoothing; 0.2-0.4 usually removes noisy mode flips without washing out real differences."
                 }),
+                "smooth_slerp_gate": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "When enabled, uses smoothed cosine (decision_cosine) for SLERP gate instead of raw avg_cos_sim. Can affect SLERP/weighted_average ratio."
+                }),
                 "tuner_data": ("TUNER_DATA", {
                     "tooltip": "Connect from the LoRA AutoTuner's tuner_data output. Used when settings_source is 'from_autotuner'."
                 }),
@@ -3553,7 +3557,7 @@ class LoRAOptimizer(_LoRAMergeBase):
     DESCRIPTION = "Auto-analyzes a LoRA stack and selects heuristic merge strategies per weight group. Outputs merged model + analysis report. Best for style/character LoRAs — apply edit, distillation (LCM/Turbo/Hyper), or DPO LoRAs via a standard Load LoRA node instead."
 
     @staticmethod
-    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix", patch_compression="smart", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_refinement="none", strategy_set="full", architecture_preset="auto", auto_strength_floor=-1.0, decision_smoothing=0.25):
+    def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix", patch_compression="smart", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_refinement="none", strategy_set="full", architecture_preset="auto", auto_strength_floor=-1.0, decision_smoothing=0.25, smooth_slerp_gate=False):
         """
         Build a deterministic SHA-256 hash (16 hex chars) from the stack
         configuration. Used by IS_CHANGED to let ComfyUI skip re-execution
@@ -3576,7 +3580,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     entries.append((str(item.get("name", "")), float(item.get("strength", 0)), cm, kf))
             entries.sort()
             h.update(json.dumps(entries).encode())
-        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}|cp={patch_compression}|sd={svd_device}|nk={normalize_keys}|sp={sparsification}|spd={sparsification_density}|dd={dare_dampening}|mso={merge_strategy_override}|mq={merge_refinement}|bp={strategy_set}|ap={architecture_preset}|asf={auto_strength_floor}|ds={decision_smoothing}".encode())
+        h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}|cp={patch_compression}|sd={svd_device}|nk={normalize_keys}|sp={sparsification}|spd={sparsification_density}|dd={dare_dampening}|mso={merge_strategy_override}|mq={merge_refinement}|bp={strategy_set}|ap={architecture_preset}|asf={auto_strength_floor}|ds={decision_smoothing}|ssg={smooth_slerp_gate}".encode())
         return h.hexdigest()[:16]
 
     @classmethod
@@ -3591,7 +3595,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                    dare_dampening=0.0,
                    merge_strategy_override="", merge_refinement="none",
                    strategy_set="full", architecture_preset="auto",
-                   decision_smoothing=0.25,
+                   decision_smoothing=0.25, smooth_slerp_gate=False,
                    tuner_data=None, settings_source="manual"):
         base_key = cls._compute_cache_key(lora_stack, output_strength,
                                           clip_strength_multiplier, auto_strength,
@@ -3602,7 +3606,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                                           merge_strategy_override, merge_refinement,
                                           strategy_set, architecture_preset,
                                           auto_strength_floor,
-                                          decision_smoothing)
+                                          decision_smoothing, smooth_slerp_gate)
         cache_key = f"{base_key}|mid={id(model)}|ss={settings_source}"
         if settings_source in ("from_autotuner", "from_tuner_data") and tuner_data is not None:
             return f"{cache_key}|at={id(tuner_data)}"
@@ -5858,6 +5862,7 @@ class LoRAMergeSettings:
         "architecture_preset": "auto",
         "auto_strength_floor": -1.0,
         "decision_smoothing": 0.25,
+        "smooth_slerp_gate": False,
         "vram_budget": 0.0,
         "cache_patches": "enabled",
     }
@@ -5868,27 +5873,31 @@ class LoRAMergeSettings:
             "required": {
                 "normalize_keys": (["disabled", "enabled"], {
                     "default": "enabled",
-                    "tooltip": "Makes LoRAs from different training tools compatible."
+                    "tooltip": "Ensures LoRAs from different training tools (Kohya, PEFT, etc.) work together. Keep enabled unless you have a specific reason to disable."
                 }),
                 "architecture_preset": (["auto", "sd_unet", "dit", "llm"], {
                     "default": "auto",
-                    "tooltip": "Architecture-aware threshold tuning. 'auto' detects from LoRA keys."
+                    "tooltip": "Tells the optimizer what type of model you're using so it can pick the best merge settings. 'auto' detects it for you. Only change if auto-detection gets it wrong."
                 }),
                 "auto_strength_floor": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Minimum auto-strength scale factor. -1 = architecture-aware default."
+                    "tooltip": "How much the weakest LoRA is allowed to be scaled down during auto-strength. Higher values keep all LoRAs more visible. -1 picks a good default based on model type."
                 }),
                 "decision_smoothing": ("FLOAT", {
                     "default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Smooth per-group decision metrics toward block average."
+                    "tooltip": "Prevents the optimizer from picking wildly different merge methods for similar layers. Higher values = more consistent choices across the model. 0.2-0.4 is usually a good range."
+                }),
+                "smooth_slerp_gate": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Changes how the optimizer decides when to use SLERP blending. When enabled, the decision is smoother and more stable. Try enabling if you notice inconsistent results between runs."
                 }),
                 "vram_budget": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Fraction of free VRAM to use for storing merged patches."
+                    "tooltip": "How much GPU memory to use for storing merge results. 0 = keep everything in system RAM (safest). Increase to use GPU memory and reduce RAM usage."
                 }),
                 "cache_patches": (["enabled", "disabled"], {
                     "default": "enabled",
-                    "tooltip": "Cache merged patches/results in RAM for faster re-execution."
+                    "tooltip": "Keeps the merge result in memory so re-running the workflow is instant. Disable to free RAM — recommended for large video models."
                 }),
             },
         }
@@ -5898,18 +5907,19 @@ class LoRAMergeSettings:
     FUNCTION = "build_settings"
     CATEGORY = "LoRA Optimizer"
     DESCRIPTION = (
-        "Common merge settings shared between Optimizer and AutoTuner modes. "
-        "Connect to the 'merge_settings' input of either settings node."
+        "Shared settings that apply to both Optimizer and AutoTuner modes. "
+        "Connect to the 'merge_settings' input on an Optimizer Settings or AutoTuner Settings node."
     )
 
     def build_settings(self, normalize_keys, architecture_preset,
                        auto_strength_floor, decision_smoothing,
-                       vram_budget, cache_patches):
+                       smooth_slerp_gate, vram_budget, cache_patches):
         return ({
             "normalize_keys": normalize_keys,
             "architecture_preset": architecture_preset,
             "auto_strength_floor": auto_strength_floor,
             "decision_smoothing": decision_smoothing,
+            "smooth_slerp_gate": smooth_slerp_gate,
             "vram_budget": vram_budget,
             "cache_patches": cache_patches,
         },)
@@ -5928,52 +5938,52 @@ class LoRAOptimizerSettings:
             "required": {
                 "auto_strength": (["enabled", "disabled"], {
                     "default": "enabled",
-                    "tooltip": "Automatically scale per-LoRA strengths to preserve energy balance."
+                    "tooltip": "Automatically turns down individual LoRA strengths when combining many LoRAs, preventing oversaturation. Recommended to keep enabled."
                 }),
                 "optimization_mode": (["per_prefix", "global", "additive"], {
                     "default": "per_prefix",
-                    "tooltip": "How merge strategies are chosen: per-prefix (best per block), global (single strategy), additive (simple sum)."
+                    "tooltip": "How the optimizer picks merge methods. 'per_prefix' (recommended): picks the best method for each part of the model. 'global': uses one method everywhere. 'additive': simple stacking with no conflict handling — use for edit/DPO LoRAs."
                 }),
                 "merge_refinement": (["none", "refine", "full"], {
                     "default": "none",
-                    "tooltip": "Post-merge refinement pass. 'refine' does a light cleanup, 'full' reruns analysis on the merged result."
+                    "tooltip": "Extra processing to reduce interference between LoRAs. 'none': fastest, usually fine. 'refine': light cleanup for better quality. 'full': most thorough but slower. Try 'refine' if you see artifacts or color shifts."
                 }),
                 "sparsification": (["disabled", "dare", "della", "dare_conflict", "della_conflict"], {
                     "default": "disabled",
-                    "tooltip": "Sparsification method to apply before merging."
+                    "tooltip": "Removes low-impact weights before merging to reduce interference between LoRAs. The 'conflict' variants (recommended if enabling) only trim where LoRAs disagree, leaving unique contributions intact."
                 }),
                 "sparsification_density": ("FLOAT", {
                     "default": 0.7, "min": 0.01, "max": 1.0, "step": 0.05,
-                    "tooltip": "Fraction of weights to keep when sparsification is enabled."
+                    "tooltip": "How much of each LoRA to keep when sparsification is enabled. 0.7 = keep 70%. Lower values are more aggressive — reduces interference but may lose detail."
                 }),
                 "dare_dampening": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "DARE dampening factor. Higher values reduce the magnitude of surviving weights."
+                    "tooltip": "Controls how strongly surviving weights are boosted after sparsification trims some away. 0 = standard boost, higher = gentler. Only matters when sparsification is enabled."
                 }),
                 "patch_compression": (["smart", "aggressive", "disabled"], {
                     "default": "smart",
-                    "tooltip": "SVD compression for merged patches. 'smart' compresses only when beneficial."
+                    "tooltip": "Shrinks the merged result to use less memory. 'smart' (recommended): only compresses where it's lossless. 'aggressive': compresses everything, saves more memory but slightly lossy. 'disabled': no compression."
                 }),
                 "svd_device": (["gpu", "cpu"], {
                     "default": "gpu",
-                    "tooltip": "Device for SVD computations during patch compression."
+                    "tooltip": "Where to run compression math. GPU is much faster. Switch to CPU only if you get out-of-memory errors."
                 }),
                 "free_vram_between_passes": (["disabled", "enabled"], {
                     "default": "disabled",
-                    "tooltip": "Free VRAM between merge passes. Enable for very large models."
+                    "tooltip": "Frees GPU memory between merge steps. Enable if you're running out of VRAM on large models. Barely affects speed."
                 }),
                 "strategy_set": (["full", "no_slerp", "basic"], {
                     "default": "full",
-                    "tooltip": "Which merge strategies to consider. 'full' includes SLERP, 'basic' uses only weighted average/sum."
+                    "tooltip": "Which merge methods the optimizer can choose from. 'full' (recommended): all methods available including SLERP blending. 'no_slerp': excludes SLERP. 'basic': only simple averaging."
                 }),
             },
             "optional": {
                 "merge_settings": ("MERGE_SETTINGS", {
-                    "tooltip": "Common merge settings from LoRA Merge Settings node. Uses defaults if not connected."
+                    "tooltip": "Connect a LoRA Merge Settings node here to share common settings. Uses good defaults if not connected."
                 }),
                 "merge_strategy_override": ("STRING", {
                     "forceInput": True,
-                    "tooltip": "Force a specific merge strategy for all prefixes (advanced)."
+                    "tooltip": "Forces one specific merge method everywhere instead of letting the optimizer choose. Connect from a LoRA Conflict Editor node."
                 }),
             },
         }
@@ -5983,8 +5993,8 @@ class LoRAOptimizerSettings:
     FUNCTION = "build_settings"
     CATEGORY = "LoRA Optimizer"
     DESCRIPTION = (
-        "Advanced-mode settings for the LoRA Optimizer. Connect to the "
-        "'settings' input of the Simple optimizer to unlock all Advanced knobs."
+        "Advanced settings for fine-tuning how LoRAs are merged. "
+        "Connect to the 'settings' input on the LoRA Optimizer node."
     )
 
     def build_settings(self, auto_strength, optimization_mode, merge_refinement,
@@ -6010,6 +6020,7 @@ class LoRAOptimizerSettings:
             "architecture_preset": ms["architecture_preset"],
             "auto_strength_floor": ms["auto_strength_floor"],
             "decision_smoothing": ms["decision_smoothing"],
+            "smooth_slerp_gate": ms["smooth_slerp_gate"],
             "vram_budget": ms["vram_budget"],
             "merge_strategy_override": merge_strategy_override,
         },)
@@ -6028,51 +6039,43 @@ class LoRAAutoTunerSettings:
             "required": {
                 "top_n": ("INT", {
                     "default": 3, "min": 1, "max": 10, "step": 1,
-                    "tooltip": "Number of top configurations to evaluate via actual merge."
+                    "tooltip": "How many of the best configurations to try with a real merge. Higher = explores more options but takes longer."
                 }),
                 "scoring_svd": (["disabled", "enabled"], {
                     "default": "disabled",
-                    "tooltip": "Enable SVD-based effective rank scoring. More thorough but slower. Skipped for orthogonal LoRAs (near-zero cosine similarity) where it does not improve ranking accuracy."
+                    "tooltip": "Uses a more thorough (but slower) scoring method to rank configurations. Usually not needed — enable if the default ranking seems off."
                 }),
                 "scoring_device": (["cpu", "gpu"], {
                     "default": "gpu",
-                    "tooltip": "Device for scoring computations."
+                    "tooltip": "Where to run scoring math. GPU is much faster, especially with scoring_svd enabled."
                 }),
                 "scoring_speed": (["full", "fast", "turbo", "turbo+"], {
                     "default": "turbo",
-                    "tooltip": "Controls how many prefixes Phase 2 scores per candidate."
+                    "tooltip": "How thoroughly to score each configuration. 'full': most accurate, slowest. 'turbo' (recommended): good balance of speed and accuracy. 'turbo+': fastest, may miss subtle differences."
                 }),
                 "scoring_formula": (["v2", "v1"], {
                     "default": "v2",
-                    "tooltip": "Phase 2 scoring formula. v2: arch-aware sparsity + energy metrics (recommended). v1: legacy scoring with fixed 40% sparsity target."
-                }),
-                "output_mode": (["merge", "tuning_only"], {
-                    "default": "merge",
-                    "tooltip": "merge: output merged model. tuning_only: skip final merge, pass base model through."
-                }),
-                "smooth_slerp_gate": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Use smoothed cosine for SLERP gate instead of raw avg_cos_sim."
+                    "tooltip": "Which scoring formula to use. v2 (recommended): smarter scoring that adapts to your model type. v1: older formula, kept for comparison."
                 }),
                 "diff_cache_mode": (["disabled", "auto", "ram", "disk"], {
                     "default": "auto",
-                    "tooltip": "Cache LoRA diffs across candidates. 'auto' uses RAM then spills to disk."
+                    "tooltip": "Caches intermediate data to speed up the sweep. 'auto' (recommended): uses RAM first, spills to disk if needed. 'disabled': slower but uses no extra memory."
                 }),
                 "diff_cache_ram_pct": ("FLOAT", {
                     "default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05,
-                    "tooltip": "Fraction of free RAM for diff cache in 'auto' mode."
+                    "tooltip": "How much of your free RAM the diff cache can use (in 'auto' mode). 0.5 = up to half your available RAM."
                 }),
                 "record_dataset": (["disabled", "enabled"], {
                     "default": "disabled",
-                    "tooltip": "Record analysis metrics to JSONL dataset for threshold tuning research."
+                    "tooltip": "Saves detailed scoring data to a file for analysis. Only useful for developers tuning the scoring system."
                 }),
             },
             "optional": {
                 "merge_settings": ("MERGE_SETTINGS", {
-                    "tooltip": "Common merge settings from LoRA Merge Settings node. Uses defaults if not connected."
+                    "tooltip": "Connect a LoRA Merge Settings node here to share common settings. Uses good defaults if not connected."
                 }),
                 "evaluator": ("AUTOTUNER_EVALUATOR", {
-                    "tooltip": "Optional external evaluator for blending custom scoring."
+                    "tooltip": "Connect an external evaluator to influence how configurations are ranked. Optional — the built-in scoring works well on its own."
                 }),
             },
         }
@@ -6082,12 +6085,12 @@ class LoRAAutoTunerSettings:
     FUNCTION = "build_settings"
     CATEGORY = "LoRA Optimizer"
     DESCRIPTION = (
-        "AutoTuner-mode settings for the LoRA Optimizer. Connect to the "
-        "'settings' input of the Simple optimizer to run a full parameter sweep."
+        "Runs an automatic parameter sweep to find the best merge settings for your LoRA stack. "
+        "Connect to the 'settings' input on the LoRA Optimizer node."
     )
 
     def build_settings(self, top_n, scoring_svd, scoring_device, scoring_speed,
-                       scoring_formula, output_mode, smooth_slerp_gate,
+                       scoring_formula,
                        diff_cache_mode, diff_cache_ram_pct, record_dataset,
                        merge_settings=None, evaluator=None):
         ms = merge_settings if merge_settings is not None else LoRAMergeSettings._DEFAULTS
@@ -6098,8 +6101,8 @@ class LoRAAutoTunerSettings:
             "scoring_device": scoring_device,
             "scoring_speed": scoring_speed,
             "scoring_formula": scoring_formula,
-            "output_mode": output_mode,
-            "smooth_slerp_gate": smooth_slerp_gate,
+            "output_mode": "merge",
+            "smooth_slerp_gate": ms["smooth_slerp_gate"],
             "normalize_keys": ms["normalize_keys"],
             "architecture_preset": ms["architecture_preset"],
             "auto_strength_floor": ms["auto_strength_floor"],
@@ -6125,29 +6128,29 @@ class LoRAOptimizerSimple(LoRAOptimizer):
         return {
             "required": {
                 "model": ("MODEL", {
-                    "tooltip": "Base model to merge LoRAs into."
+                    "tooltip": "Your base model (e.g. SDXL, Flux). The merged LoRAs will be applied to it."
                 }),
                 "lora_stack": ("LORA_STACK", {
-                    "tooltip": "LoRA stack from a LoRA Stack node."
+                    "tooltip": "Connect your LoRA Stack node here — this is the list of LoRAs you want to merge together."
                 }),
                 "output_strength": ("FLOAT", {
                     "default": 1.0, "min": -1.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Global multiplier applied after merging. Set to -1 for auto (uses suggested max strength)."
+                    "tooltip": "Master volume for the merged result. 1.0 = full effect, 0.5 = half. Set to -1 for auto: the optimizer picks a good strength for you."
                 }),
             },
             "optional": {
                 "clip": ("CLIP", {
-                    "tooltip": "Optional CLIP model for text-encoder LoRA keys."
+                    "tooltip": "Connect your text encoder so LoRAs can also affect how prompts are understood. Leave empty for video models."
                 }),
                 "clip_strength_multiplier": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Multiplier for CLIP LoRA strengths (stacks with per-LoRA clip_strength when provided)."
+                    "tooltip": "How strongly LoRAs affect text understanding. At 1.0, same strength as the model. Lower values reduce LoRA influence on prompts while keeping the visual effect."
                 }),
                 "tuner_data": ("TUNER_DATA", {
-                    "tooltip": "Optional AutoTuner results (from LoRA AutoTuner or Load Tuner Data). When connected, applies the top-ranked config instead of defaults."
+                    "tooltip": "Connect results from a LoRA AutoTuner or Load Tuner Data node. The optimizer will use the best settings found by the tuner instead of defaults."
                 }),
                 "settings": ("OPTIMIZER_SETTINGS", {
-                    "tooltip": "Optional settings from LoRA Optimizer Settings or LoRA AutoTuner Settings. Overrides defaults and tuner_data when connected."
+                    "tooltip": "Connect a Settings node (Optimizer Settings or AutoTuner Settings) for full control. Takes priority over tuner_data and defaults."
                 }),
             },
         }
@@ -6176,6 +6179,8 @@ class LoRAOptimizerSimple(LoRAOptimizer):
         merge_refinement="none",
         strategy_set="full",
         architecture_preset="auto",
+        decision_smoothing=0.25,
+        smooth_slerp_gate=False,
     )
 
     def execute_simple(self, model, lora_stack, output_strength,
@@ -6207,6 +6212,7 @@ class LoRAOptimizerSimple(LoRAOptimizer):
                     normalize_keys=settings["normalize_keys"],
                     architecture_preset=settings["architecture_preset"],
                     decision_smoothing=settings["decision_smoothing"],
+                    smooth_slerp_gate=settings["smooth_slerp_gate"],
                     cache_patches=settings["cache_patches"],
                     patch_compression=settings["patch_compression"],
                     svd_device=settings["svd_device"],
@@ -7189,7 +7195,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                    cache_patches="enabled",
                    diff_cache_mode="disabled", diff_cache_ram_pct=0.5,
                    vram_budget=0.0, scoring_speed="full", scoring_formula="v2",
-                   output_mode="merge", decision_smoothing=0.25):
+                   output_mode="merge", decision_smoothing=0.25,
+                   smooth_slerp_gate=False):
         evaluator_hash = cls._stable_data_hash(evaluator) if evaluator is not None else ""
         return (id(model), id(lora_stack), output_strength, clip_strength_multiplier, top_n,
                 normalize_keys, scoring_svd, scoring_device, architecture_preset,
@@ -7791,6 +7798,10 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                     "default": False,
                     "tooltip": "Toggle on to run compatibility analysis. Off by default so normal queue execution stays cheap."
                 }),
+                "create_nodes": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Automatically create LoRA Stack and Load LoRA nodes from results."
+                }),
                 "model": ("MODEL", {"tooltip": "Base model used for key mapping and target grouping."}),
                 "lora_stack": ("LORA_STACK", {"tooltip": "LoRA stack to analyze."}),
             },
@@ -7812,16 +7823,17 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
             return "disabled"
         return float("NaN")
 
-    def analyze(self, enabled, model, lora_stack, clip=None):
+    def analyze(self, enabled, create_nodes, model, lora_stack, clip=None):
+        has_clip = [clip is not None]
         if not enabled:
-            return {"ui": {"groups": []}, "result": ("Analysis disabled. Toggle 'enabled' to run.", self._empty_image())}
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": ("Analysis disabled. Toggle 'enabled' to run.", self._empty_image())}
         if not lora_stack or len(lora_stack) == 0:
-            return {"ui": {"groups": []}, "result": ("No LoRAs in stack.", self._empty_image())}
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": ("No LoRAs in stack.", self._empty_image())}
 
         normalized_stack = self._normalize_stack(lora_stack)
         active_loras = [item for item in normalized_stack if item["strength"] != 0]
         if len(active_loras) == 0:
-            return {"ui": {"groups": []}, "result": ("No active LoRAs in stack (all zero strength).", self._empty_image())}
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": ("No active LoRAs in stack (all zero strength).", self._empty_image())}
 
         n_loras = len(active_loras)
         detected_arch = getattr(self, "_detected_arch", None) or "unknown"
@@ -7838,7 +7850,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                 "Nothing to compare — add more LoRAs to analyze compatibility.\n"
                 "\n" + "=" * 55
             )
-            return {"ui": {"groups": []}, "result": (report, self._empty_image())}
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": (report, self._empty_image())}
 
         logging.info(f"[Compatibility Analyzer] Analyzing {n_loras} LoRAs...")
         t_start = time.time()
@@ -7851,7 +7863,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
         all_lora_prefixes = self._collect_lora_prefixes(active_loras)
         target_groups = self._build_target_groups(all_lora_prefixes, model_keys, clip_keys)
         if not target_groups:
-            return {"ui": {"groups": []}, "result": (
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": (
                 "No compatible LoRA target groups found. LoRAs may be incompatible with this model architecture.",
                 self._empty_image(),
             )}
@@ -7865,7 +7877,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
         )
         prefix_count = analysis["prefix_count"]
         if prefix_count == 0:
-            return {"ui": {"groups": []}, "result": (
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": (
                 "No compatible LoRA target groups found. LoRAs may be incompatible with this model architecture.",
                 self._empty_image(),
             )}
@@ -8074,19 +8086,27 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
         heatmap = self._generate_heatmap(raw_matrix, display_names, groups)
 
         groups_for_ui = []
-        for info in group_info:
-            if info["type"] != "merge":
-                continue
-            groups_for_ui.append({
-                "loras": [
-                    {"name": active_loras[idx]["name"], "strength": round(info["strengths"][idx], 4)}
-                    for idx in info["indices"]
-                ],
-                "suggested_merge": info.get("suggested_merge", "weighted_average"),
-                "confidence": info.get("confidence", "Low"),
-            })
+        if create_nodes:
+            for info in group_info:
+                if info["type"] == "merge":
+                    groups_for_ui.append({
+                        "node_type": "stack",
+                        "loras": [
+                            {"name": active_loras[idx]["name"], "strength": active_loras[idx]["strength"]}
+                            for idx in info["indices"]
+                        ],
+                        "suggested_merge": info.get("suggested_merge", "weighted_average"),
+                        "confidence": info.get("confidence", "Low"),
+                    })
+                elif info["type"] == "solo":
+                    idx = info["indices"][0]
+                    groups_for_ui.append({
+                        "node_type": "loader",
+                        "lora_name": active_loras[idx]["name"],
+                        "strength": active_loras[idx]["strength"],
+                    })
 
-        return {"ui": {"groups": groups_for_ui}, "result": (report, heatmap)}
+        return {"ui": {"groups": groups_for_ui, "has_clip": has_clip}, "result": (report, heatmap)}
 
     @staticmethod
     def _empty_image():
