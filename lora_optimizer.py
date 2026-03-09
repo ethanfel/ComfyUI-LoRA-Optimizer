@@ -8113,11 +8113,14 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
     @staticmethod
     def _compute_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras):
         conflict_by_pair = {(pc["i"], pc["j"]): pc["ratio"] for pc in pairwise_conflicts}
+        overlap_by_pair = {(pc["i"], pc["j"]): pc["overlap"] for pc in pairwise_conflicts}
         matrix = [[0.0] * n_loras for _ in range(n_loras)]
         for (i, j), cos_sim in pairwise_similarities.items():
             conflict_ratio = conflict_by_pair.get((i, j), 0.0)
+            overlap = overlap_by_pair.get((i, j), 0)
             compat = cos_sim * (1.0 - conflict_ratio)
-            if cos_sim > -0.1:
+            # Only boost non-opposing pairs that actually share weights
+            if cos_sim > -0.1 and overlap > 0:
                 compat += 0.1
             matrix[i][j] = compat
             matrix[j][i] = compat
