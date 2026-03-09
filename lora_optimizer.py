@@ -7814,7 +7814,6 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
     RETURN_NAMES = ("report", "compatibility_map")
     FUNCTION = "analyze"
     CATEGORY = "LoRA Optimizer"
-    OUTPUT_NODE = True
     DESCRIPTION = "Analyzes LoRA compatibility and suggests merge groups. No merge is performed."
 
     @classmethod
@@ -7827,16 +7826,16 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
         has_clip = [clip is not None]
         if not enabled:
             msg = "Analysis disabled. Toggle 'enabled' to run."
-            return {"ui": {"groups": [], "has_clip": has_clip, "text": [msg]}, "result": (msg, self._empty_image())}
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": (msg, self._empty_image())}
         if not lora_stack or len(lora_stack) == 0:
             msg = "No LoRAs in stack."
-            return {"ui": {"groups": [], "has_clip": has_clip, "text": [msg]}, "result": (msg, self._empty_image())}
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": (msg, self._empty_image())}
 
         normalized_stack = self._normalize_stack(lora_stack)
         active_loras = [item for item in normalized_stack if item["strength"] != 0]
         if len(active_loras) == 0:
             msg = "No active LoRAs in stack (all zero strength)."
-            return {"ui": {"groups": [], "has_clip": has_clip, "text": [msg]}, "result": (msg, self._empty_image())}
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": (msg, self._empty_image())}
 
         n_loras = len(active_loras)
         detected_arch = getattr(self, "_detected_arch", None) or "unknown"
@@ -7853,7 +7852,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                 "Nothing to compare — add more LoRAs to analyze compatibility.\n"
                 "\n" + "=" * 55
             )
-            return {"ui": {"groups": [], "has_clip": has_clip, "text": [report]}, "result": (report, self._empty_image())}
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": (report, self._empty_image())}
 
         logging.info(f"[Compatibility Analyzer] Analyzing {n_loras} LoRAs...")
         t_start = time.time()
@@ -7867,7 +7866,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
         target_groups = self._build_target_groups(all_lora_prefixes, model_keys, clip_keys)
         if not target_groups:
             msg = "No compatible LoRA target groups found. LoRAs may be incompatible with this model architecture."
-            return {"ui": {"groups": [], "has_clip": has_clip, "text": [msg]}, "result": (msg, self._empty_image())}
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": (msg, self._empty_image())}
 
         compute_device = self._get_compute_device()
         analysis = self._run_group_analysis(
@@ -7879,7 +7878,7 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
         prefix_count = analysis["prefix_count"]
         if prefix_count == 0:
             msg = "No compatible LoRA target groups found. LoRAs may be incompatible with this model architecture."
-            return {"ui": {"groups": [], "has_clip": has_clip, "text": [msg]}, "result": (msg, self._empty_image())}
+            return {"ui": {"groups": [], "has_clip": has_clip}, "result": (msg, self._empty_image())}
 
         per_lora_stats = analysis["per_lora_stats"]
         pair_accum = analysis["pair_accum"]
@@ -8105,24 +8104,11 @@ class LoRACompatibilityAnalyzer(LoRAOptimizer):
                         "strength": active_loras[idx]["strength"],
                     })
 
-        return {"ui": {"groups": groups_for_ui, "has_clip": has_clip, "text": [report], "images": self._save_temp_image(heatmap)}, "result": (report, heatmap)}
+        return {"ui": {"groups": groups_for_ui, "has_clip": has_clip}, "result": (report, heatmap)}
 
     @staticmethod
     def _empty_image():
         return torch.zeros(1, 1, 1, 3, dtype=torch.float32)
-
-    @staticmethod
-    def _save_temp_image(image_tensor):
-        """Save an IMAGE tensor to ComfyUI's temp dir and return ui-compatible metadata."""
-        import numpy as np
-        from PIL import Image
-        arr = (image_tensor.squeeze(0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        img = Image.fromarray(arr)
-        temp_dir = folder_paths.get_temp_directory()
-        fname = f"compat_heatmap_{id(image_tensor):x}.png"
-        fpath = os.path.join(temp_dir, fname)
-        img.save(fpath)
-        return [{"filename": fname, "subfolder": "", "type": "temp"}]
 
     @staticmethod
     def _compute_compat_matrix(pairwise_similarities, pairwise_conflicts, n_loras):
