@@ -9038,9 +9038,9 @@ class LoRAMetadataReader:
             prompt = meta.get("prompt", "")
             desc = meta.get("description", "")
             if prompt:
-                all_prompts.append(prompt)
+                all_prompts.append((name, prompt))
             if desc:
-                all_descriptions.append(desc)
+                all_descriptions.append((name, desc))
 
             # Collect interesting metadata fields (exclude prompt/description — they have dedicated outputs)
             entry_lines = [f"[{name}]"]
@@ -9066,8 +9066,14 @@ class LoRAMetadataReader:
                     entry_lines.append(f"  {key}: {val[:200]}")
             info_lines.append("\n".join(entry_lines))
 
-        combined_prompt = "\n\n".join(all_prompts)
-        combined_desc = "\n\n".join(all_descriptions)
+        if len(all_prompts) == 1:
+            combined_prompt = all_prompts[0][1]
+        else:
+            combined_prompt = "\n\n".join(f"[{n}]: {p}" for n, p in all_prompts)
+        if len(all_descriptions) == 1:
+            combined_desc = all_descriptions[0][1]
+        else:
+            combined_desc = "\n\n".join(f"[{n}]: {d}" for n, d in all_descriptions)
         metadata_info = "\n\n".join(info_lines)
 
         return (lora_stack, combined_prompt, combined_desc, metadata_info)
