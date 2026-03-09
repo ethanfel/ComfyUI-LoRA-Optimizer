@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 2060" width="720" height="2060">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 2280" width="720" height="2280">
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" style="stop-color:#0f172a"/>
@@ -19,14 +19,14 @@
     </filter>
   </defs>
 
-  <rect width="720" height="2060" fill="url(#bg)" rx="16"/>
+  <rect width="720" height="2280" fill="url(#bg)" rx="16"/>
 
   <!-- Title -->
   <text x="360" y="44" font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="-0.5">LoRA Optimizer</text>
   <text x="360" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle" letter-spacing="2">DEVELOPMENT TIMELINE</text>
 
   <!-- Central timeline line -->
-  <line x1="360" y1="84" x2="360" y2="1990" stroke="url(#line-grad)" stroke-width="3" opacity="0.5"/>
+  <line x1="360" y1="84" x2="360" y2="2210" stroke="url(#line-grad)" stroke-width="3" opacity="0.5"/>
 
   <!-- === 1: Initial Release === LEFT -->
   <circle cx="360" cy="112" r="8" fill="#e94560" filter="url(#glow)"/>
@@ -262,24 +262,52 @@
   <text x="64" y="1838" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#e94560">AutoTuner ↔ Optimizer Bridge</text>
   <text x="64" y="1854" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Dual-switch passthrough, find → tweak</text>
 
+  <!-- === 26: Settings Nodes === RIGHT -->
+  <circle cx="360" cy="1912" r="8" fill="#38bdf8" filter="url(#glow)"/>
+  <circle cx="360" cy="1912" r="3" fill="#fff"/>
+  <rect x="388" y="1892" width="282" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="1912" x2="388" y2="1912" stroke="#38bdf8" stroke-width="2"/>
+  <text x="402" y="1910" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#38bdf8">Settings Nodes</text>
+  <text x="402" y="1926" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Modular config: Merge, Optimizer, AutoTuner</text>
+  <rect x="596" y="1896" width="64" height="16" rx="8" fill="#38bdf8" opacity="0.15"/>
+  <text x="628" y="1908" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#38bdf8" text-anchor="middle" font-weight="600">NODE</text>
+
+  <!-- === 27: Compatibility Analyzer Node Creation === LEFT -->
+  <circle cx="360" cy="1984" r="8" fill="#22c55e" filter="url(#glow)"/>
+  <circle cx="360" cy="1984" r="3" fill="#fff"/>
+  <rect x="50" y="1964" width="282" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="332" y1="1984" x2="352" y2="1984" stroke="#22c55e" stroke-width="2"/>
+  <text x="64" y="1982" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#22c55e">Analyzer Node Creation</text>
+  <text x="64" y="1998" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Auto-create LoraLoader &amp; Stack nodes</text>
+  <rect x="248" y="1968" width="74" height="16" rx="8" fill="#22c55e" opacity="0.15"/>
+  <text x="285" y="1980" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#22c55e" text-anchor="middle" font-weight="600">OUTPUT</text>
+
+  <!-- === 28: Legacy Label === RIGHT -->
+  <circle cx="360" cy="2056" r="8" fill="#64ffda" filter="url(#glow)"/>
+  <circle cx="360" cy="2056" r="3" fill="#fff"/>
+  <rect x="388" y="2036" width="282" height="40" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1" filter="url(#shadow)"/>
+  <line x1="368" y1="2056" x2="388" y2="2056" stroke="#64ffda" stroke-width="2"/>
+  <text x="402" y="2054" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#64ffda">Advanced → Legacy</text>
+  <text x="402" y="2070" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Simple + Settings nodes supersede monolith</text>
+
   <!-- End dot -->
-  <circle cx="360" cy="1912" r="5" fill="#a78bfa" opacity="0.6"/>
-  <circle cx="360" cy="1912" r="2" fill="#fff" opacity="0.8"/>
+  <circle cx="360" cy="2132" r="5" fill="#a78bfa" opacity="0.6"/>
+  <circle cx="360" cy="2132" r="2" fill="#fff" opacity="0.8"/>
 
   <!-- Legend -->
-  <rect x="80" y="2020" width="560" height="24" rx="12" fill="#0f172a" stroke="#334155" stroke-width="1"/>
-  <circle cx="115" cy="2032" r="5" fill="#e94560"/>
-  <text x="125" y="2036" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Feature</text>
-  <circle cx="182" cy="2032" r="5" fill="#c026d3"/>
-  <text x="192" y="2036" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Perf</text>
-  <circle cx="228" cy="2032" r="5" fill="#a78bfa"/>
-  <text x="238" y="2036" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Strategy</text>
-  <circle cx="305" cy="2032" r="5" fill="#22c55e"/>
-  <text x="315" y="2036" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Optimize</text>
-  <circle cx="385" cy="2032" r="5" fill="#64ffda"/>
-  <text x="395" y="2036" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Compat</text>
-  <circle cx="455" cy="2032" r="5" fill="#f59e0b"/>
-  <text x="465" y="2036" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Preprocess</text>
-  <circle cx="545" cy="2032" r="5" fill="#38bdf8"/>
-  <text x="555" y="2036" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Node</text>
+  <rect x="80" y="2240" width="560" height="24" rx="12" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <circle cx="115" cy="2252" r="5" fill="#e94560"/>
+  <text x="125" y="2256" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Feature</text>
+  <circle cx="182" cy="2252" r="5" fill="#c026d3"/>
+  <text x="192" y="2256" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Perf</text>
+  <circle cx="228" cy="2252" r="5" fill="#a78bfa"/>
+  <text x="238" y="2256" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Strategy</text>
+  <circle cx="305" cy="2252" r="5" fill="#22c55e"/>
+  <text x="315" y="2256" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Optimize</text>
+  <circle cx="385" cy="2252" r="5" fill="#64ffda"/>
+  <text x="395" y="2256" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Compat</text>
+  <circle cx="455" cy="2252" r="5" fill="#f59e0b"/>
+  <text x="465" y="2256" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Preprocess</text>
+  <circle cx="545" cy="2252" r="5" fill="#38bdf8"/>
+  <text x="555" y="2256" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8">Node</text>
 </svg>

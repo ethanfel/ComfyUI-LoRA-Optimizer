@@ -8,7 +8,7 @@ A ComfyUI node suite that **automatically analyzes your LoRA stack** and selects
 
 1. Add a **LoRA Stack** (or **LoRA Stack (Dynamic)**) node
 2. Select your LoRAs and set strengths
-3. Connect to **LoRA Optimizer** (or the Advanced variant)
+3. Connect to **LoRA Optimizer** (optionally with Settings nodes for fine-grained control)
 4. Connect `MODEL` and optionally `CLIP` from your checkpoint loader
 5. Use the optimizer's `MODEL`/`CLIP` outputs for sampling
 
@@ -51,9 +51,10 @@ The optimizer handles everything automatically — conflict analysis, strategy s
 | **Key normalization** | Mix LoRAs from any trainer (Kohya, AI-Toolkit, LyCORIS, diffusers, etc.) |
 | **SVD compression** | Re-compress merged patches to low-rank for ~32x RAM savings |
 | **AutoTuner** | Sweep 2,000+ parameter combinations and rank them by internal metrics or an external evaluator |
-| **Compatibility analyzer** | Standalone planning node that groups merge-safe LoRAs and surfaces conflicts before you merge |
+| **Settings nodes** | Modular configuration: Merge Settings (shared), Optimizer Settings, AutoTuner Settings — optional, sensible defaults without them |
+| **Compatibility analyzer** | Planning node that groups merge-safe LoRAs, surfaces conflicts, and optionally auto-creates optimized node setups |
 | **Low memory** | Two-pass streaming architecture — peak memory scales with the largest active target group, not the full stack |
-| **6 architectures** | FLUX, SDXL, Z-Image, Wan, LTX Video, Qwen-Image |
+| **8 architectures** | SD 1.5, SDXL, FLUX, Z-Image, Wan, LTX Video, ACE-Step, Qwen-Image |
 
 ---
 

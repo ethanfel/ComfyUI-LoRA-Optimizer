@@ -45,7 +45,7 @@
   <text x="450" y="210" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#a78bfa" text-anchor="middle">Recommended for distilled/turbo models with 2+ LoRAs showing overexposure or artifacts</text>
 
   <text x="450" y="236" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#38bdf8" text-anchor="middle">
-    <tspan font-weight="600">merge_quality enhanced/maximum:</tspan> steps 2-3 use column-wise voting — entire output neurons vote as a unit instead of per-element
+    <tspan font-weight="600">merge_refinement refine/full:</tspan> steps 2-3 use column-wise voting — entire output neurons vote as a unit instead of per-element
   </text>
-  <text x="450" y="252" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64748b" text-anchor="middle">+ TALL-masks protect selfish weights from merge averaging  |  + KnOTS SVD alignment (maximum only)</text>
+  <text x="450" y="252" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64748b" text-anchor="middle">+ TALL-masks protect selfish weights from merge averaging  |  + KnOTS SVD alignment (full only)</text>
 </svg>

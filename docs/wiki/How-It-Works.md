@@ -579,7 +579,7 @@ Important interactions:
 
 ### SVD Patch Compression
 
-> _Controlled by: `patch_compression` (non_ties / aggressive / disabled), `svd_device` (gpu / cpu)_
+> _Controlled by: `patch_compression` (smart / aggressive / disabled), `svd_device` (gpu / cpu)_
 
 After merging, each prefix produces a full-rank diff tensor. For a 4096×4096 weight, that's ~64MB per key (vs ~0.5MB for a rank-32 LoRA patch). SVD compression re-factors these back to low-rank:
 
@@ -591,7 +591,7 @@ The compression rank is automatically set to the **sum of all input LoRA ranks**
 
 | Mode | Compresses | Quality |
 |------|-----------|---------|
-| `non_ties` (default) | weighted_sum and weighted_average prefixes only | **Lossless** — linear operations are exactly representable |
+| `smart` (default) | weighted_sum and weighted_average prefixes only | **Lossless** — linear operations are exactly representable |
 | `aggressive` | Everything including TIES | **Lossy on TIES** — nonlinear ops (trim, sign election) produce full-rank results |
 | `disabled` | Nothing | No loss, but ~32× more RAM |
 
@@ -708,20 +708,30 @@ All nodes registered by the LoRA Optimizer:
 |------|-------------|---------|
 | `LoRAStack` | LoRA Stack | Build LoRA stacks by chaining |
 | `LoRAStackDynamic` | LoRA Stack (Dynamic) | Single node with 1–10 adjustable slots, simple/advanced modes |
-| `LoRAOptimizerSimple` | LoRA Optimizer | Simplified optimizer with sensible defaults, auto-strength enabled |
-| `LoRAOptimizer` | LoRA Optimizer (Advanced) | Full-featured optimizer with all parameters exposed |
+| `LoRAMergeSettings` | LoRA Merge Settings | Shared config: normalization, architecture preset, smoothing, VRAM budget |
+| `LoRAOptimizerSettings` | LoRA Optimizer Settings | Optimizer-specific settings: auto-strength, sparsification, compression, etc. |
+| `LoRAAutoTunerSettings` | LoRA AutoTuner Settings | Tuner-specific settings: top_n, scoring, diff cache, etc. |
+| `LoRAOptimizerSimple` | LoRA Optimizer | Simplified optimizer with sensible defaults, accepts optional `settings` and `tuner_data` |
+| `LoRAOptimizer` | LoRA Optimizer (Legacy) | All parameters on one node — for bridge workflow with `settings_source` |
 | `LoRAAutoTuner` | LoRA AutoTuner | Automated parameter sweep to rank merge configs |
 | `LoRAMergeSelector` | Merge Selector | Select alternative configs from AutoTuner results |
 | `LoRAConflictEditor` | LoRA Conflict Editor | Interactive conflict analysis with per-LoRA overrides |
 | `SaveMergedLoRA` | Save Merged LoRA | Export merged patches as standalone `.safetensors` |
 | `MergedLoRAToHook` | Merged LoRA to Hook | Wrap merged patches as conditioning hooks |
+| `LoRACompatibilityAnalyzer` | LoRA Compatibility Analyzer | Pre-merge planning: overlap analysis, grouping, optional node creation |
 | `WanVideoLoRAOptimizer` | WanVideo LoRA Optimizer (WIP) | Optimizer variant for WanVideo models |
 | `MergedLoRAToWanVideo` | Merged LoRA → WanVideo (WIP) | Bridge merged LORA_DATA to WanVideo wrapper models |
 
 ### Node Variants
 
-**LoRA Optimizer** vs **LoRA Optimizer (Advanced):**
-The Simple variant exposes only `model`, `lora_stack`, `output_strength`, `clip` (optional), and `clip_strength_multiplier`. It uses fixed defaults: `auto_strength=enabled`, `optimization_mode=per_prefix`, `merge_refinement=none`, `patch_compression=non_ties`, `vram_budget=0.0`. The Advanced variant exposes all parameters.
+**LoRA Optimizer** (recommended):
+Exposes `model`, `lora_stack`, `output_strength`, `clip` (optional), and `clip_strength_multiplier`. Accepts optional `settings` (from a Settings node) and `tuner_data` (from AutoTuner) inputs. When no settings node is connected, uses built-in defaults: `auto_strength=enabled`, `optimization_mode=per_prefix`, `merge_refinement=none`, `patch_compression=smart`, `vram_budget=0.0`.
+
+**LoRA Optimizer (Legacy):**
+All parameters on one node. Has `settings_source` for the AutoTuner ↔ Optimizer bridge workflow. Superseded by LoRA Optimizer + Settings nodes for new workflows.
+
+**Settings nodes** (LoRA Merge Settings, LoRA Optimizer Settings, LoRA AutoTuner Settings):
+Separate shared and node-specific configuration from the main optimizer. Merge Settings feeds into Optimizer Settings or AutoTuner Settings, which feed into the optimizer's `settings` input.
 
 **WanVideo LoRA Optimizer:**
 Accepts `WANVIDEOMODEL` instead of `MODEL`, skips CLIP. Defaults differ from the standard optimizer: `normalize_keys=enabled` (WanVideo LoRAs come from many trainers), `cache_patches=disabled` (video models are large), `architecture_preset=dit`.
@@ -779,7 +789,6 @@ Phase 2 is designed to avoid RAM exhaustion:
 | `scoring_device` | gpu | Where to run SVD scoring (`gpu` is 10-50x faster) |
 | `scoring_speed` | turbo | Subsample prefix scoring for faster sweeps (`full`, `fast`, `turbo`, `turbo+`) |
 | `auto_strength_floor` | -1.0 | Minimum auto-strength floor for orthogonal LoRAs (`-1` = architecture default) |
-| `output_mode` | merge | `merge` = output top-ranked merge, `tuning_only` = pass base model through |
 | `decision_smoothing` | 0.25 | Smooth per-prefix decision metrics toward block averages |
 | `evaluator` | — | External evaluator hook for prompt/reference scoring |
 | `diff_cache_mode` | auto | Reuse raw LoRA diffs across candidates (`disabled`, `auto`, `ram`, `disk`) |

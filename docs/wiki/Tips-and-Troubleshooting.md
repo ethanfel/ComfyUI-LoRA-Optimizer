@@ -86,7 +86,7 @@ The scale factor tells you how much the optimizer reduced strengths. A low facto
 | Setting | Recommended Value | Why |
 |---------|------------------|-----|
 | `cache_patches` | enabled | Instant re-execution with same settings |
-| `patch_compression` | non_ties | Exact low-rank path on linear ops; only nonlinear paths use SVD compression |
+| `patch_compression` | smart | Exact low-rank path on linear ops; only nonlinear paths use SVD compression |
 | `vram_budget` | 0.3–0.5 | Keep some patches on GPU for faster sampling |
 
 ### Peak VRAM Usage
@@ -163,6 +163,6 @@ The Merge Selector validates that the LoRA stack hasn't changed since the AutoTu
 
 2. **Fully baked checkpoints are invisible.** If a checkpoint already has LoRA weights baked in, the optimizer can't detect or account for them.
 
-3. **TIES produces full-rank results.** The nonlinear operations (trim + sign election) mean TIES output can't be perfectly captured by low-rank SVD compression. Use `patch_compression=non_ties` to only compress linear operations losslessly.
+3. **TIES produces full-rank results.** The nonlinear operations (trim + sign election) mean TIES output can't be perfectly captured by low-rank SVD compression. Use `patch_compression=smart` to only compress linear operations losslessly.
 
 4. **Conflict-aware sparsification needs overlap.** If LoRAs don't share any keys, there are no conflicts to detect and conflict-aware variants behave the same as disabled.

@@ -153,7 +153,7 @@
   <text x="580" y="560" font-family="Segoe UI, Arial, sans-serif" font-size="7" fill="#e94560" text-anchor="middle">trimmed</text>
 
   <text x="620" y="545" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#94a3b8">TIES trims low-magnitude weights</text>
-  <text x="480" y="567" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64748b">Tip: apply via Load LoRA upstream, or use weighted_sum_only</text>
+  <text x="480" y="567" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64748b">Tip: apply via Load LoRA upstream, or use additive mode</text>
 
   <!-- Card C: Bad LoRA negative -->
   <rect x="460" y="585" width="410" height="62" rx="10" fill="#1e293b" stroke="#f59e0b" stroke-width="1"/>

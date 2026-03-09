@@ -39,7 +39,7 @@
   <rect x="460" y="78" width="200" height="75" rx="10" fill="#1e293b" stroke="#64ffda" stroke-width="1.5"/>
   <rect x="460" y="78" width="200" height="24" rx="10" fill="#64ffda" opacity="0.1"/>
   <rect x="460" y="92" width="200" height="10" fill="#1e293b"/>
-  <text x="560" y="95" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#64ffda" text-anchor="middle" font-weight="700">LoRA Optimizer</text>
+  <text x="560" y="95" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#64ffda" text-anchor="middle" font-weight="700">LoRA Optimizer (Legacy)</text>
   <text x="560" y="118" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#94a3b8" text-anchor="middle">settings_source:</text>
   <text x="560" y="134" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#64ffda" text-anchor="middle" font-weight="600">from_autotuner ↔ manual</text>
   <text x="560" y="148" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#64748b" text-anchor="middle">(auto-synced)</text>
