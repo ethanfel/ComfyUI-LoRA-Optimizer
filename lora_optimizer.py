@@ -2930,6 +2930,7 @@ def _generate_param_grid():
     dampenings = [0.0, 0.3, 0.6]
     qualities = ["none", "refine", "full"]
     auto_strengths = ["enabled", "disabled"]
+    strategy_sets = ["full", "no_slerp", "basic"]
 
     for spars in sparsifications:
         density_vals = densities if spars != "disabled" else [0.7]
@@ -2939,17 +2940,20 @@ def _generate_param_grid():
                 for quality in qualities:
                     for auto_str in auto_strengths:
                         # per_prefix: optimizer auto-selects mode per prefix,
-                        # merge_mode is irrelevant — emit one entry only
-                        grid.append({
-                            "merge_mode": "per_prefix_auto",
-                            "sparsification": spars,
-                            "sparsification_density": density,
-                            "dare_dampening": dampening,
-                            "merge_refinement": quality,
-                            "auto_strength": auto_str,
-                            "optimization_mode": "per_prefix",
-                        })
+                        # merge_mode is irrelevant — emit one per strategy_set
+                        for strat_set in strategy_sets:
+                            grid.append({
+                                "merge_mode": "per_prefix_auto",
+                                "sparsification": spars,
+                                "sparsification_density": density,
+                                "dare_dampening": dampening,
+                                "merge_refinement": quality,
+                                "auto_strength": auto_str,
+                                "optimization_mode": "per_prefix",
+                                "strategy_set": strat_set,
+                            })
                         # global: merge_mode matters — emit one per mode
+                        # strategy_set is irrelevant for global (mode is explicit)
                         for mode in merge_modes:
                             grid.append({
                                 "merge_mode": mode,
@@ -2959,6 +2963,7 @@ def _generate_param_grid():
                                 "merge_refinement": quality,
                                 "auto_strength": auto_str,
                                 "optimization_mode": "global",
+                                "strategy_set": "full",
                             })
     return grid
 
@@ -3099,12 +3104,35 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
         else:
             score += 0.03
 
-    # --- Optimization mode fit (0-0.15) ---
+    # --- Optimization mode fit (0-0.10) ---
     # Per-prefix benefit already scored in mode fit section above.
     if opt_mode == "per_prefix":
         score += 0.10
     else:
         score += 0.07
+
+    # --- Strategy set fit (0-0.05, per_prefix only) ---
+    strat_set = config.get("strategy_set", "full")
+    if opt_mode == "per_prefix":
+        if is_orthogonal:
+            # Orthogonal LoRAs: SLERP upgrade doesn't help, basic is safest
+            if strat_set == "basic":
+                score += 0.05
+            elif strat_set == "no_slerp":
+                score += 0.04
+            else:
+                score += 0.02
+        elif effective_conflict < ties_thresh:
+            # Low conflict, non-orthogonal: SLERP upgrade can help
+            if strat_set == "full":
+                score += 0.05
+            elif strat_set == "no_slerp":
+                score += 0.03
+            else:
+                score += 0.02
+        else:
+            # High conflict: strategy_set has less impact (TIES dominates)
+            score += 0.03
 
     return score
 
@@ -6188,10 +6216,11 @@ class LoRAAutoTuner(LoRAOptimizer):
         logging.info(f"[LoRA AutoTuner] Scored {len(grid)} combos in {time.time() - t_start:.1f}s")
         for i in range(min(5, len(scored))):
             c = scored[i][1]
+            strat_info = f" [{c.get('strategy_set', 'full')}]" if c['optimization_mode'] == 'per_prefix' else ""
             logging.info(f"[LoRA AutoTuner]   #{i+1} heuristic={scored[i][0]:.3f}: "
                          f"{c['merge_mode']}/{c['merge_refinement']}"
                          f"{' +' + c['sparsification'] if c['sparsification'] != 'disabled' else ''}"
-                         f" auto_str={c['auto_strength']} {c['optimization_mode']}")
+                         f" auto_str={c['auto_strength']} {c['optimization_mode']}{strat_info}")
 
         # Pre-compute per-group density from magnitude samples before freeing them.
         # Phase 2's per-group auto_select_params needs density but magnitude_samples
@@ -6291,7 +6320,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 patch_compression="disabled",
                 svd_device="gpu",
                 normalize_keys=normalize_keys,
-                strategy_set="full",
+                strategy_set=config.get("strategy_set", "full"),
                 architecture_preset=architecture_preset,
                 decision_smoothing=decision_smoothing,
                 smooth_slerp_gate=smooth_slerp_gate,
@@ -6398,7 +6427,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 patch_compression="disabled",
                 svd_device="gpu",
                 normalize_keys=normalize_keys,
-                strategy_set="full",
+                strategy_set=best_config.get("strategy_set", "full"),
                 architecture_preset=architecture_preset,
                 decision_smoothing=decision_smoothing,
                 smooth_slerp_gate=smooth_slerp_gate,
@@ -6636,8 +6665,10 @@ class LoRAAutoTuner(LoRAOptimizer):
                 lines.append(f"    Sparsification: {spars_info}")
             else:
                 lines.append(f"    Sparsification: disabled")
+            strat_set = c.get('strategy_set', 'full')
+            strat_label = f" | Strategy: {strat_set}" if c['optimization_mode'] == 'per_prefix' and strat_set != 'full' else ""
             lines.append(f"    Auto-strength: {c['auto_strength']} "
-                         f"| Optimization: {c['optimization_mode']}")
+                         f"| Optimization: {c['optimization_mode']}{strat_label}")
             if m.get("effective_rank_mean", 0) > 0:
                 lines.append(f"    Effective rank: {m['effective_rank_mean']:.1f} "
                              f"| Sparsity: {m.get('sparsity_mean', 0):.1%}")
