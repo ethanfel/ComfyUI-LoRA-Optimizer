@@ -2609,6 +2609,69 @@ class _LoRAMergeBase:
 
     @staticmethod
     @torch.no_grad()
+    def _spectral_calibrate_shared(merged_shared, original_diffs_with_weights,
+                                    max_rank=16, compute_device=None):
+        """
+        Singular Value Calibration (SVC) for the merged shared component.
+
+        After merging shared parts, spectral directions that were common across
+        multiple LoRAs get over-accumulated (singular value inflation). This
+        method detects inflated directions by projecting original diffs onto
+        the merged result's singular vectors, then rescales to correct.
+
+        Based on: "When Shared Knowledge Hurts: Spectral Over-Accumulation
+        in Model Merging" (2025).
+        """
+        if merged_shared.dim() < 2 or min(merged_shared.shape) < 2:
+            return merged_shared
+        if len(original_diffs_with_weights) < 2:
+            return merged_shared
+
+        original_shape = merged_shared.shape
+        dev = compute_device if compute_device is not None else merged_shared.device
+        mat = merged_shared.reshape(original_shape[0], -1).to(device=dev, dtype=torch.float32)
+
+        rank = min(max_rank, min(mat.shape))
+        try:
+            q_oversample = min(rank + max(10, rank // 5), min(mat.shape))
+            U, S, V = torch.svd_lowrank(mat, q=q_oversample, niter=4)
+            U, S, V = U[:, :rank], S[:rank], V[:, :rank]
+        except (RuntimeError, torch.cuda.OutOfMemoryError):
+            return merged_shared
+
+        n = len(original_diffs_with_weights)
+
+        gamma = torch.ones(S.shape[0], device=dev)
+        for r in range(S.shape[0]):
+            if S[r] < 1e-10:
+                continue
+            u_r = U[:, r]  # [out]
+            projections = []
+            for d, w in original_diffs_with_weights:
+                d_mat = d.reshape(original_shape[0], -1).to(device=dev, dtype=torch.float32)
+                a_r = u_r @ d_mat  # [in] — projection onto direction r
+                proj_norm_sq = (a_r * a_r).sum()
+                projections.append(proj_norm_sq)
+                del d_mat, a_r
+            merged_proj = S[r] * S[r]
+            sum_proj = sum(projections)
+            if sum_proj > 1e-10:
+                gamma[r] = min(1.0, (merged_proj / sum_proj).item() * n)
+            del projections
+
+        if (gamma < 0.99).any():
+            S_calibrated = S * gamma
+            calibrated = (U * S_calibrated.unsqueeze(0)) @ V.T
+            residual = mat - (U * S.unsqueeze(0)) @ V.T
+            result = (calibrated + residual).reshape(original_shape)
+            del U, S, V, S_calibrated, calibrated, residual, mat, gamma
+            return result.to(dtype=merged_shared.dtype, device=merged_shared.device)
+
+        del U, S, V, mat, gamma
+        return merged_shared
+
+    @staticmethod
+    @torch.no_grad()
     def _compress_to_lowrank(diff, rank, svd_device=None, output_dtype=None):
         """
         Re-compress a full-rank diff tensor to low-rank via truncated SVD.
@@ -2774,12 +2837,14 @@ class _LoRAMergeBase:
         # (agreement=1 everywhere), zeroing out all consensus diffs.
         selfish_additions = None
         spectral_additions = None
+        _spectral_shared_ref = None
         if merge_refinement != "none" and len(diffs_with_weights) >= 2 and mode != "ties":
             if merge_refinement == "spectral":
                 first = diffs_with_weights[0][0]
                 if first.dim() >= 2 and min(first.shape) >= 2:
                     diffs_with_weights, spectral_additions = self._spectral_ownership_split(
                         diffs_with_weights, compute_device=dev)
+                    _spectral_shared_ref = list(diffs_with_weights) if spectral_additions is not None else None
             else:
                 diffs_with_weights, selfish_additions = self._tall_masks(diffs_with_weights)
                 first = diffs_with_weights[0][0]
@@ -2803,7 +2868,11 @@ class _LoRAMergeBase:
             if selfish_additions is not None:
                 result = result + selfish_additions.to(device=result.device, dtype=torch.float32)
             if spectral_additions is not None:
-                result = result + spectral_additions.to(device=result.device, dtype=torch.float32)
+                if _spectral_shared_ref is not None:
+                    result = self._spectral_calibrate_shared(
+                        result, _spectral_shared_ref, compute_device=dev)
+                result = result.to(dtype=torch.float32) + spectral_additions.to(
+                    device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -2816,7 +2885,11 @@ class _LoRAMergeBase:
             if selfish_additions is not None:
                 result = result + selfish_additions.to(device=result.device, dtype=torch.float32)
             if spectral_additions is not None:
-                result = result + spectral_additions.to(device=result.device, dtype=torch.float32)
+                if _spectral_shared_ref is not None:
+                    result = self._spectral_calibrate_shared(
+                        result, _spectral_shared_ref, compute_device=dev)
+                result = result.to(dtype=torch.float32) + spectral_additions.to(
+                    device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -2837,7 +2910,11 @@ class _LoRAMergeBase:
             if selfish_additions is not None:
                 result = result + selfish_additions.to(device=result.device, dtype=torch.float32)
             if spectral_additions is not None:
-                result = result + spectral_additions.to(device=result.device, dtype=torch.float32)
+                if _spectral_shared_ref is not None:
+                    result = self._spectral_calibrate_shared(
+                        result, _spectral_shared_ref, compute_device=dev)
+                result = result.to(dtype=torch.float32) + spectral_additions.to(
+                    device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -2914,7 +2991,11 @@ class _LoRAMergeBase:
             if selfish_additions is not None:
                 result = result + selfish_additions.to(device=result.device, dtype=torch.float32)
             if spectral_additions is not None:
-                result = result + spectral_additions.to(device=result.device, dtype=torch.float32)
+                if _spectral_shared_ref is not None:
+                    result = self._spectral_calibrate_shared(
+                        result, _spectral_shared_ref, compute_device=dev)
+                result = result.to(dtype=torch.float32) + spectral_additions.to(
+                    device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -2991,7 +3072,11 @@ class _LoRAMergeBase:
             if selfish_additions is not None:
                 result = result + selfish_additions.to(device=result.device, dtype=torch.float32)
             if spectral_additions is not None:
-                result = result + spectral_additions.to(device=result.device, dtype=torch.float32)
+                if _spectral_shared_ref is not None:
+                    result = self._spectral_calibrate_shared(
+                        result, _spectral_shared_ref, compute_device=dev)
+                result = result.to(dtype=torch.float32) + spectral_additions.to(
+                    device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -3058,6 +3143,7 @@ class _LoRAMergeBase:
                     if first.dim() >= 2 and min(first.shape) >= 2:
                         trimmed_pairs, ties_spectral = self._spectral_ownership_split(
                             trimmed_pairs, compute_device=dev)
+                    _ties_spectral_shared_ref = list(trimmed_pairs) if ties_spectral is not None else None
                 else:
                     trimmed_pairs, ties_selfish = self._tall_masks(trimmed_pairs)
                     first = trimmed_pairs[0][0]
@@ -3087,6 +3173,9 @@ class _LoRAMergeBase:
             if ties_selfish is not None:
                 result = result.to(dtype=torch.float32) + ties_selfish.to(device=result.device, dtype=torch.float32)
             if ties_spectral is not None:
+                if _ties_spectral_shared_ref is not None:
+                    result = self._spectral_calibrate_shared(
+                        result, _ties_spectral_shared_ref, compute_device=dev)
                 result = result.to(dtype=torch.float32) + ties_spectral.to(device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result

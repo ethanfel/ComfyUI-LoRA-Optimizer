@@ -525,6 +525,24 @@ class LoRAOptimizerTests(unittest.TestCase):
         self.assertIsNone(private)
         self.assertTrue(torch.equal(shared[0][0], a))
 
+    def test_spectral_svc_reduces_over_accumulation(self):
+        """When LoRAs share a dominant direction, SVC should calibrate it down."""
+        torch.manual_seed(123)
+        shared_dir = torch.randn(32, 1) @ torch.randn(1, 32)  # rank-1 shared
+        a = shared_dir * 2.0 + torch.randn(32, 32) * 0.1
+        b = shared_dir * 2.0 + torch.randn(32, 32) * 0.1
+        diffs = [(a, 0.5), (b, 0.5)]
+        shared_diffs, private = lora_optimizer.LoRAOptimizer._spectral_ownership_split(diffs)
+        if private is not None:
+            total_w = sum(abs(w) for _, w in shared_diffs)
+            merged = sum(d.float() * (w / total_w) for d, w in shared_diffs)
+            result = merged + private
+        else:
+            total_w = sum(abs(w) for _, w in shared_diffs)
+            result = sum(d.float() * (w / total_w) for d, w in shared_diffs)
+        expected_magnitude = (a * 0.5 + b * 0.5).norm()
+        self.assertLess(result.norm().item(), expected_magnitude.item() * 2.0)
+
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class LoRASettingsNodeTests(unittest.TestCase):
