@@ -218,7 +218,8 @@ def _parse_merge_formula(formula_str, n_loras):
                 raise ValueError(f"Expected ')' at position {pos[0]}")
             pos[0] += 1  # skip ')'
             weight = _parse_weight()
-            node["weight"] = weight
+            if weight is not None:
+                node["weight"] = weight
             return node
 
         # Must be a number
@@ -1429,8 +1430,16 @@ class _LoRAMergeBase:
         """
         grouped = {}
         # Build reverse lookup: target_key → True for fast virtual-key detection
-        model_target_keys = set(model_keys.values()) if model_keys else set()
-        clip_target_keys = set(clip_keys.values()) if clip_keys else set()
+        model_target_keys = set()
+        for v in (model_keys.values() if model_keys else []):
+            model_target_keys.add(v)
+            if isinstance(v, tuple):
+                model_target_keys.add(v[0])
+        clip_target_keys = set()
+        for v in (clip_keys.values() if clip_keys else []):
+            clip_target_keys.add(v)
+            if isinstance(v, tuple):
+                clip_target_keys.add(v[0])
         for prefix in all_lora_prefixes:
             target_key, is_clip = self._resolve_target_key(prefix, model_keys, clip_keys)
             if target_key is None:
@@ -4188,8 +4197,27 @@ class LoRAOptimizer(_LoRAMergeBase):
         skip_count = 0
 
         for i, item in enumerate(active_loras):
-            lora_info = self._get_lora_key_info(item["lora"], lora_prefix)
-            if lora_info is not None:
+            # Virtual LoRAs from sub-merges store pre-computed diffs keyed by target key
+            if item.get("_precomputed_diffs"):
+                tkey = target_key
+                raw = item["lora"].get(tkey)
+                if raw is None and isinstance(tkey, tuple):
+                    raw = item["lora"].get(tkey[0])
+                if raw is None:
+                    continue
+                if isinstance(raw, torch.Tensor):
+                    diff = raw.float()
+                else:
+                    diff = self._expand_patch_to_diff(raw)
+                try:
+                    diff = diff.reshape(target_shape)
+                except RuntimeError:
+                    skip_count += 1
+                    continue
+                if use_gpu and diff.device.type == "cpu":
+                    diff = diff.to(device)
+                rank = 1  # unknown rank for virtual LoRAs
+            elif (lora_info := self._get_lora_key_info(item["lora"], lora_prefix)) is not None:
                 mat_up, mat_down, alpha, mid = lora_info
                 rank = mat_down.shape[0]
 
@@ -5487,7 +5515,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         # Formula-based hierarchical merge
         if merge_formula and len(active_loras) >= 2:
             try:
-                tree = _parse_merge_formula(merge_formula, len(active_loras))
+                tree = _parse_merge_formula(merge_formula, len(normalized_stack))
             except ValueError as e:
                 logging.warning(f"[LoRA Optimizer] Invalid merge formula: {e} — using flat merge")
                 tree = None
@@ -5516,7 +5544,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "vram_budget": vram_budget,
                 }
                 return self._execute_merge_tree(
-                    tree, active_loras, model, clip, output_strength, **merge_kwargs)
+                    tree, normalized_stack, model, clip, output_strength, **merge_kwargs)
 
         # Single LoRA: skip analysis, apply directly via ComfyUI's standard
         # additive LoRA application (faster than diff-based pipeline).
@@ -6380,6 +6408,8 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         if tree["type"] == "leaf":
             item = dict(normalized_stack[tree["index"]])
+            if "metadata" in item and isinstance(item["metadata"], dict):
+                item["metadata"] = dict(item["metadata"])
             if tree["weight"] is not None:
                 item["strength"] = tree["weight"]
             return ([item], sub_reports)
@@ -6389,6 +6419,8 @@ class LoRAOptimizer(_LoRAMergeBase):
         for child in tree["children"]:
             if child["type"] == "leaf":
                 item = dict(normalized_stack[child["index"]])
+                if "metadata" in item and isinstance(item["metadata"], dict):
+                    item["metadata"] = dict(item["metadata"])
                 if child["weight"] is not None:
                     item["strength"] = child["weight"]
                 resolved.append(item)
