@@ -1387,14 +1387,14 @@ class _LoRAMergeBase:
         for item in active_loras:
             if item.get("_precomputed_diffs"):
                 for key in item["lora"]:
-                    all_lora_prefixes.add(key[0] if isinstance(key, tuple) else key)
+                    all_lora_prefixes.add(key)
                 continue
             for key in item["lora"].keys():
                 for suffix in suffixes:
                     if key.endswith(suffix):
                         all_lora_prefixes.add(key[:-len(suffix)])
                         break
-        return sorted(all_lora_prefixes)
+        return sorted(all_lora_prefixes, key=lambda x: (str(x),))
 
     @staticmethod
     def _resolve_target_key(lora_prefix, model_keys, clip_keys):
@@ -1461,7 +1461,7 @@ class _LoRAMergeBase:
         ordered = {}
         prepared = []
         for entry in grouped.values():
-            aliases = sorted(set(entry["aliases"]))
+            aliases = sorted(a for a in set(entry["aliases"]) if isinstance(a, str))
             canonical = self._choose_canonical_prefix(aliases)
             prepared.append((entry["is_clip"], canonical, {
                 "target_key": entry["target_key"],
@@ -1590,8 +1590,9 @@ class _LoRAMergeBase:
                         if storage_dtype is None:
                             storage_dtype = diff.dtype
                         diff_accum = diff
-                aggregated[i] = diff_accum
-                ranks[i] = rank_sum
+                if diff_accum is not None:
+                    aggregated[i] = diff_accum
+                    ranks[i] = rank_sum
                 continue
 
             for alias in target_group["aliases"]:
@@ -5544,7 +5545,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "vram_budget": vram_budget,
                 }
                 return self._execute_merge_tree(
-                    tree, normalized_stack, model, clip, output_strength, **merge_kwargs)
+                    tree, normalized_stack, model, clip, output_strength,
+                    _orig_cache_patches=cache_patches, **merge_kwargs)
 
         # Single LoRA: skip analysis, apply directly via ComfyUI's standard
         # additive LoRA application (faster than diff-based pipeline).
@@ -6364,7 +6366,7 @@ class LoRAOptimizer(_LoRAMergeBase):
     #  Merge-formula tree executor
     # ------------------------------------------------------------------
 
-    def _execute_merge_tree(self, tree, normalized_stack, model, clip, output_strength, **kwargs):
+    def _execute_merge_tree(self, tree, normalized_stack, model, clip, output_strength, _orig_cache_patches="enabled", **kwargs):
         """
         Execute a merge formula tree leaf-to-root.
         Each sub-group is a full optimize_merge call.
@@ -6374,8 +6376,10 @@ class LoRAOptimizer(_LoRAMergeBase):
         final_stack, sub_reports = self._resolve_tree_to_stack(
             tree, normalized_stack, model, clip, **kwargs)
 
-        # Final merge with the resolved stack
-        result = self.optimize_merge(model, final_stack, output_strength, clip=clip, **kwargs)
+        # Final merge: restore original cache_patches setting (sub-merges use "disabled")
+        final_kwargs = dict(kwargs)
+        final_kwargs["cache_patches"] = _orig_cache_patches
+        result = self.optimize_merge(model, final_stack, output_strength, clip=clip, **final_kwargs)
 
         # Prepend sub-reports to the final report
         if sub_reports:
