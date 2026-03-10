@@ -7123,7 +7123,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                   cache_patches="enabled",
                   diff_cache_mode="disabled", diff_cache_ram_pct=0.5, vram_budget=0.0,
                   scoring_speed="full", scoring_formula="v2", output_mode="merge",
-                  decision_smoothing=0.25, smooth_slerp_gate=False):
+                  decision_smoothing=0.25, smooth_slerp_gate=False,
+                  _is_sub_merge=False, _suppress_pbar=False):
         import hashlib, json
 
         # Free stale cached models when the input model changes
@@ -7137,11 +7138,111 @@ class LoRAAutoTuner(LoRAOptimizer):
             gc.collect()
         self._cached_model_id = current_mid
 
+        # --- Extract merge formula before normalization ---
+        merge_formula = None
+        clean_stack = []
+        for item in lora_stack:
+            if isinstance(item, dict) and "_merge_formula" in item:
+                merge_formula = item["_merge_formula"]
+            else:
+                clean_stack.append(item)
+        if merge_formula:
+            lora_stack = clean_stack
+
         # --- Normalize & validate stack ---
         normalized_stack = self._normalize_stack(lora_stack, normalize_keys=normalize_keys)
         active_loras = [item for item in normalized_stack if item["strength"] != 0]
         if not active_loras:
             return (model, clip, "No active LoRAs in stack.", "", None, None)
+
+        # --- Formula-based hierarchical auto-tune ---
+        if merge_formula and len(active_loras) >= 2:
+            try:
+                tree = _parse_merge_formula(merge_formula, len(normalized_stack))
+            except ValueError as e:
+                logging.warning(f"[LoRA AutoTuner] Invalid merge formula: {e} — using flat auto-tune")
+                tree = None
+
+            if tree is not None and tree["type"] == "group":
+                logging.info(f"[LoRA AutoTuner] Using merge formula: {merge_formula}")
+
+                # Resolve architecture preset before sub-merges
+                preset_key, _ = _resolve_arch_preset(
+                    architecture_preset, getattr(self, '_detected_arch', None) or 'unknown')
+
+                at_kwargs = {
+                    "clip_strength_multiplier": clip_strength_multiplier,
+                    "top_n": top_n,
+                    "normalize_keys": normalize_keys,
+                    "scoring_svd": scoring_svd,
+                    "scoring_device": scoring_device,
+                    "architecture_preset": preset_key,
+                    "auto_strength_floor": auto_strength_floor,
+                    "decision_smoothing": decision_smoothing,
+                    "smooth_slerp_gate": smooth_slerp_gate,
+                    "vram_budget": vram_budget,
+                    "scoring_speed": scoring_speed,
+                    "scoring_formula": scoring_formula,
+                    "diff_cache_mode": diff_cache_mode,
+                    "diff_cache_ram_pct": diff_cache_ram_pct,
+                }
+
+                resolved_stack, sub_reports = self._autotune_resolve_tree(
+                    tree, normalized_stack, model, clip, **at_kwargs)
+
+                if len(resolved_stack) >= 2:
+                    # Save _detected_arch — recursive call may overwrite it
+                    # when all resolved items are virtual (no arch detection possible)
+                    saved_arch = getattr(self, '_detected_arch', None)
+
+                    # Run outer auto_tune on the resolved flat stack (no formula).
+                    # normalize_keys="disabled": stack is already normalized.
+                    outer_result = self.auto_tune(
+                        model, resolved_stack, output_strength,
+                        clip=clip,
+                        clip_strength_multiplier=clip_strength_multiplier,
+                        top_n=top_n,
+                        normalize_keys="disabled",
+                        scoring_svd=scoring_svd,
+                        scoring_device=scoring_device,
+                        architecture_preset=preset_key,
+                        auto_strength_floor=auto_strength_floor,
+                        evaluator=evaluator,
+                        record_dataset=record_dataset,
+                        cache_patches=cache_patches,
+                        diff_cache_mode=diff_cache_mode,
+                        diff_cache_ram_pct=diff_cache_ram_pct,
+                        vram_budget=vram_budget,
+                        scoring_speed=scoring_speed,
+                        scoring_formula=scoring_formula,
+                        output_mode=output_mode,
+                        decision_smoothing=decision_smoothing,
+                        smooth_slerp_gate=smooth_slerp_gate,
+                    )
+
+                    # Restore _detected_arch
+                    self._detected_arch = saved_arch
+
+                    # Prepend sub-reports to the outer report
+                    if sub_reports:
+                        # outer_result is 6-tuple
+                        ret_model, ret_clip, report, analysis_report, tuner_data, lora_data = outer_result
+                        separator = "\n" + "=" * 50 + "\n"
+                        sub_section = separator.join(sub_reports)
+                        report = (
+                            "AUTOTUNER FORMULA SUB-MERGE REPORTS\n"
+                            + separator + sub_section + separator
+                            + "\nFINAL AUTOTUNER REPORT:\n" + report
+                        )
+                        outer_result = (ret_model, ret_clip, report, analysis_report, tuner_data, lora_data)
+
+                    return outer_result
+                elif len(resolved_stack) == 1:
+                    # All sub-merges collapsed to one — update state and fall through
+                    logging.info("[LoRA AutoTuner] Formula resolved to single LoRA — skipping outer tune")
+                    normalized_stack = resolved_stack
+                    active_loras = [item for item in normalized_stack if item["strength"] != 0]
+                    # Fall through to single-LoRA or normal path below
 
         if len(active_loras) == 1:
             # Single LoRA: nothing to tune, delegate directly
@@ -7155,6 +7256,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 auto_strength_floor=auto_strength_floor,
                 decision_smoothing=decision_smoothing,
                 smooth_slerp_gate=smooth_slerp_gate,
+                _skip_qkv_refusion=_is_sub_merge,
             )
             return (merged_model, merged_clip,
                     "Single LoRA detected -- no parameters to tune.\n\n" + report, report, None, lora_data)
@@ -7201,7 +7303,12 @@ class LoRAAutoTuner(LoRAOptimizer):
         t_start = time.time()
         # Progress bar: analysis groups + top_n merges (+ 1 final merge when subsampling)
         n_pbar_merges = top_n + (1 if scoring_speed != "full" and top_n > 1 and output_mode != "tuning_only" else 0)
-        pbar = comfy.utils.ProgressBar(len(target_groups) + n_pbar_merges)
+        if _suppress_pbar:
+            class _NullPbar:
+                def update(self, n): pass
+            pbar = _NullPbar()
+        else:
+            pbar = comfy.utils.ProgressBar(len(target_groups) + n_pbar_merges)
         analysis_data = self._run_group_analysis(
             target_groups, active_loras, model, clip, compute_device,
             clip_strength_multiplier=clip_strength_multiplier,
@@ -7417,6 +7524,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 _analysis_cache=scoring_cache,
                 _diff_cache=_diff_cache,
                 _skip_report=True,
+                _skip_qkv_refusion=_is_sub_merge,
             )
 
             # Measure output quality (single-LoRA prefixes may still produce
@@ -7624,6 +7732,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 _analysis_cache=_analysis_cache,
                 _diff_cache=_diff_cache,
                 _skip_report=True,
+                _skip_qkv_refusion=_is_sub_merge,
             )
             logging.info(f"[LoRA AutoTuner] Final merge complete ({time.time() - t_final:.1f}s)")
             pbar.update(1)

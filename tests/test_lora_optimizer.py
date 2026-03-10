@@ -526,6 +526,41 @@ class LoRAOptimizerTests(unittest.TestCase):
         self.assertEqual(resolved_stack[1]["name"], "lora_c")
         self.assertEqual(len(sub_reports), 1)
 
+    def test_auto_tune_with_formula_calls_autotune_resolve_tree(self):
+        """auto_tune should detect formula and use _autotune_resolve_tree."""
+        tuner = lora_optimizer.LoRAAutoTuner()
+
+        # Build a lora_stack with formula metadata
+        fake_lora_a = {"key_a": torch.randn(4, 4)}
+        fake_lora_b = {"key_a": torch.randn(4, 4)}
+        fake_lora_c = {"key_c": torch.randn(4, 4)}
+        lora_stack = [
+            {"name": "lora_a", "lora": fake_lora_a, "strength": 1.0},
+            {"name": "lora_b", "lora": fake_lora_b, "strength": 1.0},
+            {"name": "lora_c", "lora": fake_lora_c, "strength": 1.0},
+            {"_merge_formula": "(1+2)+3"},
+        ]
+
+        # Track _autotune_resolve_tree calls
+        resolve_calls = []
+
+        def mock_resolve(tree, normalized_stack, model, clip, **kwargs):
+            resolve_calls.append(tree)
+            # Return a flat stack (2 items) so auto_tune continues normally
+            return ([normalized_stack[0], normalized_stack[2]], [])
+
+        tuner._autotune_resolve_tree = mock_resolve
+
+        # Mock the rest of auto_tune to avoid needing real models
+        # We just need to verify _autotune_resolve_tree was called
+        try:
+            tuner.auto_tune(None, lora_stack, 1.0)
+        except Exception:
+            pass  # Will fail later in pipeline — we only check the call happened
+
+        self.assertEqual(len(resolve_calls), 1)
+        self.assertEqual(resolve_calls[0]["type"], "group")
+
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class LoRASettingsNodeTests(unittest.TestCase):
