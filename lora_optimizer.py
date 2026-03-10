@@ -1386,7 +1386,7 @@ class _LoRAMergeBase:
         for item in active_loras:
             if item.get("_precomputed_diffs"):
                 for key in item["lora"]:
-                    all_lora_prefixes.add(key)  # model-space keys are already the "prefix"
+                    all_lora_prefixes.add(key[0] if isinstance(key, tuple) else key)
                 continue
             for key in item["lora"].keys():
                 for suffix in suffixes:
@@ -1563,8 +1563,10 @@ class _LoRAMergeBase:
             # Virtual LoRAs from sub-merges store pre-computed diffs keyed by target key
             if item.get("_precomputed_diffs"):
                 tkey = target_key
-                if tkey in item["lora"]:
-                    raw = item["lora"][tkey]
+                raw = item["lora"].get(tkey)
+                if raw is None and isinstance(tkey, tuple):
+                    raw = item["lora"].get(tkey[0])
+                if raw is not None:
                     if isinstance(raw, torch.Tensor):
                         diff = raw.float()
                     else:
@@ -3147,7 +3149,7 @@ class _LoRAMergeBase:
                     "name": item["name"],
                     "lora": item["lora"],
                     "strength": item["strength"],
-                    "clip_strength": None,  # use global multiplier
+                    "clip_strength": item.get("clip_strength", None),
                     "conflict_mode": item.get("conflict_mode", "all"),
                     "key_filter": item.get("key_filter", "all"),
                     "metadata": item.get("metadata", {}),
@@ -4064,8 +4066,10 @@ class LoRAOptimizer(_LoRAMergeBase):
             # Virtual LoRAs from sub-merges store pre-computed diffs keyed by target key
             if item.get("_precomputed_diffs"):
                 tkey = target_key
-                if tkey in item["lora"]:
-                    raw = item["lora"][tkey]
+                raw = item["lora"].get(tkey)
+                if raw is None and isinstance(tkey, tuple):
+                    raw = item["lora"].get(tkey[0])
+                if raw is not None:
                     if isinstance(raw, torch.Tensor):
                         diff = raw.float()
                     else:
@@ -6347,7 +6351,11 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         # Prepend sub-reports to the final report
         if sub_reports:
-            model_out, clip_out, report, tuner_data, lora_data = result
+            if len(result) == 3:
+                model_out, report, lora_data = result
+                clip_out, tuner_data = None, None
+            else:
+                model_out, clip_out, report, tuner_data, lora_data = result
             separator = "\n" + "=" * 50 + "\n"
             sub_section = separator.join(sub_reports)
             report = (
@@ -6355,7 +6363,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                 + separator + sub_section + separator
                 + "\nFINAL MERGE REPORT:\n" + report
             )
-            result = (model_out, clip_out, report, tuner_data, lora_data)
+            if len(result) == 3:
+                result = (model_out, report, lora_data)
+            else:
+                result = (model_out, clip_out, report, tuner_data, lora_data)
 
         return result
 
@@ -6392,7 +6403,11 @@ class LoRAOptimizer(_LoRAMergeBase):
                     try:
                         sub_result = self.optimize_merge(
                             model, sub_stack, 1.0, clip=clip, **kwargs)
-                        sub_model, sub_clip, sub_report, _, sub_lora_data = sub_result
+                        if len(sub_result) == 3:
+                            sub_model, sub_report, sub_lora_data = sub_result
+                            sub_clip = None
+                        else:
+                            sub_model, sub_clip, sub_report, _, sub_lora_data = sub_result
                         sub_reports.append(sub_report)
 
                         # Extract patches as virtual LoRA from merge output
@@ -6400,6 +6415,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                         sub_clip_patches = sub_lora_data.get("clip_patches", {}) if sub_lora_data else {}
                         virtual = self._model_to_virtual_lora(
                             sub_model_patches, sub_clip_patches, child)
+                        del sub_model, sub_clip, sub_result, sub_lora_data
                         if child["weight"] is not None:
                             virtual["strength"] = child["weight"]
                         resolved.append(virtual)
