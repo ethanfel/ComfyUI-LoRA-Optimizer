@@ -2491,6 +2491,100 @@ class _LoRAMergeBase:
 
     @staticmethod
     @torch.no_grad()
+    def _spectral_ownership_split(diffs_with_weights, ownership_threshold=0.5,
+                                   max_rank=16, compute_device=None):
+        """
+        Split each LoRA diff into spectrally private and shared components.
+
+        Each LoRA "owns" certain spectral directions (singular value components).
+        A direction is private if no other LoRA shares it (low cross-Gram overlap).
+        Private parts bypass merge averaging; shared parts go through the normal
+        merge pipeline.
+
+        Returns (shared_diffs_with_weights, private_addition) where
+        private_addition is a tensor to add after merging, or None.
+        """
+        if len(diffs_with_weights) < 2:
+            return diffs_with_weights, None
+
+        ref = diffs_with_weights[0][0]
+        if ref.dim() < 2 or min(ref.shape) < 2:
+            return diffs_with_weights, None
+
+        original_shape = ref.shape
+        dev = compute_device if compute_device is not None else ref.device
+        n = len(diffs_with_weights)
+        rank = min(max_rank, min(original_shape[0], int(torch.tensor(original_shape[1:]).prod().item())))
+
+        # Step 1: Per-LoRA truncated SVD
+        Us = []  # U_i: [out, rank]
+        Ss = []  # S_i: [rank]
+        Vs = []  # V_i: [in, rank]
+        try:
+            for d, _ in diffs_with_weights:
+                mat = d.reshape(original_shape[0], -1).to(device=dev, dtype=torch.float32)
+                q_oversample = min(rank + max(10, rank // 5), min(mat.shape))
+                U, S, V = torch.svd_lowrank(mat, q=q_oversample, niter=4)
+                Us.append(U[:, :rank])
+                Ss.append(S[:rank])
+                Vs.append(V[:, :rank])
+                del mat
+        except (RuntimeError, torch.cuda.OutOfMemoryError):
+            return diffs_with_weights, None
+
+        # Step 2: Cross-Gram ownership — classify private vs shared directions
+        private_addition = torch.zeros(original_shape, dtype=torch.float32, device=dev)
+        has_private = False
+        shared_diffs = []
+
+        for i in range(n):
+            # For each direction k of LoRA i, compute max sharedness across other LoRAs
+            sharedness = torch.zeros(Us[i].shape[1], device=dev)
+            for j in range(n):
+                if j == i:
+                    continue
+                # G_ij = U_j^T @ U_i — shape [rank_j, rank_i]
+                G = Us[j].T @ Us[i]
+                # sharedness[k] = ||G[:, k]||^2 = sum of squared projections
+                col_norms_sq = (G * G).sum(dim=0)
+                sharedness = torch.max(sharedness, col_norms_sq)
+                del G, col_norms_sq
+
+            # Private directions: sharedness < threshold
+            private_mask = sharedness < ownership_threshold
+
+            if private_mask.any():
+                has_private = True
+                # Reconstruct private component: sum over private directions
+                priv_idx = private_mask.nonzero(as_tuple=True)[0]
+                U_priv = Us[i][:, priv_idx]  # [out, n_priv]
+                S_priv = Ss[i][priv_idx]     # [n_priv]
+                V_priv = Vs[i][:, priv_idx]  # [in, n_priv]
+                d_private = ((U_priv * S_priv.unsqueeze(0)) @ V_priv.T).reshape(original_shape)
+
+                # shared = original - private
+                d, w = diffs_with_weights[i]
+                d_shared = d.to(device=dev, dtype=torch.float32) - d_private
+                shared_diffs.append((d_shared.to(dtype=d.dtype, device=d.device), w))
+                private_addition.add_(d_private * w)
+                del U_priv, S_priv, V_priv, d_private
+            else:
+                shared_diffs.append(diffs_with_weights[i])
+            del sharedness, private_mask
+
+        del Us, Ss, Vs
+
+        if not has_private:
+            return diffs_with_weights, None
+
+        output_device = ref.device
+        if private_addition.device != output_device:
+            private_addition = private_addition.to(output_device)
+
+        return shared_diffs, private_addition
+
+    @staticmethod
+    @torch.no_grad()
     def _compress_to_lowrank(diff, rank, svd_device=None, output_dtype=None):
         """
         Re-compress a full-rank diff tensor to low-rank via truncated SVD.
@@ -2655,16 +2749,23 @@ class _LoRAMergeBase:
         # which causes TALL-masks to classify every position as "selfish"
         # (agreement=1 everywhere), zeroing out all consensus diffs.
         selfish_additions = None
+        spectral_additions = None
         if merge_refinement != "none" and len(diffs_with_weights) >= 2 and mode != "ties":
-            diffs_with_weights, selfish_additions = self._tall_masks(diffs_with_weights)
-            first = diffs_with_weights[0][0]
-            if first.dim() >= 2:
-                diffs_with_weights = self._do_orthogonalize(diffs_with_weights)
-            if merge_refinement == "full":
+            if merge_refinement == "spectral":
                 first = diffs_with_weights[0][0]
                 if first.dim() >= 2 and min(first.shape) >= 2:
-                    diffs_with_weights = self._knots_align(
-                        diffs_with_weights, compute_device=dev, svd_device=dev)
+                    diffs_with_weights, spectral_additions = self._spectral_ownership_split(
+                        diffs_with_weights, compute_device=dev)
+            else:
+                diffs_with_weights, selfish_additions = self._tall_masks(diffs_with_weights)
+                first = diffs_with_weights[0][0]
+                if first.dim() >= 2:
+                    diffs_with_weights = self._do_orthogonalize(diffs_with_weights)
+                if merge_refinement == "full":
+                    first = diffs_with_weights[0][0]
+                    if first.dim() >= 2 and min(first.shape) >= 2:
+                        diffs_with_weights = self._knots_align(
+                            diffs_with_weights, compute_device=dev, svd_device=dev)
 
         if mode == "weighted_average":
             result = torch.zeros(ref_diff.shape, dtype=torch.float32, device=dev)
@@ -2677,6 +2778,8 @@ class _LoRAMergeBase:
                 result.add_(diff.to(device=dev, dtype=torch.float32) * (weight / total_weight))
             if selfish_additions is not None:
                 result = result + selfish_additions.to(device=result.device, dtype=torch.float32)
+            if spectral_additions is not None:
+                result = result + spectral_additions.to(device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -2688,6 +2791,8 @@ class _LoRAMergeBase:
                 result.add_(diff.to(device=dev, dtype=torch.float32) * weight)
             if selfish_additions is not None:
                 result = result + selfish_additions.to(device=result.device, dtype=torch.float32)
+            if spectral_additions is not None:
+                result = result + spectral_additions.to(device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -2707,6 +2812,8 @@ class _LoRAMergeBase:
                 result.add_(diff.to(device=dev, dtype=torch.float32) * weight * scale)
             if selfish_additions is not None:
                 result = result + selfish_additions.to(device=result.device, dtype=torch.float32)
+            if spectral_additions is not None:
+                result = result + spectral_additions.to(device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -2782,6 +2889,8 @@ class _LoRAMergeBase:
             del acc_v
             if selfish_additions is not None:
                 result = result + selfish_additions.to(device=result.device, dtype=torch.float32)
+            if spectral_additions is not None:
+                result = result + spectral_additions.to(device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -2857,6 +2966,8 @@ class _LoRAMergeBase:
 
             if selfish_additions is not None:
                 result = result + selfish_additions.to(device=result.device, dtype=torch.float32)
+            if spectral_additions is not None:
+                result = result + spectral_additions.to(device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -2911,21 +3022,28 @@ class _LoRAMergeBase:
                         trimmed.append(self._ties_trim(d_f, density))
                     abs_weights.append(abs(w))
 
-            # Refine/full merge refinement pipeline for TIES
+            # Refine/full/spectral merge refinement pipeline for TIES
             # TALL-masks before orthogonalization (see non-TIES comment above)
             ties_selfish = None
+            ties_spectral = None
             if merge_refinement != "none" and len(trimmed) >= 2:
                 # Re-pair trimmed diffs with abs_weights for enhancement pipeline
                 trimmed_pairs = list(zip(trimmed, abs_weights))
-                trimmed_pairs, ties_selfish = self._tall_masks(trimmed_pairs)
-                first = trimmed_pairs[0][0]
-                if first.dim() >= 2:
-                    trimmed_pairs = self._do_orthogonalize(trimmed_pairs)
-                if merge_refinement == "full":
+                if merge_refinement == "spectral":
                     first = trimmed_pairs[0][0]
                     if first.dim() >= 2 and min(first.shape) >= 2:
-                        trimmed_pairs = self._knots_align(
-                            trimmed_pairs, compute_device=dev, svd_device=dev)
+                        trimmed_pairs, ties_spectral = self._spectral_ownership_split(
+                            trimmed_pairs, compute_device=dev)
+                else:
+                    trimmed_pairs, ties_selfish = self._tall_masks(trimmed_pairs)
+                    first = trimmed_pairs[0][0]
+                    if first.dim() >= 2:
+                        trimmed_pairs = self._do_orthogonalize(trimmed_pairs)
+                    if merge_refinement == "full":
+                        first = trimmed_pairs[0][0]
+                        if first.dim() >= 2 and min(first.shape) >= 2:
+                            trimmed_pairs = self._knots_align(
+                                trimmed_pairs, compute_device=dev, svd_device=dev)
                 trimmed = [d for d, _ in trimmed_pairs]
                 abs_weights = [w for _, w in trimmed_pairs]
                 del trimmed_pairs
@@ -2944,6 +3062,8 @@ class _LoRAMergeBase:
             del trimmed, majority_sign
             if ties_selfish is not None:
                 result = result.to(dtype=torch.float32) + ties_selfish.to(device=result.device, dtype=torch.float32)
+            if ties_spectral is not None:
+                result = result.to(dtype=torch.float32) + ties_spectral.to(device=result.device, dtype=torch.float32)
             result = result.to(dtype)
             return result.cpu() if to_cpu else result
 
@@ -3111,7 +3231,7 @@ def _generate_param_grid():
     sparsifications = ["disabled", "dare", "della", "dare_conflict", "della_conflict"]
     densities = [0.5, 0.7, 0.9]
     dampenings = [0.0, 0.3, 0.6]
-    qualities = ["none", "refine", "full"]
+    qualities = ["none", "refine", "full", "spectral"]
     auto_strengths = ["enabled", "disabled"]
     strategy_sets = ["full", "no_slerp", "basic"]
 
@@ -3262,6 +3382,17 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
             score += min(effective_conflict / 0.3, 1.0) * 0.10
         else:
             score += 0.05 + min(effective_conflict / 0.3, 1.0) * 0.10
+    elif quality == "spectral":
+        # Spectral ownership works best when LoRAs have low subspace overlap
+        # (many private directions). Orthogonal LoRAs benefit most.
+        if is_orthogonal:
+            score += 0.15
+        elif avg_subspace_overlap < 0.35:
+            score += 0.12
+        elif avg_subspace_overlap < 0.6:
+            score += 0.08
+        else:
+            score += 0.05
     elif quality == "refine":
         if is_orthogonal:
             score += min(effective_conflict / 0.3, 1.0) * 0.10
@@ -3684,7 +3815,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                                "At higher values: dampened rescaling that reduces noise amplification at low density values. "
                                "Only affects DARE/DARE-conflict modes. Based on DAREx (ICLR 2025)."
                 }),
-                "merge_refinement": (["none", "refine", "full"], {
+                "merge_refinement": (["none", "refine", "full", "spectral"], {
                     "default": "none",
                     "tooltip": "Optional preprocessing steps applied to weight diffs before merging. "
                                "none: merge as-is, no extra processing. "
@@ -3692,6 +3823,9 @@ class LoRAOptimizer(_LoRAMergeBase):
                                "(TALL-masks) to reduce interference between LoRAs (minimal extra compute). "
                                "full: adds SVD alignment (KnOTS) on top of refine for maximum "
                                "interference reduction (uses more VRAM for SVD decomposition). "
+                               "spectral: spectral ownership split — each LoRA keeps its unique spectral "
+                               "directions intact while shared directions go through normal merging. "
+                               "Best for mixing style + character LoRAs where style gets drowned out. "
                                "Higher levels help most when LoRAs have high conflict; "
                                "for low-conflict or orthogonal LoRAs, 'none' is usually fine. "
                                "(Previously: this setting was called 'merge_quality' with values standard/enhanced/maximum.)"
@@ -4989,6 +5123,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             quality_desc = {
                 "refine": "Refine (orthogonalize + TALL-masks)",
                 "full": "Full (orthogonalize + KnOTS SVD alignment + TALL-masks)",
+                "spectral": "Spectral (ownership split — private directions bypass merge)",
             }
             lines.append(f"  Merge refinement: {quality_desc.get(merge_refinement, merge_refinement)}")
 
@@ -6171,9 +6306,9 @@ class LoRAOptimizerSettings:
                     "default": "per_prefix",
                     "tooltip": "How the optimizer picks merge methods. 'per_prefix' (recommended): picks the best method for each part of the model. 'global': uses one method everywhere. 'additive': simple stacking with no conflict handling — use for edit/DPO LoRAs."
                 }),
-                "merge_refinement": (["none", "refine", "full"], {
+                "merge_refinement": (["none", "refine", "full", "spectral"], {
                     "default": "none",
-                    "tooltip": "Extra processing to reduce interference between LoRAs. 'none': fastest, usually fine. 'refine': light cleanup for better quality. 'full': most thorough but slower. Try 'refine' if you see artifacts or color shifts."
+                    "tooltip": "Extra processing to reduce interference between LoRAs. 'none': fastest, usually fine. 'refine': light cleanup for better quality. 'full': most thorough but slower. 'spectral': preserves each LoRA's unique spectral directions — best when style effects get drowned out by character LoRAs."
                 }),
                 "sparsification": (["disabled", "dare", "della", "dare_conflict", "della_conflict"], {
                     "default": "disabled",
