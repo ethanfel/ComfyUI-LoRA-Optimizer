@@ -1546,6 +1546,26 @@ class _LoRAMergeBase:
         for i, item in enumerate(active_loras):
             diff_accum = None
             rank_sum = 0
+
+            # Virtual LoRAs from sub-merges store pre-computed diffs keyed by target key
+            if item.get("_precomputed_diffs"):
+                tkey = target_key[0] if isinstance(target_key, tuple) else target_key
+                if tkey in item["lora"]:
+                    diff = item["lora"][tkey].float()
+                    try:
+                        diff = diff.reshape(target_shape)
+                    except RuntimeError:
+                        diff = None
+                    if diff is not None:
+                        raw_contributors.add(i)
+                        rank_sum += 1
+                        if storage_dtype is None:
+                            storage_dtype = diff.dtype
+                        diff_accum = diff
+                aggregated[i] = diff_accum
+                ranks[i] = rank_sum
+                continue
+
             for alias in target_group["aliases"]:
                 cache_key = (alias, i)
                 if diff_cache is not None and cache_key in diff_cache:
@@ -3712,7 +3732,7 @@ class LoRAMergeFormula:
 
         # Count actual LoRAs (exclude any existing formula metadata)
         n_loras = sum(1 for item in output
-                      if isinstance(item, dict) and "_merge_formula" not in item)
+                      if not (isinstance(item, dict) and "_merge_formula" in item))
 
         # Validate formula
         try:
@@ -4020,8 +4040,19 @@ class LoRAOptimizer(_LoRAMergeBase):
         partial_stats = []
         skip_count = 0
         for i, item in enumerate(active_loras):
-            lora_info = self._get_lora_key_info(item["lora"], lora_prefix)
-            if lora_info is not None:
+            # Virtual LoRAs from sub-merges store pre-computed diffs keyed by target key
+            if item.get("_precomputed_diffs"):
+                tkey = actual_key if actual_key is not None else (target_key[0] if isinstance(target_key, tuple) else target_key)
+                if tkey in item["lora"]:
+                    diff = item["lora"][tkey].float()
+                    try:
+                        diff = diff.reshape(target_shape)
+                    except RuntimeError:
+                        diff = None
+                    rank = 1
+                else:
+                    continue
+            elif (lora_info := self._get_lora_key_info(item["lora"], lora_prefix)) is not None:
                 mat_up, mat_down, alpha, mid = lora_info
                 rank = mat_down.shape[0]
                 diff = self._compute_lora_diff(mat_up, mat_down, alpha, mid, target_shape, device=device)
@@ -5445,6 +5476,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "sparsification": sparsification,
                     "sparsification_density": sparsification_density,
                     "dare_dampening": dare_dampening,
+                    "merge_strategy_override": merge_strategy_override,
                     "merge_refinement": merge_refinement,
                     "strategy_set": strategy_set,
                     "architecture_preset": architecture_preset,
@@ -6335,12 +6367,14 @@ class LoRAOptimizer(_LoRAMergeBase):
                     try:
                         sub_result = self.optimize_merge(
                             model, sub_stack, 1.0, clip=clip, **kwargs)
-                        sub_model, sub_clip, sub_report, _, _ = sub_result
+                        sub_model, sub_clip, sub_report, _, sub_lora_data = sub_result
                         sub_reports.append(sub_report)
 
-                        # Extract patches as virtual LoRA
+                        # Extract patches as virtual LoRA from merge output
+                        sub_model_patches = sub_lora_data.get("model_patches", {}) if sub_lora_data else {}
+                        sub_clip_patches = sub_lora_data.get("clip_patches", {}) if sub_lora_data else {}
                         virtual = self._model_to_virtual_lora(
-                            model, sub_model, clip, sub_clip, child)
+                            sub_model_patches, sub_clip_patches, child)
                         if child["weight"] is not None:
                             virtual["strength"] = child["weight"]
                         resolved.append(virtual)
@@ -6359,32 +6393,19 @@ class LoRAOptimizer(_LoRAMergeBase):
         return (resolved, sub_reports)
 
     @staticmethod
-    def _model_to_virtual_lora(base_model, patched_model, base_clip, patched_clip, tree_node):
+    def _model_to_virtual_lora(model_patches, clip_patches, tree_node):
         """
-        Extract the difference between base and patched models as a virtual LoRA dict.
-        ComfyUI's model patcher stores patches internally — we extract them.
+        Build a virtual LoRA from pre-computed merge patches.
+        Stores the actual diff tensors (keyed by target model key) so the
+        merge pipeline can use them directly without LoRA decomposition.
         """
         virtual_lora = {}
 
-        # Extract model patches from the patched model's patcher
-        if patched_model is not None and patched_model is not base_model:
-            patcher = patched_model
-            if hasattr(patcher, 'patches'):
-                for key, patch_list in patcher.patches.items():
-                    if patch_list:
-                        virtual_lora[key] = patch_list[-1]  # Latest patch
-            elif hasattr(patcher, 'model') and hasattr(patcher.model, 'patches'):
-                for key, patch_list in patcher.model.patches.items():
-                    if patch_list:
-                        virtual_lora[key] = patch_list[-1]
+        for key, patch in model_patches.items():
+            virtual_lora[key] = _LoRAMergeBase._expand_patch_to_diff(patch)
 
-        # Extract CLIP patches similarly
-        if patched_clip is not None and patched_clip is not base_clip:
-            clip_patcher = patched_clip
-            if hasattr(clip_patcher, 'patches'):
-                for key, patch_list in clip_patcher.patches.items():
-                    if patch_list:
-                        virtual_lora[key] = patch_list[-1]
+        for key, patch in clip_patches.items():
+            virtual_lora[key] = _LoRAMergeBase._expand_patch_to_diff(patch)
 
         # Build label from tree
         def _tree_label(node):
@@ -6395,6 +6416,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         return {
             "name": _tree_label(tree_node),
             "lora": virtual_lora,
+            "_precomputed_diffs": True,
             "strength": 1.0,
             "clip_strength": None,
             "conflict_mode": "all",

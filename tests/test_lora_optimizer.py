@@ -819,10 +819,11 @@ class LoRASettingsNodeTests(unittest.TestCase):
             ],
         }
         virtual = lora_optimizer.LoRAOptimizer._model_to_virtual_lora(
-            None, None, None, None, tree_node)
+            {}, {}, tree_node)
         self.assertEqual(virtual["name"], "(1+2)")
         self.assertEqual(virtual["strength"], 1.0)
         self.assertIsInstance(virtual["lora"], dict)
+        self.assertTrue(virtual["_precomputed_diffs"])
 
     def test_resolve_tree_to_stack_flat(self):
         """_resolve_tree_to_stack resolves a flat group to the original items."""
