@@ -5119,7 +5119,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                      sparsification_density=0.7, dare_dampening=0.0,
                      merge_strategy_override="", merge_refinement="none",
                      strategy_set="full", architecture_preset="auto",
-                     decision_smoothing=0.25,
+                     decision_smoothing=0.25, smooth_slerp_gate=False,
                      tuner_data=None, settings_source="manual"):
         """
         ComfyUI entry point. Supports an AutoTuner bridge mode:
@@ -5194,6 +5194,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     strategy_set=tuner_data.get("strategy_set", strategy_set),
                     architecture_preset=tuner_data.get("architecture_preset", architecture_preset),
                     decision_smoothing=resolved_smoothing,
+                    smooth_slerp_gate=smooth_slerp_gate,
                 )
                 applied_config = dict(config)
                 return {"result": result, "ui": {"applied_settings": [json.dumps(applied_config)]}}
@@ -5219,6 +5220,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             strategy_set=strategy_set,
             architecture_preset=architecture_preset,
             decision_smoothing=decision_smoothing,
+            smooth_slerp_gate=smooth_slerp_gate,
         )
 
     def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", auto_strength_floor=-1.0, free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", patch_compression="smart", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_refinement="none", strategy_set="full", architecture_preset="auto", decision_smoothing=0.25, smooth_slerp_gate=False, _analysis_cache=None, _diff_cache=None, _skip_report=False):
