@@ -7728,6 +7728,90 @@ class LoRAAutoTuner(LoRAOptimizer):
 
         return result
 
+    def _autotune_resolve_tree(self, tree, normalized_stack, model, clip, **at_kwargs):
+        """
+        Recursively resolve a merge formula tree, running auto_tune for each
+        sub-group with 2+ items.  Returns (resolved_stack, sub_reports).
+        Same tree format as _resolve_tree_to_stack but uses AutoTuner for sub-merges.
+        """
+        sub_reports = []
+
+        if tree["type"] == "leaf":
+            item = dict(normalized_stack[tree["index"]])
+            if "metadata" in item and isinstance(item["metadata"], dict):
+                item["metadata"] = dict(item["metadata"])
+            if tree["weight"] is not None:
+                item["strength"] = tree["weight"]
+            return ([item], sub_reports)
+
+        # Group: resolve each child
+        resolved = []
+        for child in tree["children"]:
+            if child["type"] == "leaf":
+                item = dict(normalized_stack[child["index"]])
+                if "metadata" in item and isinstance(item["metadata"], dict):
+                    item["metadata"] = dict(item["metadata"])
+                if child["weight"] is not None:
+                    item["strength"] = child["weight"]
+                resolved.append(item)
+            else:
+                # Sub-group: resolve recursively then auto-tune
+                sub_stack, child_reports = self._autotune_resolve_tree(
+                    child, normalized_stack, model, clip, **at_kwargs)
+                sub_reports.extend(child_reports)
+
+                if len(sub_stack) >= 2:
+                    try:
+                        # Override settings for sub-merge
+                        sub_kwargs = dict(at_kwargs)
+                        sub_kwargs["cache_patches"] = "disabled"
+                        sub_kwargs["record_dataset"] = "disabled"
+                        sub_kwargs["output_mode"] = "merge"
+                        sub_kwargs["_is_sub_merge"] = True
+                        sub_kwargs["_suppress_pbar"] = True
+                        # Evaluator is excluded: it may be prompt-specific and
+                        # inappropriate for sub-groups (character-only merge etc.)
+
+                        sub_result = self.auto_tune(
+                            model, sub_stack, 1.0, clip=clip, **sub_kwargs)
+
+                        # auto_tune returns 6-tuple
+                        sub_model, sub_clip, sub_report, _, _, sub_lora_data = sub_result
+
+                        sub_reports.append(sub_report)
+
+                        if sub_lora_data is None:
+                            # Fallback: pass items through
+                            for sub_item in sub_stack:
+                                item = dict(sub_item)
+                                if child.get("weight") is not None:
+                                    item["strength"] = child["weight"]
+                                resolved.append(item)
+                            continue
+
+                        # Build virtual LoRA from sub-merge result
+                        sub_model_patches = sub_lora_data.get("model_patches", {})
+                        sub_clip_patches = sub_lora_data.get("clip_patches", {})
+                        virtual = self._model_to_virtual_lora(
+                            sub_model_patches, sub_clip_patches, child)
+                        del sub_model, sub_clip, sub_result, sub_lora_data
+                        if child["weight"] is not None:
+                            virtual["strength"] = child["weight"]
+                        resolved.append(virtual)
+                    except Exception as e:
+                        logging.warning(
+                            f"[LoRA AutoTuner] Sub-merge auto_tune failed: {e} — "
+                            "falling back to flat merge for this sub-group")
+                        for item in sub_stack:
+                            resolved.append(item)
+                elif len(sub_stack) == 1:
+                    item = sub_stack[0]
+                    if child["weight"] is not None:
+                        item["strength"] = child["weight"]
+                    resolved.append(item)
+
+        return (resolved, sub_reports)
+
     def _save_tuner_dataset_entry(self, tuner_data, active_loras, prefix_stats,
                                   detected_arch):
         """

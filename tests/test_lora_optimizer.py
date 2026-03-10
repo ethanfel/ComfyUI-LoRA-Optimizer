@@ -463,6 +463,69 @@ class LoRAOptimizerTests(unittest.TestCase):
         )
         self.assertIn("LoRACompatibilityAnalyzer", lora_optimizer.NODE_CLASS_MAPPINGS)
 
+    def test_autotune_resolve_tree_calls_auto_tune_for_subgroups(self):
+        """_autotune_resolve_tree should call auto_tune for sub-groups with 2+ items."""
+        from lora_optimizer import LoRAAutoTuner, _parse_merge_formula
+
+        tuner = LoRAAutoTuner()
+        tree = _parse_merge_formula("(1+2)+3", 3)
+
+        # Build a minimal normalized stack with 3 fake LoRAs
+        fake_lora_a = {"key_a": torch.randn(4, 4)}
+        fake_lora_b = {"key_a": torch.randn(4, 4)}
+        fake_lora_c = {"key_c": torch.randn(4, 4)}
+        normalized_stack = [
+            {"name": "lora_a", "lora": fake_lora_a, "strength": 1.0,
+             "clip_strength": None, "metadata": {}},
+            {"name": "lora_b", "lora": fake_lora_b, "strength": 1.0,
+             "clip_strength": None, "metadata": {}},
+            {"name": "lora_c", "lora": fake_lora_c, "strength": 1.0,
+             "clip_strength": None, "metadata": {}},
+        ]
+
+        # Track auto_tune calls
+        calls = []
+
+        def mock_auto_tune(model, lora_stack, output_strength, **kwargs):
+            calls.append({"n_loras": len(lora_stack), "names": [l["name"] for l in lora_stack]})
+            # Return a minimal 6-tuple with virtual LoRA patches
+            virtual_patches = {"key_a": ("diff", (torch.randn(4, 4),))}
+            lora_data = {"model_patches": virtual_patches, "clip_patches": {}}
+            return (model, None, "sub-report", "", None, lora_data)
+
+        tuner.auto_tune = mock_auto_tune
+
+        at_kwargs = {
+            "clip_strength_multiplier": 1.0,
+            "top_n": 3,
+            "normalize_keys": "disabled",
+            "scoring_svd": "disabled",
+            "scoring_device": "cpu",
+            "architecture_preset": "dit",
+            "auto_strength_floor": -1.0,
+            "decision_smoothing": 0.25,
+            "smooth_slerp_gate": False,
+            "vram_budget": 0.0,
+            "scoring_speed": "turbo",
+            "scoring_formula": "v2",
+            "diff_cache_mode": "disabled",
+            "diff_cache_ram_pct": 0.5,
+        }
+
+        resolved_stack, sub_reports = tuner._autotune_resolve_tree(
+            tree, normalized_stack, None, None, **at_kwargs)
+
+        # Should have called auto_tune once for the (1+2) sub-group
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["n_loras"], 2)
+        self.assertEqual(calls[0]["names"], ["lora_a", "lora_b"])
+
+        # Resolved stack should have 2 items: virtual LoRA + lora_c
+        self.assertEqual(len(resolved_stack), 2)
+        self.assertTrue(resolved_stack[0].get("_precomputed_diffs"))  # virtual
+        self.assertEqual(resolved_stack[1]["name"], "lora_c")
+        self.assertEqual(len(sub_reports), 1)
+
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class LoRASettingsNodeTests(unittest.TestCase):
