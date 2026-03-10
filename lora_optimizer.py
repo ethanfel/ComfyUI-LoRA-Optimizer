@@ -2492,14 +2492,20 @@ class _LoRAMergeBase:
     @staticmethod
     @torch.no_grad()
     def _spectral_ownership_split(diffs_with_weights, ownership_threshold=0.5,
-                                   max_rank=16, compute_device=None):
+                                   max_rank=16, energy_threshold=0.9,
+                                   compute_device=None):
         """
-        Split each LoRA diff into spectrally private and shared components.
+        Split each LoRA diff into spectrally private and shared components
+        using soft ownership weighting.
 
         Each LoRA "owns" certain spectral directions (singular value components).
-        A direction is private if no other LoRA shares it (low cross-Gram overlap).
-        Private parts bypass merge averaging; shared parts go through the normal
-        merge pipeline.
+        Ownership is computed bilaterally (both U and V subspaces) using cross-Gram
+        overlap, then converted to a continuous weight via sigmoid. Private
+        components (high ownership) bypass merge averaging; shared components
+        (low ownership) go through the normal merge pipeline.
+
+        Uses energy-adaptive rank: SVD rank per LoRA adapts to capture ≥90%
+        of spectral energy, avoiding wasted compute on noise directions.
 
         Returns (shared_diffs_with_weights, private_addition) where
         private_addition is a tensor to add after merging, or None.
@@ -2517,17 +2523,25 @@ class _LoRAMergeBase:
         rank = min(max_rank, min(original_shape[0], int(torch.tensor(original_shape[1:]).prod().item())))
 
         # Step 1: Per-LoRA truncated SVD
-        Us = []  # U_i: [out, rank]
-        Ss = []  # S_i: [rank]
-        Vs = []  # V_i: [in, rank]
+        Us = []  # U_i: [out, effective_rank_i]
+        Ss = []  # S_i: [effective_rank_i]
+        Vs = []  # V_i: [in, effective_rank_i]
         try:
             for d, _ in diffs_with_weights:
                 mat = d.reshape(original_shape[0], -1).to(device=dev, dtype=torch.float32)
                 q_oversample = min(rank + max(10, rank // 5), min(mat.shape))
                 U, S, V = torch.svd_lowrank(mat, q=q_oversample, niter=4)
-                Us.append(U[:, :rank])
-                Ss.append(S[:rank])
-                Vs.append(V[:, :rank])
+                U, S, V = U[:, :rank], S[:rank], V[:, :rank]
+                # Energy-adaptive rank: keep directions capturing >= energy_threshold
+                total_energy = S.sum()
+                if total_energy > 1e-10:
+                    cumulative = S.cumsum(0) / total_energy
+                    effective_rank = max(1, int((cumulative < energy_threshold).sum().item()) + 1)
+                    effective_rank = min(effective_rank, rank)
+                    U, S, V = U[:, :effective_rank], S[:effective_rank], V[:, :effective_rank]
+                Us.append(U)
+                Ss.append(S)
+                Vs.append(V)
                 del mat
         except (RuntimeError, torch.cuda.OutOfMemoryError):
             return diffs_with_weights, None
@@ -2539,38 +2553,48 @@ class _LoRAMergeBase:
 
         for i in range(n):
             # For each direction k of LoRA i, compute max sharedness across other LoRAs
-            sharedness = torch.zeros(Us[i].shape[1], device=dev)
+            rank_i = Us[i].shape[1]
+            sharedness = torch.zeros(rank_i, device=dev)
             for j in range(n):
                 if j == i:
                     continue
-                # G_ij = U_j^T @ U_i — shape [rank_j, rank_i]
-                G = Us[j].T @ Us[i]
-                # sharedness[k] = ||G[:, k]||^2 = sum of squared projections
-                col_norms_sq = (G * G).sum(dim=0)
-                sharedness = torch.max(sharedness, col_norms_sq)
-                del G, col_norms_sq
+                # Left singular vector overlap: G_U = U_j^T @ U_i
+                G_U = Us[j].T @ Us[i]  # [rank_j, rank_i]
+                u_overlap = (G_U * G_U).sum(dim=0)  # [rank_i]
 
-            # Private directions: sharedness < threshold
-            private_mask = sharedness < ownership_threshold
+                # Right singular vector overlap: G_V = V_j^T @ V_i
+                min_in = min(Vs[j].shape[0], Vs[i].shape[0])
+                G_V = Vs[j][:min_in].T @ Vs[i][:min_in]  # [rank_j, rank_i]
+                v_overlap = (G_V * G_V).sum(dim=0)  # [rank_i]
 
-            if private_mask.any():
+                # Bilateral sharedness: geometric mean of U and V overlap
+                bilateral = torch.sqrt(u_overlap * v_overlap)
+                sharedness = torch.max(sharedness, bilateral)
+                del G_U, G_V, u_overlap, v_overlap, bilateral
+
+            # Soft ownership: continuous weighting based on sharedness
+            # ownership = 1.0 means fully private, 0.0 means fully shared
+            ownership = torch.sigmoid(10.0 * (ownership_threshold - sharedness))
+
+            S_private = Ss[i] * ownership
+            S_shared = Ss[i] * (1.0 - ownership)
+
+            has_any_private = (ownership > 0.01).any()
+            if has_any_private:
                 has_private = True
-                # Reconstruct private component: sum over private directions
-                priv_idx = private_mask.nonzero(as_tuple=True)[0]
-                U_priv = Us[i][:, priv_idx]  # [out, n_priv]
-                S_priv = Ss[i][priv_idx]     # [n_priv]
-                V_priv = Vs[i][:, priv_idx]  # [in, n_priv]
-                d_private = ((U_priv * S_priv.unsqueeze(0)) @ V_priv.T).reshape(original_shape)
-
-                # shared = original - private
+                d_private = ((Us[i] * S_private.unsqueeze(0)) @ Vs[i].T).reshape(original_shape)
+                d_shared = ((Us[i] * S_shared.unsqueeze(0)) @ Vs[i].T).reshape(original_shape)
+                # Add residual: original - SVD reconstruction to preserve non-SVD content
                 d, w = diffs_with_weights[i]
-                d_shared = d.to(device=dev, dtype=torch.float32) - d_private
+                d_full = d.to(device=dev, dtype=torch.float32)
+                residual = d_full - ((Us[i] * Ss[i].unsqueeze(0)) @ Vs[i].T).reshape(original_shape)
+                d_shared = d_shared + residual  # residual goes to shared (conservative)
                 shared_diffs.append((d_shared.to(dtype=d.dtype, device=d.device), w))
                 private_addition.add_(d_private * w)
-                del U_priv, S_priv, V_priv, d_private
+                del d_private, d_shared, residual, d_full
             else:
                 shared_diffs.append(diffs_with_weights[i])
-            del sharedness, private_mask
+            del sharedness, ownership, S_private, S_shared
 
         del Us, Ss, Vs
 

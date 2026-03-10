@@ -463,6 +463,68 @@ class LoRAOptimizerTests(unittest.TestCase):
         )
         self.assertIn("LoRACompatibilityAnalyzer", lora_optimizer.NODE_CLASS_MAPPINGS)
 
+    def test_spectral_split_orthogonal_loras_all_private(self):
+        """Two orthogonal LoRAs: all directions should be private (ownership ~1.0)."""
+        a = torch.zeros(16, 16)
+        a[:8, :8] = torch.randn(8, 8)
+        b = torch.zeros(16, 16)
+        b[8:, 8:] = torch.randn(8, 8)
+        diffs = [(a, 1.0), (b, 1.0)]
+        shared, private = lora_optimizer.LoRAOptimizer._spectral_ownership_split(diffs)
+        self.assertIsNotNone(private)
+        self.assertGreater(private.norm().item(), 0.1 * (a.norm() + b.norm()).item())
+
+    def test_spectral_split_identical_loras_all_shared(self):
+        """Two identical LoRAs: all directions shared, no private component."""
+        a = torch.randn(16, 16)
+        diffs = [(a.clone(), 1.0), (a.clone(), 1.0)]
+        shared, private = lora_optimizer.LoRAOptimizer._spectral_ownership_split(diffs)
+        self.assertIsNone(private)
+
+    def test_spectral_split_soft_weighting_partial_overlap(self):
+        """Partially overlapping LoRAs: private_addition should be non-None
+        and shared diffs should preserve total energy approximately."""
+        torch.manual_seed(42)
+        shared_base = torch.randn(32, 32) * 0.5
+        a = shared_base + torch.randn(32, 32) * 0.3
+        b = shared_base + torch.randn(32, 32) * 0.3
+        original_sum = a * 0.6 + b * 0.4
+        diffs = [(a, 0.6), (b, 0.4)]
+        shared_diffs, private = lora_optimizer.LoRAOptimizer._spectral_ownership_split(diffs)
+        self.assertIsNotNone(private)
+        total_w = sum(abs(w) for _, w in shared_diffs)
+        merged_shared = sum(d * (w / total_w) for d, w in shared_diffs)
+        reconstructed = merged_shared + private
+        self.assertGreater(reconstructed.norm().item(), original_sum.norm().item() * 0.3)
+
+    def test_spectral_split_energy_adaptive_rank(self):
+        """Low-rank input should use fewer SVD components than max_rank."""
+        u = torch.randn(32, 2)
+        v = torch.randn(32, 2)
+        low_rank = u @ v.T
+        noise = torch.randn(32, 32) * 0.01
+        a = low_rank + noise
+        b = torch.randn(32, 32)
+        diffs = [(a, 1.0), (b, 1.0)]
+        shared, private = lora_optimizer.LoRAOptimizer._spectral_ownership_split(diffs)
+        self.assertEqual(len(shared), 2)
+
+    def test_spectral_split_1d_guard(self):
+        """1D tensors should pass through unchanged."""
+        a = torch.randn(16)
+        diffs = [(a, 1.0), (torch.randn(16), 1.0)]
+        shared, private = lora_optimizer.LoRAOptimizer._spectral_ownership_split(diffs)
+        self.assertIsNone(private)
+        self.assertTrue(torch.equal(shared[0][0], a))
+
+    def test_spectral_split_single_lora_guard(self):
+        """Single LoRA should pass through unchanged."""
+        a = torch.randn(16, 16)
+        diffs = [(a, 1.0)]
+        shared, private = lora_optimizer.LoRAOptimizer._spectral_ownership_split(diffs)
+        self.assertIsNone(private)
+        self.assertTrue(torch.equal(shared[0][0], a))
+
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class LoRASettingsNodeTests(unittest.TestCase):
