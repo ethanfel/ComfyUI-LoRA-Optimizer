@@ -1384,6 +1384,10 @@ class _LoRAMergeBase:
             ".alpha",
         ]
         for item in active_loras:
+            if item.get("_precomputed_diffs"):
+                for key in item["lora"]:
+                    all_lora_prefixes.add(key)  # model-space keys are already the "prefix"
+                continue
             for key in item["lora"].keys():
                 for suffix in suffixes:
                     if key.endswith(suffix):
@@ -1424,10 +1428,19 @@ class _LoRAMergeBase:
         on actual model weights rather than raw trainer-specific prefixes.
         """
         grouped = {}
+        # Build reverse lookup: target_key → True for fast virtual-key detection
+        model_target_keys = set(model_keys.values()) if model_keys else set()
+        clip_target_keys = set(clip_keys.values()) if clip_keys else set()
         for prefix in all_lora_prefixes:
             target_key, is_clip = self._resolve_target_key(prefix, model_keys, clip_keys)
             if target_key is None:
-                continue
+                # Virtual LoRA keys are already target keys — map to themselves
+                if prefix in model_target_keys:
+                    target_key, is_clip = prefix, False
+                elif prefix in clip_target_keys:
+                    target_key, is_clip = prefix, True
+                else:
+                    continue
             group_id = self._make_target_group_id(target_key, is_clip)
             entry = grouped.setdefault(group_id, {
                 "target_key": target_key,
@@ -1549,9 +1562,13 @@ class _LoRAMergeBase:
 
             # Virtual LoRAs from sub-merges store pre-computed diffs keyed by target key
             if item.get("_precomputed_diffs"):
-                tkey = target_key[0] if isinstance(target_key, tuple) else target_key
+                tkey = target_key
                 if tkey in item["lora"]:
-                    diff = item["lora"][tkey].float()
+                    raw = item["lora"][tkey]
+                    if isinstance(raw, torch.Tensor):
+                        diff = raw.float()
+                    else:
+                        diff = self._expand_patch_to_diff(raw)
                     try:
                         diff = diff.reshape(target_shape)
                     except RuntimeError:
@@ -3134,6 +3151,7 @@ class _LoRAMergeBase:
                     "conflict_mode": item.get("conflict_mode", "all"),
                     "key_filter": item.get("key_filter", "all"),
                     "metadata": item.get("metadata", {}),
+                    "_precomputed_diffs": item.get("_precomputed_diffs", False),
                 })
 
         else:
@@ -3144,6 +3162,8 @@ class _LoRAMergeBase:
         if len(normalized) > 0:
             arch = "unknown"
             for item in normalized:
+                if item.get("_precomputed_diffs"):
+                    continue  # virtual LoRAs have model-space keys, not LoRA keys
                 detected = self._detect_architecture(item["lora"])
                 if detected != "unknown":
                     arch = detected
@@ -3156,7 +3176,8 @@ class _LoRAMergeBase:
                     logging.info(f"[LoRA Optimizer] Architecture detected: {arch}")
                     logging.info(f"[LoRA Optimizer] Normalizing keys for {len(normalized)} LoRAs...")
                     for item in normalized:
-                        item["lora"] = self._normalize_keys(item["lora"], arch)
+                        if not item.get("_precomputed_diffs"):
+                            item["lora"] = self._normalize_keys(item["lora"], arch)
                 else:
                     logging.info("[LoRA Optimizer] Architecture: unknown (no key normalization applied)")
 
@@ -4042,9 +4063,13 @@ class LoRAOptimizer(_LoRAMergeBase):
         for i, item in enumerate(active_loras):
             # Virtual LoRAs from sub-merges store pre-computed diffs keyed by target key
             if item.get("_precomputed_diffs"):
-                tkey = actual_key if actual_key is not None else (target_key[0] if isinstance(target_key, tuple) else target_key)
+                tkey = target_key
                 if tkey in item["lora"]:
-                    diff = item["lora"][tkey].float()
+                    raw = item["lora"][tkey]
+                    if isinstance(raw, torch.Tensor):
+                        diff = raw.float()
+                    else:
+                        diff = self._expand_patch_to_diff(raw)
                     try:
                         diff = diff.reshape(target_shape)
                     except RuntimeError:
@@ -5482,7 +5507,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "architecture_preset": architecture_preset,
                     "decision_smoothing": decision_smoothing,
                     "smooth_slerp_gate": smooth_slerp_gate,
-                    "cache_patches": cache_patches,
+                    "cache_patches": "disabled",  # sub-merges must not thrash parent cache
                     "free_vram_between_passes": free_vram_between_passes,
                     "vram_budget": vram_budget,
                 }
@@ -6402,10 +6427,19 @@ class LoRAOptimizer(_LoRAMergeBase):
         virtual_lora = {}
 
         for key, patch in model_patches.items():
-            virtual_lora[key] = _LoRAMergeBase._expand_patch_to_diff(patch)
+            # Store raw patch; expansion to dense is deferred to the merge
+            # loop so compressed adapters (LoRAAdapter etc.) don't blow up
+            # memory here.
+            if isinstance(patch, tuple) and patch[0] == "diff":
+                virtual_lora[key] = patch[1][0]  # extract the tensor
+            else:
+                virtual_lora[key] = patch  # tensor or adapter object
 
         for key, patch in clip_patches.items():
-            virtual_lora[key] = _LoRAMergeBase._expand_patch_to_diff(patch)
+            if isinstance(patch, tuple) and patch[0] == "diff":
+                virtual_lora[key] = patch[1][0]
+            else:
+                virtual_lora[key] = patch
 
         # Build label from tree
         def _tree_label(node):
