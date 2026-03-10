@@ -543,6 +543,23 @@ class LoRAOptimizerTests(unittest.TestCase):
         expected_magnitude = (a * 0.5 + b * 0.5).norm()
         self.assertLess(result.norm().item(), expected_magnitude.item() * 2.0)
 
+    def test_spectral_merge_refinement_end_to_end(self):
+        """Spectral refinement through _merge_diffs produces valid output."""
+        torch.manual_seed(99)
+        a = torch.randn(16, 16)
+        b = torch.randn(16, 16)
+        diffs = [(a, 0.7), (b, 0.3)]
+        opt = lora_optimizer.LoRAOptimizer()
+        # Call _merge_diffs with spectral refinement
+        result = opt._merge_diffs(
+            diffs, mode="weighted_average", merge_refinement="spectral",
+            sparsification="disabled", sparsification_density=0.7,
+            compute_device=torch.device("cpu"))
+        self.assertIsNotNone(result)
+        self.assertEqual(result.shape, a.shape)
+        self.assertFalse(torch.isnan(result).any())
+        self.assertFalse(torch.isinf(result).any())
+
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class LoRASettingsNodeTests(unittest.TestCase):
