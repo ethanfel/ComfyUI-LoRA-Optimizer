@@ -1584,6 +1584,8 @@ class _LoRAMergeBase:
                         diff = raw.float()
                     else:
                         diff = self._expand_patch_to_diff(raw)
+                    if device is not None and diff.device != device:
+                        diff = diff.to(device)
                     try:
                         diff = diff.reshape(target_shape)
                     except RuntimeError:
@@ -4088,6 +4090,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                         diff = raw.float()
                     else:
                         diff = self._expand_patch_to_diff(raw)
+                    if device is not None and diff.device != device:
+                        diff = diff.to(device)
                     try:
                         diff = diff.reshape(target_shape)
                     except RuntimeError:
@@ -4214,6 +4218,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                     diff = raw.float()
                 else:
                     diff = self._expand_patch_to_diff(raw)
+                if device is not None and diff.device != device:
+                    diff = diff.to(device)
                 try:
                     diff = diff.reshape(target_shape)
                 except RuntimeError:
