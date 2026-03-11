@@ -3896,23 +3896,25 @@ class LoRAOptimizer(_LoRAMergeBase):
                 }),
                 "merge_refinement": (["none", "refine", "full"], {
                     "default": "none",
-                    "tooltip": "Optional preprocessing steps applied to weight diffs before merging. "
-                               "none: merge as-is, no extra processing. "
-                               "refine: adds direction orthogonalization + selfish weight protection "
-                               "(TALL-masks) to reduce interference between LoRAs (minimal extra compute). "
-                               "full: adds SVD alignment (KnOTS) on top of refine for maximum "
-                               "interference reduction (uses more VRAM for SVD decomposition). "
-                               "Higher levels help most when LoRAs have high conflict; "
-                               "for low-conflict or orthogonal LoRAs, 'none' is usually fine. "
-                               "(Previously: this setting was called 'merge_quality' with values standard/enhanced/maximum.)"
+                    "tooltip": "Optional preprocessing applied to weight diffs before merging — not a quality ladder.\n\n"
+                               "none: merge as-is. Best when LoRAs are low-conflict or orthogonal — adding refinement can hurt by over-processing.\n\n"
+                               "refine: direction orthogonalization + selfish weight protection (TALL-masks). Helps when LoRAs overlap in similar weight regions. Minimal extra compute.\n\n"
+                               "full: adds SVD alignment (KnOTS) on top of refine. Uses more VRAM. Helps high-conflict merges but can over-smooth low-conflict ones.\n\n"
+                               "Try refine first if you see artifacts. Not every merge benefits from higher levels. "
+                               "(Previously: 'merge_quality' with values standard/enhanced/maximum.)"
                 }),
                 "strategy_set": (["full", "no_slerp", "basic"], {
                     "default": "full",
-                    "tooltip": "Which merge strategies the auto-selector can choose from. "
-                               "'full': all strategies available (consensus, SLERP, orthogonal detection). "
-                               "'no_slerp': same detection logic but SLERP is excluded (weighted_average stays as-is). "
-                               "'basic': only TIES vs weighted_average, no advanced strategy selection. "
-                               "(Previously: this setting was called 'behavior_profile' with values v1.2/no_slerp/classic.)"
+                    "tooltip": "Which merge strategies the auto-selector can choose from (per_prefix mode only). "
+                               "Each set is a different toolbox — not a quality ranking.\n\n"
+                               "full: TIES, weighted_average, consensus, SLERP, orthogonal detection. "
+                               "Most options — the optimizer picks the best per layer. Good default.\n\n"
+                               "no_slerp: same as full but SLERP is excluded. Use when SLERP causes unwanted blending "
+                               "(e.g. Z-Image, or when you want sharper separation between LoRA effects).\n\n"
+                               "basic: TIES + weighted_average only. Simpler decision logic — fewer moving parts. "
+                               "Can outperform full when the extra strategies add noise rather than helping. "
+                               "Try if full/no_slerp give inconsistent results.\n\n"
+                               "(Previously: 'behavior_profile' with values v1.2/no_slerp/classic.)"
                 }),
                 "architecture_preset": (["auto", "sd_unet", "dit", "llm"], {
                     "default": "auto",
@@ -6642,7 +6644,11 @@ class LoRAOptimizerSettings:
                 }),
                 "merge_refinement": (["none", "refine", "full"], {
                     "default": "none",
-                    "tooltip": "Extra processing to reduce interference between LoRAs. 'none': fastest, usually fine. 'refine': light cleanup for better quality. 'full': most thorough but slower. Try 'refine' if you see artifacts or color shifts."
+                    "tooltip": "Optional preprocessing to reduce interference between LoRAs.\n\n"
+                               "none: merge as-is. Best when LoRAs are low-conflict or orthogonal — adding refinement can hurt by over-processing.\n\n"
+                               "refine: direction orthogonalization + selfish weight protection (TALL-masks). Helps when LoRAs overlap in similar weight regions.\n\n"
+                               "full: adds SVD alignment (KnOTS) on top of refine. Uses more VRAM. Helps high-conflict merges but can over-smooth low-conflict ones.\n\n"
+                               "Try refine first if you see artifacts. Not every merge benefits from higher levels."
                 }),
                 "sparsification": (["disabled", "dare", "della", "dare_conflict", "della_conflict"], {
                     "default": "disabled",
@@ -6670,7 +6676,10 @@ class LoRAOptimizerSettings:
                 }),
                 "strategy_set": (["full", "no_slerp", "basic"], {
                     "default": "full",
-                    "tooltip": "Which merge methods the optimizer can choose from. 'full' (recommended): all methods available including SLERP blending. 'no_slerp': excludes SLERP. 'basic': only simple averaging."
+                    "tooltip": "Which merge strategies the optimizer can pick from — not a quality ranking, each is a different toolbox.\n\n"
+                               "full: all strategies (TIES, averaging, consensus, SLERP). Good default.\n\n"
+                               "no_slerp: excludes SLERP blending. Use when SLERP causes unwanted smoothing.\n\n"
+                               "basic: TIES + averaging only. Simpler — can work better when extra strategies add noise."
                 }),
             },
             "optional": {
