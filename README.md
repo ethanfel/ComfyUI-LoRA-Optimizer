@@ -548,12 +548,10 @@ The `vram_budget` slider (0.0–1.0) controls what fraction of free VRAM to use 
 
 ---
 
-<details>
-<summary><b>LoRA Pruner</b></summary>
+## LoRA Pruner
 
 Drop-in replacement for ComfyUI's **Load LoRA** node that prunes before applying. Useful for slimming down large LoRAs or surgically removing layers that hurt quality — for example, removing transformer blocks in LTX-Video 2.3 LoRAs that slow down motion.
 
-**Workflow:**
 ```
 Load Checkpoint → MODEL ──► LoRA Pruner ──► MODEL ──► KSampler
                → CLIP  ──► (optional)  ──► CLIP
@@ -561,7 +559,8 @@ Load Checkpoint → MODEL ──► LoRA Pruner ──► MODEL ──► KSampl
                                         ──► STRING (report)
 ```
 
-### Pruning Modes
+<details>
+<summary><b>Pruning Modes</b></summary>
 
 | Mode | What It Does |
 |------|-------------|
@@ -570,7 +569,10 @@ Load Checkpoint → MODEL ──► LoRA Pruner ──► MODEL ──► KSampl
 | **rank** | Keeps all keys but reduces each key's internal rank via SVD. A rank-64 key might become rank-32, preserving the effect everywhere but making it thinner |
 | **block+rank** | First drops the least important blocks, then reduces rank on all surviving keys. Recommended for aggressive pruning |
 
-### Settings
+</details>
+
+<details>
+<summary><b>Settings</b></summary>
 
 | Setting | Default | Effect |
 |---------|---------|--------|
@@ -581,14 +583,20 @@ Load Checkpoint → MODEL ──► LoRA Pruner ──► MODEL ──► KSampl
 | `strength_model` | 1.0 | How strongly to apply the pruned LoRA to the diffusion model |
 | `strength_clip` | 1.0 | How strongly to apply the pruned LoRA to CLIP (only when CLIP is connected) |
 
-### LTX-Video 2.3 Guide
+</details>
+
+<details>
+<summary><b>LTX-Video 2.3 Guide</b></summary>
 
 Certain blocks in LTX-Video LoRAs can slow down motion or add unwanted artifacts. Start with:
 - **block+rank** mode, **20%** drop / **20%** rank reduction
 - If motion is still sluggish, try **30-40%** drop
 - Check the report to see which blocks were dropped and how much rank was removed
 
-### Notes
+</details>
+
+<details>
+<summary><b>Notes</b></summary>
 
 - **LoKr/LoHa keys** are always preserved (exotic format cannot be rank-reduced)
 - **LoCon mid tensors** are handled for scoring but dropped during rank reduction (recompressed as standard LoRA)
@@ -597,6 +605,8 @@ Certain blocks in LTX-Video LoRAs can slow down motion or add unwanted artifacts
 - Scoring uses fast paths: Frobenius via trace identity on [r,r] matrices, spectral norm via QR on [r,r] cores — no dense [out,in] matrix expansion
 
 </details>
+
+---
 
 <details>
 <summary><b>Other Nodes & Workflows</b></summary>
