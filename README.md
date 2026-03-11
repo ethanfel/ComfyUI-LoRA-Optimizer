@@ -91,6 +91,7 @@ Restart ComfyUI. Nodes appear under the `loaders` category.
 | **LoRA AutoTuner** | Sweep 2000+ parameter combos, rank the best configs |
 | **Merge Selector** | Try alternative ranked configs from AutoTuner results |
 | **Compatibility Analyzer** | Check which LoRAs work well together before merging |
+| **LoRA Pruner** | Drop blocks, keys, or rank from a single LoRA — drop-in replacement for Load LoRA |
 | **Save Merged LoRA** | Export the merge as a standalone `.safetensors` file |
 | **Merged LoRA to Hook** | Apply merged LoRA per-conditioning instead of globally |
 | **LoRA Optimizer (Legacy)** | All parameters on one node (superseded by Optimizer + Settings) |
@@ -546,6 +547,56 @@ The `vram_budget` slider (0.0–1.0) controls what fraction of free VRAM to use 
 </details>
 
 ---
+
+<details>
+<summary><b>LoRA Pruner</b></summary>
+
+Drop-in replacement for ComfyUI's **Load LoRA** node that prunes before applying. Useful for slimming down large LoRAs or surgically removing layers that hurt quality — for example, removing transformer blocks in LTX-Video 2.3 LoRAs that slow down motion.
+
+**Workflow:**
+```
+Load Checkpoint → MODEL ──► LoRA Pruner ──► MODEL ──► KSampler
+               → CLIP  ──► (optional)  ──► CLIP
+                                        ──► LORA_DATA ──► Save Merged LoRA (optional)
+                                        ──► STRING (report)
+```
+
+### Pruning Modes
+
+| Mode | What It Does |
+|------|-------------|
+| **block** | Groups keys by transformer block (e.g. `double_blocks.15`) and drops the least important blocks entirely. Good for removing whole layers that contribute little |
+| **key** | Drops individual LoRA key prefixes (e.g. a single attention projection). Finer-grained than block mode |
+| **rank** | Keeps all keys but reduces each key's internal rank via SVD. A rank-64 key might become rank-32, preserving the effect everywhere but making it thinner |
+| **block+rank** | First drops the least important blocks, then reduces rank on all surviving keys. Recommended for aggressive pruning |
+
+### Settings
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `drop_percentage` | 20% | Percentage of blocks or keys to drop (block/key/block+rank modes) |
+| `rank_reduction` | 20% | How much rank to remove from each key (rank/block+rank modes) |
+| `importance_metric` | frobenius_norm | Scoring metric: `frobenius_norm` (total magnitude) or `spectral_norm` (peak directional impact) |
+| `rank_mode` | energy_threshold | `energy_threshold` adapts per key — keys with concentrated spectra get cut more aggressively. `percentage` applies a flat cut everywhere |
+| `strength_model` | 1.0 | How strongly to apply the pruned LoRA to the diffusion model |
+| `strength_clip` | 1.0 | How strongly to apply the pruned LoRA to CLIP (only when CLIP is connected) |
+
+### LTX-Video 2.3 Guide
+
+Certain blocks in LTX-Video LoRAs can slow down motion or add unwanted artifacts. Start with:
+- **block+rank** mode, **20%** drop / **20%** rank reduction
+- If motion is still sluggish, try **30-40%** drop
+- Check the report to see which blocks were dropped and how much rank was removed
+
+### Notes
+
+- **LoKr/LoHa keys** are always preserved (exotic format cannot be rank-reduced)
+- **LoCon mid tensors** are handled for scoring but dropped during rank reduction (recompressed as standard LoRA)
+- **DoRA scale** is preserved for block/key modes, dropped for rank reduction (baked into new factors)
+- The **LORA_DATA** output connects to **Save Merged LoRA** to export the pruned result as a new `.safetensors` file
+- Scoring uses fast paths: Frobenius via trace identity on [r,r] matrices, spectral norm via QR on [r,r] cores — no dense [out,in] matrix expansion
+
+</details>
 
 <details>
 <summary><b>Other Nodes & Workflows</b></summary>
