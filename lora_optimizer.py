@@ -9866,6 +9866,670 @@ class LoRAConflictEditor(_LoRAMergeBase):
         return "\n".join(lines)
 
 
+class LoRAPruner:
+    """
+    Prunes a LoRA by dropping low-importance blocks, keys, or singular values, then applies it.
+    Works as a drop-in replacement for ComfyUI's LoRA Loader — connect MODEL (and optionally CLIP),
+    pick a LoRA, choose how to prune, and get the pruned LoRA applied to your model.
+    Also outputs LORA_DATA for SaveMergedLoRA if you want to export the pruned result.
+    """
+
+    def __init__(self):
+        self.loaded_lora = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {
+                    "tooltip": "The diffusion model to apply the pruned LoRA to."
+                }),
+                "lora_name": (folder_paths.get_filename_list("loras"), {
+                    "tooltip": "The LoRA file to prune. Supports standard LoRA, LoCon, LoKr, and LoHa formats. LoKr/LoHa keys are always preserved."
+                }),
+                "strength_model": ("FLOAT", {
+                    "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,
+                    "tooltip": "How strongly to apply the pruned LoRA to the diffusion model. This value can be negative."
+                }),
+                "strength_clip": ("FLOAT", {
+                    "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,
+                    "tooltip": "How strongly to apply the pruned LoRA to the CLIP model. Only used when a CLIP model is connected."
+                }),
+                "pruning_mode": (["block", "key", "rank", "block+rank"], {
+                    "default": "block",
+                    "tooltip": "How to slim down the LoRA:\n\n"
+                               "block — Groups keys by transformer block (e.g. double_blocks.15) and drops the least important blocks entirely. Good for removing whole layers that contribute little. For video LoRAs like LTX-Video, certain blocks may slow down motion or add unwanted artifacts — this mode lets you surgically remove them.\n\n"
+                               "key — Drops individual LoRA key prefixes (e.g. a single attention projection). Finer-grained than block mode.\n\n"
+                               "rank — Keeps all keys but reduces each key's internal rank via SVD. A rank-64 key might become rank-32, preserving the effect everywhere but making it thinner. The 'rank_mode' setting controls whether this is a flat cut or adaptive per key.\n\n"
+                               "block+rank — Best of both: first drops the least important blocks, then reduces rank on all surviving keys. Recommended for aggressive pruning of video LoRAs (e.g. LTX-Video 2.3) where you want to remove motion-damaging blocks AND slim down what remains."
+                }),
+                "drop_percentage": ("FLOAT", {
+                    "default": 20.0, "min": 0.0, "max": 90.0, "step": 5.0,
+                    "tooltip": "Percentage of blocks or keys to drop (used in block, key, and block+rank modes — ignored in rank-only mode).\n\n"
+                               "20% on a 28-block model drops ~6 blocks. For LTX-Video 2.3 LoRAs: start with 20%, try 30-40% if motion is still sluggish.\n\n"
+                               "Check the report to see which blocks/keys were dropped."
+                }),
+                "rank_reduction": ("FLOAT", {
+                    "default": 20.0, "min": 0.0, "max": 90.0, "step": 5.0,
+                    "tooltip": "How much rank to remove from each key (used in rank and block+rank modes — ignored in block/key-only modes).\n\n"
+                               "percentage mode: Drops this % of singular values from every key uniformly.\n\n"
+                               "energy_threshold mode: Removes this % of energy per key. Each key loses a different number of SVs depending on how concentrated its spectrum is. A key with energy packed in 2 directions might go from rank 64 to rank 4, while a key with spread-out energy might only go from 64 to 50.\n\n"
+                               "For LTX-Video 2.3 LoRAs in block+rank mode: try 20% drop_percentage + 10-20% rank_reduction."
+                }),
+                "importance_metric": (["frobenius_norm", "spectral_norm"], {
+                    "default": "frobenius_norm",
+                    "tooltip": "How to score the importance of each block or key (used in block, key, and block+rank modes — ignored in rank-only mode).\n\n"
+                               "frobenius_norm — Total magnitude of the weight change (sum of all squared elements, then square root). Captures the overall 'size' of the LoRA's effect at that layer. Good default.\n\n"
+                               "spectral_norm — The largest singular value of the weight change. Captures the peak directional impact — how strongly the LoRA pushes in its most dominant direction. Can produce different rankings than frobenius when some keys have a few strong directions vs. many weak ones."
+                }),
+                "rank_mode": (["percentage", "energy_threshold"], {
+                    "default": "energy_threshold",
+                    "tooltip": "How to decide how much rank to cut from each key (only used in rank and block+rank modes).\n\n"
+                               "energy_threshold (recommended) — Adaptively determines rank per key. Keeps the fewest singular values needed to retain (100 - rank_reduction)% of each key's energy (sum of squared singular values). Smart keys that pack their effect into a few strong directions get cut aggressively (e.g. rank 64→4), while keys with spread-out effects keep more rank (e.g. 64→50). This is more principled than a flat cut because it respects each key's spectral structure.\n\n"
+                               "percentage — Flat cut: drops the same rank_reduction% of singular values from every key regardless of structure. Simpler but less efficient — some keys lose too much, others not enough."
+                }),
+            },
+            "optional": {
+                "clip": ("CLIP", {
+                    "tooltip": "Optional CLIP model to apply the pruned LoRA to. If not connected, only the diffusion model is modified."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP", "LORA_DATA", "STRING")
+    RETURN_NAMES = ("model", "clip", "lora_data", "report")
+    OUTPUT_TOOLTIPS = (
+        "The diffusion model with the pruned LoRA applied.",
+        "The CLIP model with the pruned LoRA applied (passthrough if no CLIP input).",
+        "Pruned LoRA data for Save Merged LoRA — export as a new .safetensors file.",
+        "Detailed report showing what was pruned and kept.",
+    )
+    FUNCTION = "prune"
+    CATEGORY = "LoRA Optimizer"
+    DESCRIPTION = ("Prunes a LoRA by dropping low-importance blocks, keys, or singular values, then applies it to your model. "
+                       "Works as a drop-in replacement for the standard LoRA Loader. "
+                       "Four modes: block (drop whole transformer blocks), key (drop individual weight keys), rank (reduce internal rank via SVD), "
+                       "block+rank (drop blocks then reduce rank on survivors). Energy threshold mode adapts rank reduction per key based on spectral structure. "
+                       "Connect to Save Merged LoRA via the lora_data output to export the pruned LoRA as a new file.")
+
+    @staticmethod
+    def _extract_prefixes(lora_dict):
+        """Extract LoRA key prefixes from a raw state dict."""
+        # Note: .alpha excluded — alpha alone doesn't constitute a LoRA key
+        suffixes = [
+            ".lora_up.weight", ".lora_down.weight",
+            "_lora.up.weight", "_lora.down.weight",
+            ".lora_B.weight", ".lora_A.weight",
+            ".lora.up.weight", ".lora.down.weight",
+            ".lokr_w1", ".lokr_w2",
+            ".lokr_w1_a", ".lokr_w1_b",
+            ".lokr_w2_a", ".lokr_w2_b",
+            ".lokr_t2",
+            ".hada_w1_a", ".hada_w1_b",
+            ".hada_w2_a", ".hada_w2_b",
+            ".hada_t1", ".hada_t2",
+        ]
+        prefixes = set()
+        for key in lora_dict.keys():
+            for suffix in suffixes:
+                if key.endswith(suffix):
+                    prefixes.add(key[:-len(suffix)])
+                    break
+        return sorted(prefixes)
+
+    @staticmethod
+    def _get_lora_factors(lora_dict, prefix):
+        """Extract (mat_up, mat_down, alpha, mid) for standard LoRA keys, or None."""
+        formats = [
+            ("{}.lora_up.weight", "{}.lora_down.weight"),
+            ("{}_lora.up.weight", "{}_lora.down.weight"),
+            ("{}.lora_B.weight", "{}.lora_A.weight"),
+            ("{}.lora.up.weight", "{}.lora.down.weight"),
+        ]
+        for up_fmt, down_fmt in formats:
+            up_key = up_fmt.format(prefix)
+            down_key = down_fmt.format(prefix)
+            if up_key in lora_dict and down_key in lora_dict:
+                mat_up = lora_dict[up_key]
+                mat_down = lora_dict[down_key]
+                alpha_key = f"{prefix}.alpha"
+                alpha = lora_dict.get(alpha_key)
+                if alpha is not None:
+                    alpha = alpha.item()
+                else:
+                    alpha = mat_down.shape[0]
+                mid_key = f"{prefix}.lora_mid.weight"
+                mid = lora_dict.get(mid_key)
+                return (mat_up, mat_down, alpha, mid)
+        return None
+
+    @staticmethod
+    def _is_lokr(lora_dict, prefix):
+        p = prefix
+        has_w1 = f"{p}.lokr_w1" in lora_dict or (f"{p}.lokr_w1_a" in lora_dict and f"{p}.lokr_w1_b" in lora_dict)
+        has_w2 = f"{p}.lokr_w2" in lora_dict or (f"{p}.lokr_w2_a" in lora_dict and f"{p}.lokr_w2_b" in lora_dict)
+        return has_w1 and has_w2
+
+    @staticmethod
+    def _is_loha(lora_dict, prefix):
+        p = prefix
+        return (f"{p}.hada_w1_a" in lora_dict and f"{p}.hada_w1_b" in lora_dict
+                and f"{p}.hada_w2_a" in lora_dict and f"{p}.hada_w2_b" in lora_dict)
+
+    @staticmethod
+    def _is_clip_prefix(prefix):
+        return any(prefix.startswith(p) for p in ("lora_te_", "lora_te1_", "lora_te2_", "text_encoder"))
+
+    @staticmethod
+    def _adapter_to_state_dict(lora_data):
+        """Build a state dict from adapter objects in lora_data.
+        Reconstructs lora_up/lora_down/alpha keys from LoRAAdapter, LoKr, and LoHa objects."""
+        state_dict = {}
+        for patches in (lora_data["model_patches"], lora_data["clip_patches"]):
+            for prefix, adapter in patches.items():
+                if isinstance(adapter, LoRAAdapter):
+                    w = adapter.weights
+                    state_dict[f"{prefix}.lora_up.weight"] = w[0]
+                    state_dict[f"{prefix}.lora_down.weight"] = w[1]
+                    if w[2] is not None:
+                        state_dict[f"{prefix}.alpha"] = torch.tensor(float(w[2]))
+                    if len(w) > 3 and w[3] is not None:
+                        state_dict[f"{prefix}.lora_mid.weight"] = w[3]
+                    if len(w) > 4 and w[4] is not None:
+                        state_dict[f"{prefix}.dora_scale"] = w[4]
+                elif isinstance(adapter, LoKrAdapter):
+                    w = adapter.weights
+                    # (w1, w2, alpha, w1a, w1b, w2a, w2b, t2, dora_scale)
+                    for idx, suffix in ((0, ".lokr_w1"), (1, ".lokr_w2"),
+                                        (3, ".lokr_w1_a"), (4, ".lokr_w1_b"),
+                                        (5, ".lokr_w2_a"), (6, ".lokr_w2_b"),
+                                        (7, ".lokr_t2")):
+                        if w[idx] is not None:
+                            state_dict[f"{prefix}{suffix}"] = w[idx]
+                    if w[2] is not None:
+                        state_dict[f"{prefix}.alpha"] = torch.tensor(float(w[2]))
+                    if len(w) > 8 and w[8] is not None:
+                        state_dict[f"{prefix}.dora_scale"] = w[8]
+                elif isinstance(adapter, LoHaAdapter):
+                    w = adapter.weights
+                    # (w1a, w1b, alpha, w2a, w2b, t1, t2, dora_scale)
+                    for idx, suffix in ((0, ".hada_w1_a"), (1, ".hada_w1_b"),
+                                        (3, ".hada_w2_a"), (4, ".hada_w2_b"),
+                                        (5, ".hada_t1"), (6, ".hada_t2")):
+                        if w[idx] is not None:
+                            state_dict[f"{prefix}{suffix}"] = w[idx]
+                    if w[2] is not None:
+                        state_dict[f"{prefix}.alpha"] = torch.tensor(float(w[2]))
+                    if len(w) > 7 and w[7] is not None:
+                        state_dict[f"{prefix}.dora_scale"] = w[7]
+        return state_dict
+
+    @staticmethod
+    def _filter_state_dict(lora_dict, kept_prefixes, suffixes):
+        """Filter a raw state dict to only keys belonging to kept_prefixes."""
+        prefix_set = set(kept_prefixes)
+        pruned = {}
+        for key, tensor in lora_dict.items():
+            for suffix in suffixes:
+                if key.endswith(suffix):
+                    pfx = key[:-len(suffix)]
+                    if pfx in prefix_set:
+                        pruned[key] = tensor
+                    break
+            else:
+                # Also include .alpha keys for kept prefixes
+                if key.endswith(".alpha"):
+                    pfx = key[:-len(".alpha")]
+                    if pfx in prefix_set:
+                        pruned[key] = tensor
+        return pruned
+
+    # Suffix list for _filter_state_dict — all tensor keys that belong to a LoRA prefix.
+    # IMPORTANT: longer suffixes must come before shorter ones that are prefixes of them
+    # (e.g. .lokr_w1_a before .lokr_w1) to avoid false suffix matches.
+    _LORA_SUFFIXES = [
+        ".lora_up.weight", ".lora_down.weight",
+        "_lora.up.weight", "_lora.down.weight",
+        ".lora_B.weight", ".lora_A.weight",
+        ".lora.up.weight", ".lora.down.weight",
+        ".lora_mid.weight", ".dora_scale",
+        ".lokr_w1_a", ".lokr_w1_b",
+        ".lokr_w2_a", ".lokr_w2_b",
+        ".lokr_w1", ".lokr_w2",
+        ".lokr_t2",
+        ".hada_w1_a", ".hada_w1_b",
+        ".hada_w2_a", ".hada_w2_b",
+        ".hada_t1", ".hada_t2",
+    ]
+
+    def _apply_to_model(self, model, clip, pruned_dict, strength_model, strength_clip):
+        """Apply a pruned LoRA state dict to model and optionally clip."""
+        if not pruned_dict or (strength_model == 0 and strength_clip == 0):
+            return (model, clip)
+        model_out, clip_out = comfy.sd.load_lora_for_models(
+            model, clip, pruned_dict, strength_model,
+            strength_clip if clip is not None else 0)
+        if model_out is None:
+            model_out = model
+        if clip_out is None:
+            clip_out = clip
+        return (model_out, clip_out)
+
+    @torch.no_grad()
+    def prune(self, model, lora_name, strength_model, strength_clip,
+              pruning_mode, drop_percentage, rank_reduction, importance_metric,
+              rank_mode="energy_threshold", clip=None):
+        # Load LoRA with caching (same pattern as ComfyUI's LoraLoader)
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora_dict = None
+        if self.loaded_lora is not None:
+            if self.loaded_lora[0] == lora_path:
+                lora_dict = self.loaded_lora[1]
+            else:
+                self.loaded_lora = None
+        if lora_dict is None:
+            lora_dict = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            self.loaded_lora = (lora_path, lora_dict)
+
+        prefixes = self._extract_prefixes(lora_dict)
+        if not prefixes:
+            logging.warning("[LoRA Pruner] No LoRA keys found in file.")
+            return (model, clip, None, "No LoRA keys found in file.")
+
+        # ── Rank-only mode ──
+        if pruning_mode == "rank":
+            lora_data, report = self._prune_rank(lora_name, lora_dict, prefixes, rank_reduction, rank_mode)
+            pruned_dict = self._adapter_to_state_dict(lora_data)
+            model_out, clip_out = self._apply_to_model(model, clip, pruned_dict, strength_model, strength_clip)
+            return (model_out, clip_out, lora_data, report)
+
+        # ── Block / Key mode: score prefixes, partition, keep/drop ──
+        pbar = comfy.utils.ProgressBar(len(prefixes))
+
+        scores = {}
+        skipped_exotic = []
+        has_locon = False
+        for prefix in prefixes:
+            if self._is_lokr(lora_dict, prefix) or self._is_loha(lora_dict, prefix):
+                skipped_exotic.append(prefix)
+                pbar.update(1)
+                continue
+
+            factors = self._get_lora_factors(lora_dict, prefix)
+            if factors is None:
+                pbar.update(1)
+                continue
+
+            mat_up, mat_down, alpha, mid = factors
+            rank = mat_down.shape[0]
+
+            if mid is not None:
+                has_locon = True
+
+            up_2d = mat_up.flatten(1).float()
+            down_2d = mat_down.flatten(1).float()
+            scale = alpha / rank
+
+            if mid is None:
+                if importance_metric == "frobenius_norm":
+                    # Fast: ||up @ down||²_F = trace((up^T up)(down down^T)) on [r,r]
+                    ata = up_2d.T @ up_2d        # [r, r]
+                    bbt = down_2d @ down_2d.T    # [r, r]
+                    score = ((ata * bbt).sum().item() ** 0.5) * abs(scale)
+                else:
+                    # Fast: σ_max(up @ down) = σ_max(R_u @ R_d^T) via QR on [r,r]
+                    _, R_u = torch.linalg.qr(up_2d)
+                    _, R_d = torch.linalg.qr(down_2d.T)
+                    score = torch.linalg.svdvals(R_u @ R_d.T)[0].item() * abs(scale)
+            else:
+                # LoCon: must form dense diff
+                diff = (up_2d @ mid.flatten(1).float() @ down_2d) * scale
+                if importance_metric == "frobenius_norm":
+                    score = diff.norm().item()
+                else:
+                    score = torch.linalg.svdvals(diff)[0].item()
+                del diff
+
+            scores[prefix] = score
+            pbar.update(1)
+
+        comfy.model_management.soft_empty_cache()
+
+        if pruning_mode in ("block", "block+rank"):
+            block_scores = {}
+            block_prefixes = {}
+            for prefix, score in scores.items():
+                block = LoRAOptimizer._extract_block_name(prefix)
+                block_scores[block] = block_scores.get(block, 0.0) + score
+                block_prefixes.setdefault(block, []).append(prefix)
+            exotic_blocks = set()
+            for prefix in skipped_exotic:
+                block = LoRAOptimizer._extract_block_name(prefix)
+                block_prefixes.setdefault(block, []).append(prefix)
+                exotic_blocks.add(block)
+
+            ranked = sorted(block_scores.items(), key=lambda x: (-x[1], x[0]))
+            total = len(ranked)
+            n_drop = int(total * drop_percentage / 100.0)
+            if n_drop == 0 and drop_percentage > 0 and total > 1:
+                n_drop = 1
+
+            kept_blocks = set(b for b, _ in ranked[:total - n_drop])
+            dropped_blocks = set(b for b, _ in ranked[total - n_drop:])
+            kept_blocks.update(exotic_blocks)
+            dropped_blocks -= exotic_blocks
+
+            kept_prefixes = set()
+            dropped_prefixes = set()
+            for block, pfxs in block_prefixes.items():
+                if block in dropped_blocks:
+                    dropped_prefixes.update(pfxs)
+                else:
+                    kept_prefixes.update(pfxs)
+
+            header_parts = f"Mode: {pruning_mode} | Metric: {importance_metric} | Block drop: {drop_percentage}%"
+            if pruning_mode == "block+rank":
+                header_parts += f" | Rank reduction: {rank_reduction}%"
+            report_lines = [f"LoRA Pruner Report — {lora_name}",
+                            header_parts,
+                            "=" * 60,
+                            "── Block Pruning ──"]
+            report_lines.append(f"{'Block':<30} {'Score':>12} {'Status':>10}")
+            report_lines.append("-" * 60)
+            for block, score in ranked:
+                status = "DROPPED" if block in dropped_blocks else "KEPT"
+                exotic_note = " [LoKr/LoHa]" if block in exotic_blocks else ""
+                report_lines.append(f"{block:<30} {score:>12.4f} {status:>10}{exotic_note}")
+            for block in sorted(exotic_blocks - set(b for b, _ in ranked)):
+                report_lines.append(f"{block:<30} {'(exotic)':>12} {'KEPT':>10} [LoKr/LoHa]")
+            report_lines.append("-" * 60)
+            report_lines.append(f"Kept: {len(kept_prefixes)} keys in {len(kept_blocks)} blocks | "
+                                f"Dropped: {len(dropped_prefixes)} keys in {len(dropped_blocks)} blocks")
+
+            # ── Compound: block+rank → do rank reduction on survivors ──
+            if pruning_mode == "block+rank":
+                survivor_prefixes = sorted(kept_prefixes)
+                lora_data, report = self._prune_rank(lora_name, lora_dict, survivor_prefixes,
+                                                     rank_reduction, rank_mode, block_report=report_lines)
+                pruned_dict = self._adapter_to_state_dict(lora_data)
+                model_out, clip_out = self._apply_to_model(model, clip, pruned_dict, strength_model, strength_clip)
+                return (model_out, clip_out, lora_data, report)
+
+        elif pruning_mode == "key":
+            ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+            total = len(ranked)
+            n_drop = int(total * drop_percentage / 100.0)
+            if n_drop == 0 and drop_percentage > 0 and total > 1:
+                n_drop = 1
+
+            kept_prefixes = set(p for p, _ in ranked[:total - n_drop])
+            dropped_prefixes = set(p for p, _ in ranked[total - n_drop:])
+            kept_prefixes.update(skipped_exotic)
+
+            report_lines = [f"LoRA Pruner Report — {lora_name}",
+                            f"Mode: key | Metric: {importance_metric} | Drop: {drop_percentage}%",
+                            "=" * 60]
+            report_lines.append(f"{'Prefix':<50} {'Score':>12} {'Status':>10}")
+            report_lines.append("-" * 75)
+            for prefix, score in ranked:
+                status = "DROPPED" if prefix in dropped_prefixes else "KEPT"
+                clip_tag = " [CLIP]" if self._is_clip_prefix(prefix) else " [MODEL]"
+                report_lines.append(f"{prefix:<50} {score:>12.6f} {status:>10}{clip_tag}")
+            for prefix in skipped_exotic:
+                report_lines.append(f"{prefix:<50} {'(exotic)':>12} {'KEPT':>10} [LoKr/LoHa]")
+            report_lines.append("-" * 75)
+            report_lines.append(f"Kept: {len(kept_prefixes)} | Dropped: {len(dropped_prefixes)}")
+
+        if skipped_exotic:
+            report_lines.append(f"\nNote: {len(skipped_exotic)} LoKr/LoHa keys always kept (exotic format).")
+        if has_locon:
+            report_lines.append("Note: LoCon mid tensors detected. SaveMergedLoRA will drop mid tensors (pre-existing limitation).")
+
+        report = "\n".join(report_lines)
+
+        # Build lora_data output
+        model_patches = {}
+        clip_patches = {}
+        key_map = {}
+        max_rank = 0
+
+        for prefix in kept_prefixes:
+            factors = self._get_lora_factors(lora_dict, prefix)
+            is_clip = self._is_clip_prefix(prefix)
+
+            if factors is not None:
+                mat_up, mat_down, alpha, mid = factors
+                rank = mat_down.shape[0]
+                max_rank = max(max_rank, rank)
+                adapter = LoRAAdapter(set(), (mat_up, mat_down, float(alpha), mid, None, None))
+            elif self._is_lokr(lora_dict, prefix):
+                alpha_val = lora_dict.get(f"{prefix}.alpha")
+                alpha_f = alpha_val.item() if alpha_val is not None else 1.0
+                adapter = LoKrAdapter.load(prefix, lora_dict, alpha_f, None)
+                if adapter is None:
+                    continue
+            elif self._is_loha(lora_dict, prefix):
+                alpha_val = lora_dict.get(f"{prefix}.alpha")
+                alpha_f = alpha_val.item() if alpha_val is not None else 1.0
+                adapter = LoHaAdapter.load(prefix, lora_dict, alpha_f, None)
+                if adapter is None:
+                    continue
+            else:
+                continue
+
+            key_map[prefix] = {"canonical_prefix": prefix, "aliases": [prefix]}
+            if is_clip:
+                clip_patches[prefix] = adapter
+            else:
+                model_patches[prefix] = adapter
+
+        lora_data = {
+            "model_patches": model_patches,
+            "clip_patches": clip_patches,
+            "key_map": key_map,
+            "output_strength": 1.0,
+            "clip_strength": 1.0,
+            "sum_rank": max_rank if max_rank > 0 else 128,
+            "merge_metadata": {
+                "source_loras": [{"name": lora_name, "strength": 1.0}],
+                "mode": "pruned",
+            },
+        }
+
+        logging.info(f"[LoRA Pruner] {lora_name}: kept {len(kept_prefixes)}, dropped {len(dropped_prefixes)} "
+                     f"({pruning_mode} mode, {importance_metric}, {drop_percentage}% drop)")
+
+        # For block/key mode, filter original dict directly (no adapter roundtrip)
+        pruned_dict = self._filter_state_dict(lora_dict, kept_prefixes, self._LORA_SUFFIXES)
+        model_out, clip_out = self._apply_to_model(model, clip, pruned_dict, strength_model, strength_clip)
+        return (model_out, clip_out, lora_data, report)
+
+    @torch.no_grad()
+    def _prune_rank(self, lora_name, lora_dict, prefixes, rank_reduction, rank_mode="energy_threshold", block_report=None):
+        """Rank pruning: reduce each key's rank by dropping least important singular values.
+        rank_mode: 'percentage' = flat % of SVs dropped per key.
+                   'energy_threshold' = adaptively keep SVs until (100-rank_reduction)% energy retained per key.
+        block_report: if provided (from block+rank compound), prepend to report.
+        """
+        pbar = comfy.utils.ProgressBar(len(prefixes))
+
+        model_patches = {}
+        clip_patches = {}
+        key_map = {}
+        max_rank = 0
+
+        if block_report is not None:
+            report_lines = list(block_report)
+            report_lines.append("")
+            report_lines.append("── Rank Reduction (survivors) ──")
+        else:
+            report_lines = [f"LoRA Pruner Report — {lora_name}",
+                            f"Mode: rank | Rank mode: {rank_mode} | Rank reduction: {rank_reduction}%",
+                            "=" * 60]
+        report_lines.append(f"{'Prefix':<50} {'Rank':>6} {'New':>6} {'Energy%':>9}")
+        report_lines.append("-" * 75)
+        has_locon = False
+        skipped_exotic = 0
+        total_original_rank = 0
+        total_new_rank = 0
+        energy_target = (100.0 - rank_reduction) / 100.0  # for energy_threshold mode
+
+        for prefix in prefixes:
+            is_clip = self._is_clip_prefix(prefix)
+
+            # LoKr/LoHa: pass through unchanged
+            if self._is_lokr(lora_dict, prefix) or self._is_loha(lora_dict, prefix):
+                alpha_val = lora_dict.get(f"{prefix}.alpha")
+                alpha_f = alpha_val.item() if alpha_val is not None else 1.0
+                if self._is_lokr(lora_dict, prefix):
+                    adapter = LoKrAdapter.load(prefix, lora_dict, alpha_f, None)
+                else:
+                    adapter = LoHaAdapter.load(prefix, lora_dict, alpha_f, None)
+                if adapter is not None:
+                    key_map[prefix] = {"canonical_prefix": prefix, "aliases": [prefix]}
+                    if is_clip:
+                        clip_patches[prefix] = adapter
+                    else:
+                        model_patches[prefix] = adapter
+                skipped_exotic += 1
+                report_lines.append(f"{prefix:<50} {'—':>6} {'—':>6} {'kept':>9} [LoKr/LoHa]")
+                pbar.update(1)
+                continue
+
+            factors = self._get_lora_factors(lora_dict, prefix)
+            if factors is None:
+                pbar.update(1)
+                continue
+
+            mat_up, mat_down, alpha, mid = factors
+            orig_rank = mat_down.shape[0]
+
+            if mid is not None:
+                has_locon = True
+
+            # SVD via QR factorization of the low-rank factors — avoids dense [out, in] matrix.
+            # For LoCon (mid tensor), falls back to dense path since mid changes the factorization.
+            up_2d = mat_up.flatten(1).float()
+            down_2d = mat_down.flatten(1).float()
+            scale = alpha / orig_rank
+            try:
+                if mid is not None:
+                    # LoCon: must form dense diff
+                    diff = (up_2d @ mid.flatten(1).float() @ down_2d) * scale
+                    U, S, Vh = torch.linalg.svd(diff, full_matrices=False)
+                    del diff
+                else:
+                    # Standard LoRA: SVD(up @ down) via small [r, r] SVD
+                    # QR(up) = Q_u [out,r] @ R_u [r,r], QR(down^T) = Q_d [in,r] @ R_d [r,r]
+                    # SVD(up @ down) = SVD(Q_u @ R_u @ R_d^T @ Q_d^T) → SVD on [r,r] core
+                    Q_u, R_u = torch.linalg.qr(up_2d)          # [out, r], [r, r]
+                    Q_d, R_d = torch.linalg.qr(down_2d.T)      # [in, r], [r, r]
+                    core = (R_u @ R_d.T) * scale                # [r, r]
+                    U_core, S, Vh_core = torch.linalg.svd(core, full_matrices=False)
+                    U = Q_u @ U_core                            # [out, r]
+                    Vh = Vh_core @ Q_d.T                        # [r, in]
+            except Exception:
+                # SVD/QR failed — keep original
+                max_rank = max(max_rank, orig_rank)
+                adapter = LoRAAdapter(set(), (mat_up, mat_down, float(alpha), mid, None, None))
+                key_map[prefix] = {"canonical_prefix": prefix, "aliases": [prefix]}
+                if is_clip:
+                    clip_patches[prefix] = adapter
+                else:
+                    model_patches[prefix] = adapter
+                report_lines.append(f"{prefix:<50} {orig_rank:>6} {orig_rank:>6} {'100.0%':>9} [SVD fail]")
+                pbar.update(1)
+                continue
+
+            # Effective rank: for standard LoRA, S has exactly orig_rank entries (from [r,r] SVD).
+            # For LoCon dense path, S has min(m,n) entries — filter noise.
+            n_sv = len(S)
+            if n_sv > orig_rank:
+                sv_threshold = S[0].item() * 1e-6 if S[0].item() > 0 else 0
+                effective_rank = max(1, int((S > sv_threshold).sum().item()))
+            else:
+                effective_rank = n_sv
+            total_energy = (S[:effective_rank] ** 2).sum().item()
+
+            # Determine new rank based on mode
+            if rank_mode == "energy_threshold" and total_energy > 0:
+                # Keep fewest SVs that retain >= energy_target fraction of total energy
+                cumulative = torch.cumsum(S[:effective_rank] ** 2, dim=0)
+                threshold = energy_target * total_energy
+                # Find first index where cumulative energy >= threshold
+                above = (cumulative >= threshold).nonzero(as_tuple=True)[0]
+                n_keep = max(1, (above[0].item() + 1) if len(above) > 0 else effective_rank)
+            else:
+                # Flat percentage: drop rank_reduction% of effective SVs
+                n_keep = max(1, effective_rank - int(effective_rank * rank_reduction / 100.0))
+
+            # Energy retained
+            kept_energy = (S[:n_keep] ** 2).sum().item()
+            energy_pct = (kept_energy / total_energy * 100.0) if total_energy > 0 else 100.0
+
+            # Rebuild as truncated low-rank: new_up = U[:, :k] * sqrt(S[:k]), new_down = sqrt(S[:k]) * Vh[:k, :]
+            sqrt_s = S[:n_keep].sqrt()
+            new_up = (U[:, :n_keep] * sqrt_s.unsqueeze(0))  # [out, k]
+            new_down = (sqrt_s.unsqueeze(1) * Vh[:n_keep, :])  # [k, in]
+
+            # Restore original shape for conv weights
+            if mat_up.dim() > 2:
+                new_up = new_up.reshape(mat_up.shape[0], n_keep, *mat_up.shape[2:])
+            if mat_down.dim() > 2:
+                new_down = new_down.reshape(n_keep, *mat_down.shape[1:])
+
+            # Store with alpha = new_rank (so alpha/rank = 1.0, strength already baked into factors)
+            new_alpha = float(n_keep)
+            adapter = LoRAAdapter(set(), (new_up.to(mat_up.dtype), new_down.to(mat_down.dtype),
+                                          new_alpha, None, None, None))
+            max_rank = max(max_rank, n_keep)
+            total_original_rank += orig_rank
+            total_new_rank += n_keep
+
+            key_map[prefix] = {"canonical_prefix": prefix, "aliases": [prefix]}
+            if is_clip:
+                clip_patches[prefix] = adapter
+            else:
+                model_patches[prefix] = adapter
+
+            clip_tag = " [CLIP]" if is_clip else ""
+            eff_note = f" (eff:{effective_rank})" if effective_rank < orig_rank else ""
+            report_lines.append(f"{prefix:<50} {orig_rank:>6} {n_keep:>6} {energy_pct:>8.1f}%{clip_tag}{eff_note}")
+            del U, S, Vh
+            pbar.update(1)
+
+        comfy.model_management.soft_empty_cache()
+
+        report_lines.append("-" * 75)
+        report_lines.append(f"Total rank: {total_original_rank} -> {total_new_rank} "
+                            f"({total_new_rank / total_original_rank * 100:.0f}% of original)"
+                            if total_original_rank > 0 else "No standard LoRA keys found.")
+        if skipped_exotic:
+            report_lines.append(f"\nNote: {skipped_exotic} LoKr/LoHa keys passed through unchanged.")
+        if has_locon:
+            report_lines.append("Note: LoCon mid tensors dropped during rank reduction (recompressed as standard LoRA).")
+
+        report = "\n".join(report_lines)
+
+        lora_data = {
+            "model_patches": model_patches,
+            "clip_patches": clip_patches,
+            "key_map": key_map,
+            "output_strength": 1.0,
+            "clip_strength": 1.0,
+            "sum_rank": max_rank if max_rank > 0 else 128,
+            "merge_metadata": {
+                "source_loras": [{"name": lora_name, "strength": 1.0}],
+                "mode": "pruned_rank",
+            },
+        }
+
+        logging.info(f"[LoRA Pruner] {lora_name}: rank reduced {total_original_rank} -> {total_new_rank} "
+                     f"({rank_reduction}% reduction)")
+
+        return (lora_data, report)
+
+
 class LoRAMetadataReader:
     """
     Passthrough node that reads embedded metadata from LoRAs in a stack.
@@ -9987,6 +10651,7 @@ NODE_CLASS_MAPPINGS = {
     "LoRAAutoTunerSettings": LoRAAutoTunerSettings,
     "LoRAMetadataReader": LoRAMetadataReader,
     "LoRAMergeFormula": LoRAMergeFormula,
+    "LoRAPruner": LoRAPruner,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -10010,4 +10675,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoRAAutoTunerSettings": "LoRA AutoTuner Settings",
     "LoRAMetadataReader": "LoRA Metadata Reader",
     "LoRAMergeFormula": "LoRA Merge Formula",
+    "LoRAPruner": "LoRA Pruner",
 }
