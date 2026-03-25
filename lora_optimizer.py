@@ -40,6 +40,35 @@ except Exception:
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+# --- Triton SVD kernel (optional) ---
+try:
+    _kernel_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel.py")
+    _kernel_spec = importlib.util.spec_from_file_location("lora_optimizer_kernel", _kernel_path)
+    _kernel_mod = importlib.util.module_from_spec(_kernel_spec)
+    _kernel_spec.loader.exec_module(_kernel_mod)
+    _batched_svd = _kernel_mod.batched_svd
+    _HAS_SVD_KERNEL = True
+    _HAS_TRITON = _kernel_mod.HAS_TRITON
+    logging.info(f"[LoRA Optimizer] SVD kernel loaded (Triton={_HAS_TRITON})")
+except Exception:
+    _batched_svd = None
+    _HAS_SVD_KERNEL = False
+    _HAS_TRITON = False
+
+
+def _triton_svdvals(mat2d: torch.Tensor, n_sv: int) -> torch.Tensor:
+    """Single 2D matrix → singular values, using kernel when M >= N and kernel available."""
+    if (_batched_svd is not None
+            and mat2d.dim() == 2
+            and mat2d.shape[0] >= mat2d.shape[1]):
+        try:
+            _, s, _ = _batched_svd(mat2d.unsqueeze(0))
+            return s.squeeze(0)[:n_sv]
+        except Exception:
+            pass
+    return torch.linalg.svdvals(mat2d)[:n_sv]
+
+
 TUNER_DATA_DIR = os.path.join(folder_paths.models_dir, "tuner_data")
 os.makedirs(TUNER_DATA_DIR, exist_ok=True)
 folder_paths.add_model_folder_path("tuner_data", TUNER_DATA_DIR)
@@ -2704,7 +2733,8 @@ class _LoRAMergeBase:
         rank = max(initial_rank, 64)
         for sample in samples:
             mat = sample.reshape(sample.shape[0], -1).float()
-            singular_values = torch.linalg.svdvals(mat)
+            mat_svd = mat if mat.shape[0] >= mat.shape[1] else mat.T
+            singular_values = _triton_svdvals(mat_svd, n_sv=min(mat.shape))
             total_sq = (singular_values ** 2).sum().item()
             if total_sq == 0:
                 continue
@@ -3576,6 +3606,15 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                     sparsity = (sampled.abs() < threshold).float().mean().item()
                     sparsities.append(sparsity)
                 del sampled
+                # Effective rank via thin SVD on mat_up [out, rank] — kernel's sweet spot
+                if compute_svd and rank > 0 and rank <= 64 and up_flat.shape[0] >= up_flat.shape[1]:
+                    try:
+                        s_up = _triton_svdvals(up_flat, n_sv=rank)
+                        s_norm = s_up / (s_up.sum() + 1e-10)
+                        entropy = -(s_norm * (s_norm + 1e-10).log()).sum().item()
+                        effective_ranks.append(min(math.exp(entropy), float(rank)))
+                    except Exception:
+                        pass
             continue
         else:
             continue
@@ -3595,10 +3634,12 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
         # Effective rank via spectral analysis (optional, expensive)
         if compute_svd and t.dim() == 2 and min(t.shape) > 1:
             try:
-                s = torch.linalg.svdvals(t)[:min(min(t.shape), 64)]
+                thin_dim = min(t.shape)
+                t_svd = t if t.shape[0] >= t.shape[1] else t.T
+                s = _triton_svdvals(t_svd, n_sv=min(thin_dim, 64))
                 s_norm = s / (s.sum() + 1e-10)
                 entropy = -(s_norm * (s_norm + 1e-10).log()).sum().item()
-                eff_rank = min(math.exp(entropy), min(t.shape))
+                eff_rank = min(math.exp(entropy), thin_dim)
                 effective_ranks.append(eff_rank)
             except Exception:
                 pass
