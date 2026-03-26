@@ -85,7 +85,7 @@ folder_paths.add_model_folder_path("tuner_data", TUNER_DATA_DIR)
 AUTOTUNER_MEMORY_DIR = os.path.join(folder_paths.models_dir, "autotuner_memory")
 os.makedirs(AUTOTUNER_MEMORY_DIR, exist_ok=True)
 AUTOTUNER_MEMORY_VERSION = 1
-AUTOTUNER_ALGO_VERSION = "1.4.5"  # Bump when scoring/analysis logic changes
+AUTOTUNER_ALGO_VERSION = "1.5.0"  # Bump when scoring/analysis logic changes
 
 
 
