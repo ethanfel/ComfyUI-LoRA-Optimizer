@@ -269,6 +269,38 @@ function applyLoraFilter(node, baseModel, fullLoraList, loraBaseModelMap) {
     app.canvas?.setDirty?.(true, true);
 }
 
+// --- LoRA name display: show filename only, strip directory path ---
+
+function patchLoraDisplayValue(widget) {
+    if (!widget || widget._loraDisplayPatched) return;
+    widget._loraDisplayPatched = true;
+
+    // Override _displayValue getter to show filename without path
+    const proto = Object.getPrototypeOf(widget);
+    const desc = Object.getOwnPropertyDescriptor(proto, "_displayValue")
+        || Object.getOwnPropertyDescriptor(widget, "_displayValue");
+
+    Object.defineProperty(widget, "_displayValue", {
+        configurable: true,
+        enumerable: true,
+        get() {
+            const fullVal = desc?.get ? desc.get.call(widget) : widget.value;
+            if (!fullVal || typeof fullVal !== "string") return fullVal;
+            // Strip directory path, show filename only
+            const filename = fullVal.split("/").pop() || fullVal;
+            return filename.split("\\").pop() || filename;
+        },
+    });
+}
+
+function patchLoraWidgets(node) {
+    for (const w of node.widgets || []) {
+        if (w.type === "combo" && /^lora_name/.test(w.name)) {
+            patchLoraDisplayValue(w);
+        }
+    }
+}
+
 // --- Node Registration ---
 
 app.registerExtension({
@@ -293,7 +325,17 @@ app.registerExtension({
             updateVisibility(node);
             // Initialize base model filter after visibility is set
             initBaseModelFilter(node);
+            // Patch LoRA combo display to show filename only
+            patchLoraWidgets(node);
         }, 100);
+    },
+});
+
+app.registerExtension({
+    name: "LoRAOptimizer.LoRAStack",
+    nodeCreated(node) {
+        if (node.comfyClass !== "LoRAStack") return;
+        setTimeout(() => patchLoraWidgets(node), 100);
     },
 });
 
