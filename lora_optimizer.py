@@ -7507,7 +7507,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             f"|top_n={top_n}|nk={normalize_keys}|ss={scoring_svd}|sls={scoring_lora_svd}"
             f"|ap={architecture_preset}|vb={vram_budget}"
             f"|spd={scoring_speed}|mid={id(model)}|asf={auto_strength_floor}|ds={decision_smoothing}|eh={evaluator_hash}"
-            f"|sel={selection}".encode()
+            f"|mm={memory_mode}|sel={selection}".encode()
         ).hexdigest()[:16]
         if cache_patches == "enabled" and hasattr(self, '_autotuner_cache') and at_cache_key in self._autotuner_cache:
             cached_result, cached_mode = self._autotuner_cache[at_cache_key]
