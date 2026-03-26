@@ -222,7 +222,8 @@ try:
     HAS_TRITON = True
 
 except ImportError:
-    pass
+    import logging
+    logging.info("[SVD Kernel] Triton not available — fused N=2/N=3 kernels disabled, using PyTorch fallback")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
