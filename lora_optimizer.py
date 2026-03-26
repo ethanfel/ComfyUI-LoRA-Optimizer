@@ -57,15 +57,9 @@ except Exception:
 
 
 def _triton_svdvals(mat2d: torch.Tensor, n_sv: int) -> torch.Tensor:
-    """Single 2D matrix → singular values, using kernel when M >= N and kernel available."""
-    if (_batched_svd is not None
-            and mat2d.dim() == 2
-            and mat2d.shape[0] >= mat2d.shape[1]):
-        try:
-            _, s, _ = _batched_svd(mat2d.unsqueeze(0))
-            return s.squeeze(0)[:n_sv]
-        except Exception:
-            pass
+    """Single 2D matrix → singular values (descending, first n_sv).
+    The batched kernel requires B>>1 to amortise overhead; for single matrices
+    torch.linalg.svdvals (values only, no U/Vh) is faster."""
     return torch.linalg.svdvals(mat2d)[:n_sv]
 
 
@@ -3606,15 +3600,16 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                     sparsity = (sampled.abs() < threshold).float().mean().item()
                     sparsities.append(sparsity)
                 del sampled
-                # Effective rank via thin SVD on up_flat — for conv layers shape is [out, rank*k*k]
-                # n_sv must be min(up_flat.shape) to capture the full spectrum; for conv layers
-                # up_flat[:,1] = rank*k*k so using n_sv=rank would give a biased-low estimate.
-                # Guard on rank (not _n_sv) to keep the original performance bound; cap effective
-                # rank at rank since the LoRA product up@down has rank <= rank regardless of up_flat shape.
-                _n_sv = min(up_flat.shape)
+                # Effective rank via Gram+eigvalsh — correct for both linear and conv LoRA.
+                # For conv layers up_flat is [out, rank*k*k]; using n_sv=rank would miss most
+                # of the spectrum. Gram+eigvalsh gives all singular values cheaply: no U/Vh
+                # computed, so it's faster than svdvals or the B=1 kernel path.
+                # Guard on rank (performance bound); cap at rank (product rank ≤ rank).
                 if compute_svd and rank > 0 and rank <= 64 and up_flat.shape[0] >= up_flat.shape[1]:
                     try:
-                        s_up = _triton_svdvals(up_flat, n_sv=_n_sv)
+                        G = up_flat.T @ up_flat
+                        eigs = torch.linalg.eigvalsh(G).flip(-1).clamp(min=0)
+                        s_up = eigs.sqrt()
                         s_norm = s_up / (s_up.sum() + 1e-10)
                         entropy = -(s_norm * (s_norm + 1e-10).log()).sum().item()
                         effective_ranks.append(min(math.exp(entropy), float(rank)))
