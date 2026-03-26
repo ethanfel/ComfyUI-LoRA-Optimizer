@@ -3714,29 +3714,31 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
         if tensor is None:
             continue
 
-        t = tensor.float()
+        # Compute norm and sparsity without fp32 copy for large tensors
         if score_device is not None:
-            t = t.to(score_device)
+            tensor = tensor.to(score_device)
 
-        # Frobenius norm
-        fro_norm = t.norm().item()
+        # Frobenius norm (works on any dtype)
+        fro_norm = tensor.float().norm().item() if tensor.dtype != torch.float32 else tensor.norm().item()
         norms.append(fro_norm)
         importance_values.append(fro_norm)
 
         # Effective rank via spectral analysis (optional, expensive)
-        if compute_svd and t.dim() == 2 and min(t.shape) > 1:
+        if compute_svd and tensor.dim() == 2 and min(tensor.shape) > 1:
             try:
-                thin_dim = min(t.shape)
+                thin_dim = min(tensor.shape)
+                t = tensor.float()
                 if thin_dim <= 32:
                     # Small enough for direct SVD (Triton-accelerated)
                     s = _triton_svdvals(t, n_sv=min(thin_dim, 64))
                 else:
                     # Large tensor: use Gram matrix + eigvalsh to avoid
                     # full SVD memory allocation (critical for video models)
-                    if t.shape[0] < t.shape[1]:
+                    if t.shape[0] <= t.shape[1]:
                         gram = torch.mm(t, t.T)
                     else:
                         gram = torch.mm(t.T, t)
+                    del t
                     eigs = torch.linalg.eigvalsh(gram).flip(-1).clamp(min=0)
                     s = eigs.sqrt()
                     del gram, eigs
@@ -3744,13 +3746,14 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                 entropy = -(s_norm * (s_norm + 1e-10).log()).sum().item()
                 eff_rank = min(math.exp(entropy), thin_dim)
                 effective_ranks.append(eff_rank)
+                del s
             except Exception:
                 pass
 
         # Sparsity
-        threshold = t.abs().max().item() * 0.01
+        threshold = tensor.abs().max().item() * 0.01
         if threshold > 0:
-            sparsity = (t.abs() < threshold).float().mean().item()
+            sparsity = (tensor.abs() < threshold).float().mean().item()
             sparsities.append(sparsity)
 
     # Batched effective-rank from deferred gram matrices.
