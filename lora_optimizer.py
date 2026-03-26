@@ -54,8 +54,7 @@ except Exception as e:
     _batched_svd = None
     _HAS_SVD_KERNEL = False
     _HAS_TRITON = False
-    _kernel_path_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel.py")
-    if os.path.exists(_kernel_path_local):
+    if os.path.exists(_kernel_path):
         logging.warning(f"[LoRA Optimizer] kernel.py found but failed to load: {e}")
 
 
@@ -63,7 +62,7 @@ def _triton_svdvals(mat2d: torch.Tensor, n_sv: int) -> torch.Tensor:
     """Single 2D matrix → singular values, using kernel when available.
     Handles transpose internally — callers can pass any 2D tensor."""
     if mat2d.dim() != 2:
-        return torch.linalg.svdvals(mat2d)[:n_sv]
+        return torch.linalg.svdvals(mat2d)[..., :n_sv]
     m, n = mat2d.shape
     if m < n:
         mat2d = mat2d.T
