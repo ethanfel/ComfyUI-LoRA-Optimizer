@@ -3529,6 +3529,7 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
     importance_values = []
     effective_ranks = []
     sparsities = []
+    _svd_tasks = []  # (gram_up [rank,rank], rank_int) — batched after loop
 
     all_patches = (
         [(False, key, patch) for key, patch in model_patches.items()] +
@@ -3612,15 +3613,11 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                     sparsity = (sampled.abs() < threshold).float().mean().item()
                     sparsities.append(sparsity)
                 del sampled
-                # Effective rank via thin SVD on mat_up [out, rank] — kernel's sweet spot
-                if lora_svd and compute_svd and rank > 0 and rank <= 32:
-                    try:
-                        s_up = _triton_svdvals(up_flat, n_sv=rank)
-                        s_norm = s_up / (s_up.sum() + 1e-10)
-                        entropy = -(s_norm * (s_norm + 1e-10).log()).sum().item()
-                        effective_ranks.append(min(math.exp(entropy), float(rank)))
-                    except Exception:
-                        pass
+                # Defer effective-rank SVD to batched post-loop computation.
+                # gram_up is [rank, rank] — tiny; batch all same-rank grams
+                # into a single eigvalsh call instead of 240 individual svdvals.
+                if lora_svd and compute_svd and rank > 0 and rank <= 64:
+                    _svd_tasks.append((gram_up, rank))
             continue
         else:
             continue
@@ -3654,6 +3651,27 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
         if threshold > 0:
             sparsity = (t.abs() < threshold).float().mean().item()
             sparsities.append(sparsity)
+
+    # Batched effective-rank from deferred gram matrices.
+    # Group by rank, stack, single eigvalsh per group.
+    if _svd_tasks:
+        from collections import defaultdict
+        _groups = defaultdict(list)
+        for _g, _r in _svd_tasks:
+            _groups[_g.shape[0]].append((_g, _r))
+        for _items in _groups.values():
+            try:
+                _G = torch.stack([g for g, _ in _items])
+                _eigs = torch.linalg.eigvalsh(_G).flip(-1).clamp(min=0)
+                _S = _eigs.sqrt()
+                for _i, (_, _r) in enumerate(_items):
+                    _s = _S[_i]
+                    _s_norm = _s / (_s.sum() + 1e-10)
+                    _ent = -(_s_norm * (_s_norm + 1e-10).log()).sum().item()
+                    effective_ranks.append(min(math.exp(_ent), float(_r)))
+            except Exception:
+                pass
+        del _svd_tasks
 
     metrics = {}
 
