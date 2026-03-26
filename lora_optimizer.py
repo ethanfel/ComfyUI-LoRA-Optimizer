@@ -48,11 +48,13 @@ try:
     _kernel_mod = importlib.util.module_from_spec(_kernel_spec)
     _kernel_spec.loader.exec_module(_kernel_mod)
     _batched_svd = _kernel_mod.batched_svd
+    _batched_procrustes = _kernel_mod.batched_procrustes
     _HAS_SVD_KERNEL = True
     _HAS_TRITON = _kernel_mod.HAS_TRITON
     logging.info(f"[LoRA Optimizer] SVD kernel loaded (Triton={_HAS_TRITON})")
 except Exception as e:
     _batched_svd = None
+    _batched_procrustes = None
     _HAS_SVD_KERNEL = False
     _HAS_TRITON = False
     if _kernel_path and os.path.exists(_kernel_path):
@@ -2676,6 +2678,69 @@ class _LoRAMergeBase:
 
     @staticmethod
     @torch.no_grad()
+    def _procrustes_align(diffs_with_weights, compute_device=None, svd_device=None):
+        """
+        Procrustes alignment: rotate each LoRA diff toward the weighted-mean
+        reference via optimal rotation. Uses batched_procrustes from kernel.py
+        with whiten=False so Frobenius norms are preserved (pure rotation).
+
+        Treats each diff as (n_samples=out_dim, N=in_dim): aligns input-space
+        directions. Batches all diffs into a single (B, out_dim, in_dim) call.
+        """
+        if _batched_procrustes is None:
+            return diffs_with_weights
+        if len(diffs_with_weights) < 2:
+            return diffs_with_weights
+
+        ref = diffs_with_weights[0][0]
+        if ref.dim() < 2 or min(ref.shape) < 2:
+            return diffs_with_weights
+
+        n = len(diffs_with_weights)
+        out_dim = ref.shape[0]
+        in_dim = ref.reshape(out_dim, -1).shape[1]
+        original_shape = ref.shape
+        original_dtype = ref.dtype
+
+        dev = svd_device if svd_device is not None else (compute_device or ref.device)
+        output_device = compute_device if compute_device is not None else ref.device
+
+        # Weighted mean reference
+        total_w = sum(abs(w) for _, w in diffs_with_weights)
+        if total_w < 1e-12:
+            return diffs_with_weights
+        ref_mat = sum(
+            d.reshape(out_dim, in_dim).to(device=dev, dtype=torch.float32) * (abs(w) / total_w)
+            for d, w in diffs_with_weights
+        )
+
+        source_batch = torch.stack([
+            d.reshape(out_dim, in_dim).to(device=dev, dtype=torch.float32)
+            for d, _ in diffs_with_weights
+        ], dim=0)
+        target_batch = ref_mat.unsqueeze(0).expand(n, -1, -1)
+
+        try:
+            aligned_batch, _ = _batched_procrustes(
+                source_batch, target_batch, whiten=False)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            logging.warning(f"[LoRA Optimizer] Procrustes align failed ({e}), skipping")
+            del source_batch, target_batch, ref_mat
+            return diffs_with_weights
+        del source_batch, target_batch, ref_mat
+
+        result = []
+        for i, (_, w) in enumerate(diffs_with_weights):
+            aligned_diff = aligned_batch[i].reshape(original_shape)
+            if aligned_diff.device != output_device:
+                aligned_diff = aligned_diff.to(output_device)
+            result.append((aligned_diff.to(dtype=original_dtype), w))
+        del aligned_batch
+
+        return result
+
+    @staticmethod
+    @torch.no_grad()
     def _compress_to_lowrank(diff, rank, svd_device=None, output_dtype=None):
         """
         Re-compress a full-rank diff tensor to low-rank via truncated SVD.
@@ -2848,8 +2913,12 @@ class _LoRAMergeBase:
             if merge_refinement == "full":
                 first = diffs_with_weights[0][0]
                 if first.dim() >= 2 and min(first.shape) >= 2:
-                    diffs_with_weights = self._knots_align(
-                        diffs_with_weights, compute_device=dev, svd_device=dev)
+                    if _batched_procrustes is not None:
+                        diffs_with_weights = self._procrustes_align(
+                            diffs_with_weights, compute_device=dev, svd_device=dev)
+                    else:
+                        diffs_with_weights = self._knots_align(
+                            diffs_with_weights, compute_device=dev, svd_device=dev)
 
         if mode == "weighted_average":
             result = torch.zeros(ref_diff.shape, dtype=torch.float32, device=dev)
@@ -3109,8 +3178,12 @@ class _LoRAMergeBase:
                 if merge_refinement == "full":
                     first = trimmed_pairs[0][0]
                     if first.dim() >= 2 and min(first.shape) >= 2:
-                        trimmed_pairs = self._knots_align(
-                            trimmed_pairs, compute_device=dev, svd_device=dev)
+                        if _batched_procrustes is not None:
+                            trimmed_pairs = self._procrustes_align(
+                                trimmed_pairs, compute_device=dev, svd_device=dev)
+                        else:
+                            trimmed_pairs = self._knots_align(
+                                trimmed_pairs, compute_device=dev, svd_device=dev)
                 trimmed = [d for d, _ in trimmed_pairs]
                 abs_weights = [w for _, w in trimmed_pairs]
                 del trimmed_pairs
