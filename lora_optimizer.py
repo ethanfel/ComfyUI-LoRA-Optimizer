@@ -3513,7 +3513,7 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
 
 
 def _score_merge_result(model_patches, clip_patches, compute_svd=True,
-                        score_device=None, arch_preset=None):
+                        score_device=None, arch_preset=None, lora_svd=False):
     """
     Score an actual merge result by measuring output quality metrics.
     Returns dict with individual metrics and composite score in [0, 1].
@@ -3613,7 +3613,7 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                     sparsities.append(sparsity)
                 del sampled
                 # Effective rank via thin SVD on mat_up [out, rank] — kernel's sweet spot
-                if compute_svd and rank > 0 and rank <= 32:
+                if lora_svd and compute_svd and rank > 0 and rank <= 32:
                     try:
                         s_up = _triton_svdvals(up_flat, n_sv=rank)
                         s_norm = s_up / (s_up.sum() + 1e-10)
@@ -6793,6 +6793,10 @@ class LoRAAutoTunerSettings:
                     "default": "disabled",
                     "tooltip": "Uses a more thorough (but slower) scoring method to rank configurations. Usually not needed — enable if the default ranking seems off."
                 }),
+                "scoring_lora_svd": (["disabled", "enabled"], {
+                    "default": "disabled",
+                    "tooltip": "Experimental: compute effective rank on LoRA factor matrices during scoring. Changes how configs are ranked. Enable to compare."
+                }),
                 "scoring_device": (["cpu", "gpu"], {
                     "default": "gpu",
                     "tooltip": "Where to run scoring math. GPU is much faster, especially with scoring_svd enabled."
@@ -6849,8 +6853,8 @@ class LoRAAutoTunerSettings:
         "Connect to the 'settings' input on the LoRA Optimizer node."
     )
 
-    def build_settings(self, top_n, scoring_svd, scoring_device, scoring_speed,
-                       scoring_formula,
+    def build_settings(self, top_n, scoring_svd, scoring_lora_svd, scoring_device,
+                       scoring_speed, scoring_formula,
                        diff_cache_mode, diff_cache_ram_pct, record_dataset,
                        memory_mode="disabled", selection=1,
                        merge_settings=None, evaluator=None):
@@ -6859,6 +6863,7 @@ class LoRAAutoTunerSettings:
             "mode": "autotuner",
             "top_n": top_n,
             "scoring_svd": scoring_svd,
+            "scoring_lora_svd": scoring_lora_svd,
             "scoring_device": scoring_device,
             "scoring_speed": scoring_speed,
             "scoring_formula": scoring_formula,
@@ -6993,6 +6998,7 @@ class LoRAOptimizerSimple(LoRAOptimizer):
                     clip=clip, clip_strength_multiplier=clip_strength_multiplier,
                     top_n=settings["top_n"],
                     scoring_svd=settings["scoring_svd"],
+                    scoring_lora_svd=settings.get("scoring_lora_svd", "disabled"),
                     scoring_device=settings["scoring_device"],
                     scoring_speed=settings["scoring_speed"],
                     scoring_formula=settings.get("scoring_formula", "v2"),
@@ -7121,6 +7127,10 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "scoring_svd": (["disabled", "enabled"], {
                     "default": "disabled",
                     "tooltip": "Enable SVD-based effective rank scoring for candidates. More thorough but much slower on large models. Skipped for orthogonal LoRAs (near-zero cosine similarity) where it does not improve ranking accuracy."
+                }),
+                "scoring_lora_svd": (["disabled", "enabled"], {
+                    "default": "disabled",
+                    "tooltip": "Experimental: compute effective rank on LoRA factor matrices during scoring. Changes how configs are ranked. Enable to compare."
                 }),
                 "scoring_device": (["cpu", "gpu"], {
                     "default": "gpu",
@@ -7323,7 +7333,8 @@ class LoRAAutoTuner(LoRAOptimizer):
 
     def auto_tune(self, model, lora_stack, output_strength, clip=None,
                   clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
-                  scoring_svd="disabled", scoring_device="gpu",
+                  scoring_svd="disabled", scoring_lora_svd="disabled",
+                  scoring_device="gpu",
                   architecture_preset="auto", auto_strength_floor=-1.0, evaluator=None,
                   record_dataset="disabled",
                   cache_patches="enabled",
@@ -7382,6 +7393,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "top_n": top_n,
                     "normalize_keys": normalize_keys,
                     "scoring_svd": scoring_svd,
+                    "scoring_lora_svd": scoring_lora_svd,
                     "scoring_device": scoring_device,
                     "architecture_preset": preset_key,
                     "auto_strength_floor": auto_strength_floor,
@@ -7412,6 +7424,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                         top_n=top_n,
                         normalize_keys="disabled",
                         scoring_svd=scoring_svd,
+                        scoring_lora_svd=scoring_lora_svd,
                         scoring_device=scoring_device,
                         architecture_preset=preset_key,
                         auto_strength_floor=auto_strength_floor,
@@ -7491,7 +7504,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         # Check AutoTuner cache
         at_cache_key = hashlib.sha256(
             f"{lora_hash}|os={output_strength}|csm={clip_strength_multiplier}"
-            f"|top_n={top_n}|nk={normalize_keys}|ss={scoring_svd}"
+            f"|top_n={top_n}|nk={normalize_keys}|ss={scoring_svd}|sls={scoring_lora_svd}"
             f"|ap={architecture_preset}|vb={vram_budget}"
             f"|spd={scoring_speed}|mid={id(model)}|asf={auto_strength_floor}|ds={decision_smoothing}|eh={evaluator_hash}"
             f"|sel={selection}".encode()
@@ -7510,6 +7523,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             memory_settings = {
                 "normalize_keys": normalize_keys,
                 "scoring_svd": scoring_svd,
+                "scoring_lora_svd": scoring_lora_svd,
                 "scoring_device": scoring_device,
                 "architecture_preset": architecture_preset,
                 "auto_strength_floor": auto_strength_floor,
@@ -7842,7 +7856,8 @@ class LoRAAutoTuner(LoRAOptimizer):
             score_arch = tuner_arch_preset if scoring_formula == "v2" else None
             measured = _score_merge_result(
                 m_patches, c_patches, compute_svd=compute_svd,
-                score_device=score_dev, arch_preset=score_arch
+                score_device=score_dev, arch_preset=score_arch,
+                lora_svd=(scoring_lora_svd == "enabled")
             )
             t_score_elapsed = time.time() - t_score
             # --- Post-scoring adjustments ---
@@ -8096,6 +8111,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             memory_settings = {
                 "normalize_keys": normalize_keys,
                 "scoring_svd": scoring_svd,
+                "scoring_lora_svd": scoring_lora_svd,
                 "scoring_device": scoring_device,
                 "architecture_preset": architecture_preset,
                 "auto_strength_floor": auto_strength_floor,
@@ -8430,7 +8446,8 @@ class LoRAAutoTuner(LoRAOptimizer):
     @classmethod
     def IS_CHANGED(cls, model, lora_stack, output_strength, clip=None,
                    clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
-                   scoring_svd="disabled", scoring_device="gpu",
+                   scoring_svd="disabled", scoring_lora_svd="disabled",
+                   scoring_device="gpu",
                    architecture_preset="auto", auto_strength_floor=-1.0, evaluator=None, record_dataset="disabled",
                    cache_patches="enabled",
                    diff_cache_mode="disabled", diff_cache_ram_pct=0.5,
@@ -8439,7 +8456,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                    smooth_slerp_gate=False, memory_mode="disabled", selection=1):
         evaluator_hash = cls._stable_data_hash(evaluator) if evaluator is not None else ""
         return (id(model), id(lora_stack), output_strength, clip_strength_multiplier, top_n,
-                normalize_keys, scoring_svd, scoring_device, architecture_preset,
+                normalize_keys, scoring_svd, scoring_lora_svd, scoring_device,
+                architecture_preset,
                 vram_budget, record_dataset, scoring_speed, scoring_formula, output_mode,
                 auto_strength_floor, decision_smoothing, evaluator_hash, memory_mode,
                 selection)
