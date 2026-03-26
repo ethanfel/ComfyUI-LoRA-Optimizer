@@ -3517,6 +3517,7 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
     importance_values = []
     effective_ranks = []
     sparsities = []
+    svd_tasks = []  # (gram_up [rank,rank], rank_int) — batched after loop
 
     all_patches = (
         [(False, key, patch) for key, patch in model_patches.items()] +
@@ -3600,21 +3601,14 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                     sparsity = (sampled.abs() < threshold).float().mean().item()
                     sparsities.append(sparsity)
                 del sampled
-                # Effective rank via Gram+eigvalsh — correct for both linear and conv LoRA.
-                # For conv layers up_flat is [out, rank*k*k]; using n_sv=rank would miss most
-                # of the spectrum. Gram+eigvalsh gives all singular values cheaply: no U/Vh
-                # computed, so it's faster than svdvals or the B=1 kernel path.
-                # Guard on rank (performance bound); cap at rank (product rank ≤ rank).
+                # Defer effective-rank SVD to batched post-loop computation.
+                # gram_up ([rank,rank]) is already computed above; storing it costs
+                # rank² floats vs out*rank for up_flat.  After the loop we batch-stack
+                # all gram_up tensors of the same rank and run a single eigvalsh call,
+                # which is far cheaper than 240 individual svdvals calls.
+                # Guard on rank (performance bound); cap applied after batch.
                 if compute_svd and rank > 0 and rank <= 64 and up_flat.shape[0] >= up_flat.shape[1]:
-                    try:
-                        G = up_flat.T @ up_flat
-                        eigs = torch.linalg.eigvalsh(G).flip(-1).clamp(min=0)
-                        s_up = eigs.sqrt()
-                        s_norm = s_up / (s_up.sum() + 1e-10)
-                        entropy = -(s_norm * (s_norm + 1e-10).log()).sum().item()
-                        effective_ranks.append(min(math.exp(entropy), float(rank)))
-                    except Exception:
-                        pass
+                    svd_tasks.append((gram_up, rank))
             continue
         else:
             continue
@@ -3649,6 +3643,27 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
         if threshold > 0:
             sparsity = (t.abs() < threshold).float().mean().item()
             sparsities.append(sparsity)
+
+    # Batched effective-rank computation from deferred gram matrices.
+    # Group by rank (gram shape), stack, single eigvalsh per group.
+    if svd_tasks:
+        from collections import defaultdict
+        _groups: dict = defaultdict(list)
+        for _g, _r in svd_tasks:
+            _groups[_g.shape[0]].append((_g, _r))
+        for _n, _items in _groups.items():
+            try:
+                _G = torch.stack([g for g, _ in _items])          # [B, rank, rank]
+                _eigs = torch.linalg.eigvalsh(_G).flip(-1).clamp(min=0)  # [B, rank] descending
+                _S = _eigs.sqrt()
+                for _i, (_, _r) in enumerate(_items):
+                    _s = _S[_i]
+                    _s_norm = _s / (_s.sum() + 1e-10)
+                    _ent = -(_s_norm * (_s_norm + 1e-10).log()).sum().item()
+                    effective_ranks.append(min(math.exp(_ent), float(_r)))
+            except Exception:
+                pass
+        del svd_tasks
 
     metrics = {}
 
