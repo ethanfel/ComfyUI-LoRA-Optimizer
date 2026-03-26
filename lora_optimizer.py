@@ -3607,13 +3607,17 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                     sparsities.append(sparsity)
                 del sampled
                 # Effective rank via thin SVD on up_flat — for conv layers shape is [out, rank*k*k]
+                # n_sv must be min(up_flat.shape) to capture the full spectrum; for conv layers
+                # up_flat[:,1] = rank*k*k so using n_sv=rank would give a biased-low estimate.
+                # Guard on rank (not _n_sv) to keep the original performance bound; cap effective
+                # rank at rank since the LoRA product up@down has rank <= rank regardless of up_flat shape.
                 _n_sv = min(up_flat.shape)
-                if compute_svd and rank > 0 and _n_sv <= 64 and up_flat.shape[0] >= up_flat.shape[1]:
+                if compute_svd and rank > 0 and rank <= 64 and up_flat.shape[0] >= up_flat.shape[1]:
                     try:
                         s_up = _triton_svdvals(up_flat, n_sv=_n_sv)
                         s_norm = s_up / (s_up.sum() + 1e-10)
                         entropy = -(s_norm * (s_norm + 1e-10).log()).sum().item()
-                        effective_ranks.append(min(math.exp(entropy), float(_n_sv)))
+                        effective_ranks.append(min(math.exp(entropy), float(rank)))
                     except Exception:
                         pass
             continue
