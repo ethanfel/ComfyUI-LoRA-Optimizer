@@ -2726,7 +2726,7 @@ class _LoRAMergeBase:
             # We extract R and compute src @ R ourselves.
             _, info = _batched_procrustes(
                 source_batch, target_batch, whiten=False)
-            R = info.get('rotation') or info.get('rotation_k')
+            R = info.get('rotation') if 'rotation' in info else info.get('rotation_k')
             if R is None:
                 del source_batch, target_batch, ref_mat
                 return diffs_with_weights
