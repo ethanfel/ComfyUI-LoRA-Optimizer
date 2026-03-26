@@ -3606,13 +3606,14 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                     sparsity = (sampled.abs() < threshold).float().mean().item()
                     sparsities.append(sparsity)
                 del sampled
-                # Effective rank via thin SVD on mat_up [out, rank] — kernel's sweet spot
-                if compute_svd and rank > 0 and rank <= 64 and up_flat.shape[0] >= up_flat.shape[1]:
+                # Effective rank via thin SVD on up_flat — for conv layers shape is [out, rank*k*k]
+                _n_sv = min(up_flat.shape)
+                if compute_svd and rank > 0 and _n_sv <= 64 and up_flat.shape[0] >= up_flat.shape[1]:
                     try:
-                        s_up = _triton_svdvals(up_flat, n_sv=rank)
+                        s_up = _triton_svdvals(up_flat, n_sv=_n_sv)
                         s_norm = s_up / (s_up.sum() + 1e-10)
                         entropy = -(s_norm * (s_norm + 1e-10).log()).sum().item()
-                        effective_ranks.append(min(math.exp(entropy), float(rank)))
+                        effective_ranks.append(min(math.exp(entropy), float(_n_sv)))
                     except Exception:
                         pass
             continue
