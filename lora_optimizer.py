@@ -2721,8 +2721,24 @@ class _LoRAMergeBase:
         target_batch = ref_mat.unsqueeze(0).expand(n, -1, -1)
 
         try:
-            aligned_batch, _ = _batched_procrustes(
+            # Get rotation from batched_procrustes, then apply to uncentered source.
+            # batched_procrustes centers internally, which corrupts LoRA diffs.
+            # We extract R and compute src @ R ourselves.
+            _, info = _batched_procrustes(
                 source_batch, target_batch, whiten=False)
+            R = info.get('rotation') or info.get('rotation_k')
+            if R is None:
+                del source_batch, target_batch, ref_mat
+                return diffs_with_weights
+            if 'projection' in info:
+                # Subspace path: R_k is in projected space, need to lift back
+                P = info['projection']  # (B, N, k)
+                P_T = P.transpose(1, 2)
+                src_in = torch.bmm(source_batch, P)  # (B, out, k)
+                src_perp = source_batch - torch.bmm(src_in, P_T)
+                aligned_batch = torch.bmm(torch.bmm(src_in, R), P_T) + src_perp
+            else:
+                aligned_batch = torch.bmm(source_batch, R)
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             logging.warning(f"[LoRA Optimizer] Procrustes align failed ({e}), skipping")
             del source_batch, target_batch, ref_mat
