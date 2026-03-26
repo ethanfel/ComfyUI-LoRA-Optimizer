@@ -3718,22 +3718,28 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
         if score_device is not None:
             tensor = tensor.to(score_device)
 
-        # Frobenius norm (works on any dtype)
-        fro_norm = tensor.float().norm().item() if tensor.dtype != torch.float32 else tensor.norm().item()
+        # Frobenius norm — avoid full fp32 copy for non-float32 tensors
+        fro_norm = tensor.to(dtype=torch.float32).norm().item() if tensor.dtype != torch.float32 else tensor.norm().item()
         norms.append(fro_norm)
         importance_values.append(fro_norm)
+
+        # Sparsity — compute before SVD to free tensor sooner
+        threshold = tensor.abs().max().item() * 0.01
+        if threshold > 0:
+            sparsity = (tensor.abs() < threshold).to(dtype=torch.float32).mean().item()
+            sparsities.append(sparsity)
 
         # Effective rank via spectral analysis (optional, expensive)
         if compute_svd and tensor.dim() == 2 and min(tensor.shape) > 1:
             try:
                 thin_dim = min(tensor.shape)
-                t = tensor.float()
                 if thin_dim <= 32:
                     # Small enough for direct SVD (Triton-accelerated)
-                    s = _triton_svdvals(t, n_sv=min(thin_dim, 64))
+                    s = _triton_svdvals(tensor.float(), n_sv=min(thin_dim, 64))
                 else:
                     # Large tensor: use Gram matrix + eigvalsh to avoid
                     # full SVD memory allocation (critical for video models)
+                    t = tensor.float()
                     if t.shape[0] <= t.shape[1]:
                         gram = torch.mm(t, t.T)
                     else:
@@ -3749,12 +3755,7 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                 del s
             except Exception:
                 pass
-
-        # Sparsity
-        threshold = tensor.abs().max().item() * 0.01
-        if threshold > 0:
-            sparsity = (tensor.abs() < threshold).float().mean().item()
-            sparsities.append(sparsity)
+        del tensor
 
     # Batched effective-rank from deferred gram matrices.
     # Group by rank, stack, single eigvalsh per group.
