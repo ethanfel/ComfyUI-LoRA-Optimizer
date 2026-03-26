@@ -41,6 +41,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 # --- Triton SVD kernel (optional) ---
+_kernel_path = None
 try:
     _kernel_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel.py")
     _kernel_spec = importlib.util.spec_from_file_location("lora_optimizer_kernel", _kernel_path)
@@ -54,7 +55,7 @@ except Exception as e:
     _batched_svd = None
     _HAS_SVD_KERNEL = False
     _HAS_TRITON = False
-    if os.path.exists(_kernel_path):
+    if _kernel_path and os.path.exists(_kernel_path):
         logging.warning(f"[LoRA Optimizer] kernel.py found but failed to load: {e}")
 
 
