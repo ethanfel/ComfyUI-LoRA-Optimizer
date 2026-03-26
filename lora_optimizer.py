@@ -50,17 +50,24 @@ try:
     _HAS_SVD_KERNEL = True
     _HAS_TRITON = _kernel_mod.HAS_TRITON
     logging.info(f"[LoRA Optimizer] SVD kernel loaded (Triton={_HAS_TRITON})")
-except Exception:
+except Exception as e:
     _batched_svd = None
     _HAS_SVD_KERNEL = False
     _HAS_TRITON = False
+    _kernel_path_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel.py")
+    if os.path.exists(_kernel_path_local):
+        logging.warning(f"[LoRA Optimizer] kernel.py found but failed to load: {e}")
 
 
 def _triton_svdvals(mat2d: torch.Tensor, n_sv: int) -> torch.Tensor:
-    """Single 2D matrix → singular values, using kernel when M >= N and kernel available."""
-    if (_batched_svd is not None
-            and mat2d.dim() == 2
-            and mat2d.shape[0] >= mat2d.shape[1]):
+    """Single 2D matrix → singular values, using kernel when available.
+    Handles transpose internally — callers can pass any 2D tensor."""
+    if mat2d.dim() != 2:
+        return torch.linalg.svdvals(mat2d)[:n_sv]
+    m, n = mat2d.shape
+    if m < n:
+        mat2d = mat2d.T
+    if _batched_svd is not None and min(m, n) <= 32:
         try:
             _, s, _ = _batched_svd(mat2d.unsqueeze(0))
             return s.squeeze(0)[:n_sv]
@@ -2733,8 +2740,7 @@ class _LoRAMergeBase:
         rank = max(initial_rank, 64)
         for sample in samples:
             mat = sample.reshape(sample.shape[0], -1).float()
-            mat_svd = mat if mat.shape[0] >= mat.shape[1] else mat.T
-            singular_values = _triton_svdvals(mat_svd, n_sv=min(mat.shape))
+            singular_values = _triton_svdvals(mat, n_sv=min(mat.shape))
             total_sq = (singular_values ** 2).sum().item()
             if total_sq == 0:
                 continue
@@ -3626,8 +3632,7 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
         if compute_svd and t.dim() == 2 and min(t.shape) > 1:
             try:
                 thin_dim = min(t.shape)
-                t_svd = t if t.shape[0] >= t.shape[1] else t.T
-                s = _triton_svdvals(t_svd, n_sv=min(thin_dim, 64))
+                s = _triton_svdvals(t, n_sv=min(thin_dim, 64))
                 s_norm = s / (s.sum() + 1e-10)
                 entropy = -(s_norm * (s_norm + 1e-10).log()).sum().item()
                 eff_rank = min(math.exp(entropy), thin_dim)
