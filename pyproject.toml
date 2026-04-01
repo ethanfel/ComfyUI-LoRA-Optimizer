@@ -8,6 +8,10 @@ dependencies = []
 [project.urls]
 Repository = "https://github.com/ethanfel/ComfyUI-LoRA-Optimizer"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+
 [tool.comfy]
 PublisherId = "ethanfel"
 DisplayName = "LoRA Optimizer"

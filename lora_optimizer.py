@@ -8910,7 +8910,7 @@ class SaveMergedLoRA:
                 "filename": ("STRING", {"default": "merged_lora", "tooltip": "Name for the saved file. Subdirectories are allowed (e.g. 'merged/my_lora'). Extension .safetensors is added automatically."}),
                 "save_rank": ("INT", {
                     "default": 0, "min": 0, "max": 2048, "step": 4,
-                    "tooltip": "0 = auto (adaptively finds the rank needed for <5% reconstruction error — recommended). Non-zero = force this rank for any layers that need compression. Higher values = more accurate but larger file."
+                    "tooltip": "0 = auto: uses the sum of all input LoRA ranks (e.g. 3 rank-32 LoRAs → rank 96). Non-zero = compress all layers to exactly this rank via SVD. Use a non-zero value to reduce output file size — set it to match your largest input LoRA's rank or lower. Higher values = more accurate but larger file."
                 }),
                 "bake_strength": ("BOOLEAN", {
                     "default": True,
@@ -8967,7 +8967,11 @@ class SaveMergedLoRA:
                              f"(initial estimate {initial_rank}, adapted from sample diffs)")
             else:
                 fallback_rank = lora_data.get("sum_rank", 128)
-                logging.info(f"[Save Merged LoRA] Auto rank: {fallback_rank} (no full-rank diffs to compress)")
+                n_loras = len(lora_data.get("merge_metadata", {}).get("source_loras", []))
+                logging.info(
+                    f"[Save Merged LoRA] Auto rank: {fallback_rank} (sum of {n_loras} input LoRA ranks). "
+                    f"Set save_rank to a fixed value to compress below this."
+                )
 
         save_dtype = None
         for patch in list(model_patches.values()) + list(clip_patches.values()):
@@ -9006,6 +9010,18 @@ class SaveMergedLoRA:
                 elif isinstance(patch, LoRAAdapter):
                     mat_up, mat_down, alpha, mid, _, _ = patch.weights
                     alpha = float(alpha) if alpha is not None else float(mat_down.shape[0])
+                    current_rank = int(mat_down.shape[0])
+                    target_rank = fallback_rank if auto_rank else save_rank
+                    # The fast linear path (_build_exact_linear_patch) produces LoRAAdapters
+                    # with rank = sum of all input ranks, bypassing patch_compression entirely.
+                    # Compress here when the patch rank exceeds the requested target rank.
+                    # Skip LoCon (mid != None): mid tensor requires special reshape handling.
+                    if target_rank > 0 and current_rank > target_rank and mid is None:
+                        diff = _LoRAMergeBase._expand_patch_to_diff(patch)
+                        compressed = LoRAOptimizer._compress_to_lowrank(diff, target_rank, output_dtype=save_dtype)
+                        del diff
+                        mat_up, mat_down, alpha, mid, _, _ = compressed.weights
+                        alpha = float(alpha)
                 elif isinstance(patch, tuple) and len(patch) == 2 and patch[0] == "diff":
                     diff_tensor = patch[1][0]
                     rank = fallback_rank if auto_rank else save_rank
