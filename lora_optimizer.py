@@ -7420,6 +7420,31 @@ class LoRAAutoTuner(LoRAOptimizer):
                             f"{lora_hash}_{settings_hash}.memory.json")
 
     @staticmethod
+    def _compute_names_only_hash(active_loras):
+        """
+        Compute a hash of LoRA file identity (name + mtime + size) independent
+        of strength values. Returns (hash_str, signs) where signs is
+        {lora_index: +1 or -1} for sign-flip detection at synthesis.
+        """
+        entries = []
+        for item in active_loras:
+            name = item["name"]
+            path = folder_paths.get_full_path("loras", name)
+            if path is not None:
+                try:
+                    st = os.stat(path)
+                    entries.append((name, st.st_mtime, st.st_size))
+                except OSError:
+                    entries.append((name, 0, 0))
+            else:
+                entries.append((name, 0, 0))
+        hash_input = json.dumps(sorted(entries), separators=(",", ":"))
+        names_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
+        signs = {i: (1 if item["strength"] >= 0 else -1)
+                 for i, item in enumerate(active_loras)}
+        return names_hash, signs
+
+    @staticmethod
     def _memory_load(lora_hash, settings_hash, requested_top_n):
         """Load and validate a memory entry. Returns tuner_data or None."""
         path = LoRAAutoTuner._memory_file_path(lora_hash, settings_hash)

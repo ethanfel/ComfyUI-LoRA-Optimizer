@@ -24,6 +24,7 @@ def _install_stubs():
     folder_paths.get_folder_paths = lambda _kind: [tmpdir]
     folder_paths.get_filename_list = lambda _kind: []
     folder_paths.get_full_path_or_raise = lambda _kind, name: name
+    folder_paths.get_full_path = lambda _kind, name: name
     sys.modules["folder_paths"] = folder_paths
 
     comfy = types.ModuleType("comfy")
@@ -1164,6 +1165,50 @@ class TestExtractLoRAFromDelta(unittest.TestCase):
         delta = torch.randn(64)  # bias vector
         result = mod._extract_lora_svd(delta, rank=4, rank_mode="fixed", energy_threshold=0.99)
         self.assertIsNone(result)
+
+
+@unittest.skipIf(torch is None, "torch is not installed")
+class AnalysisCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.tuner = lora_optimizer.LoRAAutoTuner()
+
+    def test_names_only_hash_excludes_strength(self):
+        """Same LoRA files at different strengths produce the same hash."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path_a = os.path.join(tmpdir, "lora_a.safetensors")
+            path_b = os.path.join(tmpdir, "lora_b.safetensors")
+            open(path_a, "wb").close()
+            open(path_b, "wb").close()
+
+            with mock.patch("lora_optimizer.folder_paths.get_full_path",
+                            side_effect=lambda _k, n: os.path.join(tmpdir, n)):
+                stack_s1 = [
+                    {"name": "lora_a.safetensors", "strength": 0.5},
+                    {"name": "lora_b.safetensors", "strength": 1.0},
+                ]
+                stack_s2 = [
+                    {"name": "lora_a.safetensors", "strength": 1.5},
+                    {"name": "lora_b.safetensors", "strength": 0.3},
+                ]
+                h1, signs1 = lora_optimizer.LoRAAutoTuner._compute_names_only_hash(stack_s1)
+                h2, signs2 = lora_optimizer.LoRAAutoTuner._compute_names_only_hash(stack_s2)
+                self.assertEqual(h1, h2)
+                self.assertEqual(signs1, {0: 1, 1: 1})
+                self.assertEqual(signs2, {0: 1, 1: 1})
+
+    def test_names_only_hash_captures_sign(self):
+        """Negative strength is captured in the returned signs dict."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path_a = os.path.join(tmpdir, "lora_a.safetensors")
+            open(path_a, "wb").close()
+            with mock.patch("lora_optimizer.folder_paths.get_full_path",
+                            side_effect=lambda _k, n: os.path.join(tmpdir, n)):
+                stack_pos = [{"name": "lora_a.safetensors", "strength":  1.0}]
+                stack_neg = [{"name": "lora_a.safetensors", "strength": -1.0}]
+                _, signs_pos = lora_optimizer.LoRAAutoTuner._compute_names_only_hash(stack_pos)
+                _, signs_neg = lora_optimizer.LoRAAutoTuner._compute_names_only_hash(stack_neg)
+                self.assertEqual(signs_pos[0],  1)
+                self.assertEqual(signs_neg[0], -1)
 
 
 if __name__ == "__main__":
