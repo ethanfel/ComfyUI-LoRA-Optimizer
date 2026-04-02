@@ -4678,6 +4678,60 @@ class LoRAOptimizer(_LoRAMergeBase):
                                for i in lora_indices},
         }
 
+    @staticmethod
+    def _reconstruct_from_analysis_cache(prefix, cached_prefix, active_loras):
+        """
+        Reconstruct the 8-tuple expected by _collect_analysis_result from cached
+        data and current active_loras. Returns None if any strength sign has
+        flipped vs the cached signs (triggers full re-analysis for this prefix).
+        """
+        cached_signs = cached_prefix.get("strength_signs", {})
+        per_lora_norm_sq_raw = cached_prefix["per_lora_norm_sq"]
+        lora_indices = sorted(int(k) for k in per_lora_norm_sq_raw.keys())
+
+        for i in lora_indices:
+            current_sign = 1 if active_loras[i]["strength"] >= 0 else -1
+            if current_sign != cached_signs.get(str(i), 1):
+                logging.info(
+                    f"[AutoTuner Analysis Cache] Sign flip on LoRA {i} "
+                    f"for {prefix!r}, falling back to full analysis")
+                return None
+
+        ranks = cached_prefix["ranks"]
+        partial_stats = []
+        for i in lora_indices:
+            norm_sq = float(per_lora_norm_sq_raw[str(i)])
+            display_l2 = math.sqrt(norm_sq) * abs(active_loras[i]["strength"])
+            partial_stats.append((i, int(ranks.get(str(i), 0)), display_l2, norm_sq))
+
+        pair_conflicts = {}
+        for key_str, metrics in cached_prefix["pair_conflicts"].items():
+            a, b = key_str.split(",")
+            pair_conflicts[(int(a), int(b))] = metrics
+
+        mag_unscaled = cached_prefix["magnitude_samples_unscaled"]
+        magnitude_samples = []
+        for i in lora_indices:
+            raw = mag_unscaled.get(str(i), [])
+            t = torch.tensor(raw, dtype=torch.float32) * abs(active_loras[i]["strength"])
+            magnitude_samples.append(t)
+
+        tk = cached_prefix["target_key"]
+        target_key = tuple(tk) if isinstance(tk, list) else tk
+
+        per_lora_norm_sq = {int(k): float(v) for k, v in per_lora_norm_sq_raw.items()}
+
+        return (
+            prefix,
+            partial_stats,
+            pair_conflicts,
+            magnitude_samples,
+            (target_key, cached_prefix["is_clip"]),
+            int(cached_prefix.get("skip_count", 0)),
+            int(cached_prefix.get("raw_n", len(lora_indices))),
+            per_lora_norm_sq,
+        )
+
     def _run_group_analysis(self, target_groups, active_loras, model, clip,
                             compute_device, clip_strength_multiplier=1.0,
                             merge_refinement="none",

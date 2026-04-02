@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import math
 import os
 import sys
 import tempfile
@@ -1297,6 +1298,62 @@ class AnalysisCacheTests(unittest.TestCase):
         self.assertEqual(extracted["target_key"], "layer.weight")
         self.assertFalse(extracted["is_clip"])
         self.assertEqual(extracted["strength_signs"]["0"], 1)
+
+    def test_reconstruct_rescales_by_new_strength(self):
+        """Reconstruction rescales magnitude samples and display_l2 to new strength."""
+        cached_prefix = {
+            "pair_conflicts": {
+                "0,1": {"overlap": 50, "conflict": 10, "dot": 0.4,
+                        "norm_a_sq": 2.25, "norm_b_sq": 0.81,
+                        "weighted_total": 0.6, "weighted_conflict": 0.1,
+                        "expected_conflict": 0.12, "excess_conflict": 0.0,
+                        "subspace_overlap": 0.2, "subspace_weight": 1.35}
+            },
+            "per_lora_norm_sq": {"0": 2.25, "1": 0.81},
+            "magnitude_samples_unscaled": {"0": [1.0, 2.0], "1": [1.0]},
+            "ranks": {"0": 16, "1": 32},
+            "target_key": "layer.weight",
+            "is_clip": False,
+            "raw_n": 2,
+            "skip_count": 0,
+            "strength_signs": {"0": 1, "1": 1},
+        }
+        active_loras = [
+            {"name": "a.safetensors", "strength": 2.0, "clip_strength": None},
+            {"name": "b.safetensors", "strength": 0.5, "clip_strength": None},
+        ]
+        result = lora_optimizer.LoRAOptimizer._reconstruct_from_analysis_cache(
+            "prefix_x", cached_prefix, active_loras)
+        self.assertIsNotNone(result)
+        prefix, partial_stats, pair_conflicts, mag_samples, target_info, skip_count, raw_n, norm_sq = result
+
+        self.assertEqual(prefix, "prefix_x")
+        # display_l2 = sqrt(norm_sq) * abs(strength)
+        self.assertAlmostEqual(partial_stats[0][2], math.sqrt(2.25) * 2.0, places=4)
+        self.assertAlmostEqual(partial_stats[1][2], math.sqrt(0.81) * 0.5, places=4)
+        # pair_conflicts keys are int tuples
+        self.assertIn((0, 1), pair_conflicts)
+        # magnitude_samples rescaled by abs(new_strength)
+        self.assertAlmostEqual(mag_samples[0][0].item(), 1.0 * 2.0, places=4)
+        self.assertAlmostEqual(mag_samples[1][0].item(), 1.0 * 0.5, places=4)
+
+    def test_reconstruct_returns_none_on_sign_flip(self):
+        """Sign flip triggers None so caller falls back to full analysis."""
+        cached_prefix = {
+            "pair_conflicts": {},
+            "per_lora_norm_sq": {"0": 1.0},
+            "magnitude_samples_unscaled": {"0": [1.0]},
+            "ranks": {"0": 16},
+            "target_key": "layer.weight",
+            "is_clip": False,
+            "raw_n": 1,
+            "skip_count": 0,
+            "strength_signs": {"0": 1},  # was positive
+        }
+        active_loras = [{"name": "a.safetensors", "strength": -1.0, "clip_strength": None}]
+        result = lora_optimizer.LoRAOptimizer._reconstruct_from_analysis_cache(
+            "prefix_x", cached_prefix, active_loras)
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
