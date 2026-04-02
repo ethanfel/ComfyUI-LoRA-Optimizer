@@ -1207,6 +1207,58 @@ class AnalysisCacheTests(unittest.TestCase):
                 self.assertEqual(signs_pos[0],  1)
                 self.assertEqual(signs_neg[0], -1)
 
+    def test_analysis_cache_roundtrip(self):
+        """Save and load analysis cache; content survives round-trip."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                per_prefix = {
+                    "prefix_a": {
+                        "pair_conflicts": {"0,1": {"overlap": 100, "conflict": 30,
+                                                   "dot": 0.5, "norm_a_sq": 1.0,
+                                                   "norm_b_sq": 1.0,
+                                                   "weighted_total": 0.8,
+                                                   "weighted_conflict": 0.2,
+                                                   "expected_conflict": 0.15,
+                                                   "excess_conflict": 0.05,
+                                                   "subspace_overlap": 0.3,
+                                                   "subspace_weight": 1.0}},
+                        "per_lora_norm_sq": {"0": 1.5, "1": 0.8},
+                        "magnitude_samples_unscaled": {"0": [0.1, 0.2], "1": [0.3]},
+                        "ranks": {"0": 16, "1": 32},
+                        "target_key": "model.layer.weight",
+                        "is_clip": False,
+                        "raw_n": 2,
+                        "skip_count": 0,
+                        "strength_signs": {"0": 1, "1": 1},
+                    }
+                }
+                source_loras = [{"name": "a.safetensors", "mtime": 1.0, "size": 100}]
+                lora_optimizer.LoRAAutoTuner._analysis_cache_save(
+                    "abc123", per_prefix, source_loras)
+
+                loaded = lora_optimizer.LoRAAutoTuner._analysis_cache_load("abc123")
+                self.assertIsNotNone(loaded)
+                self.assertIn("prefix_a", loaded)
+                self.assertEqual(loaded["prefix_a"]["per_lora_norm_sq"]["0"], 1.5)
+
+    def test_analysis_cache_load_missing_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                self.assertIsNone(
+                    lora_optimizer.LoRAAutoTuner._analysis_cache_load("nonexistent"))
+
+    def test_analysis_cache_load_stale_algo_version_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                stale_hash = "staletest1"
+                path = os.path.join(tmpdir, f"{stale_hash}.analysis.json")
+                with open(path, "w") as f:
+                    json.dump({"analysis_version": 1,
+                               "algo_version": "0.0.0",
+                               "per_prefix": {"prefix_a": {}}}, f)
+                result = lora_optimizer.LoRAAutoTuner._analysis_cache_load(stale_hash)
+                self.assertIsNone(result)
+
 
 if __name__ == "__main__":
     unittest.main()
