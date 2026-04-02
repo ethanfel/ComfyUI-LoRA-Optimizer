@@ -1259,6 +1259,45 @@ class AnalysisCacheTests(unittest.TestCase):
                 result = lora_optimizer.LoRAAutoTuner._analysis_cache_load(stale_hash)
                 self.assertIsNone(result)
 
+    def test_extract_for_analysis_cache_strips_strength(self):
+        """Extracted data has unscaled magnitude samples; tuple keys become strings."""
+        partial_stats = [(0, 16, 1.5, 2.25), (1, 32, 0.9, 0.81)]
+        pair_conflicts = {
+            (0, 1): {"overlap": 50, "conflict": 10, "dot": 0.4,
+                     "norm_a_sq": 2.25, "norm_b_sq": 0.81,
+                     "weighted_total": 0.6, "weighted_conflict": 0.1,
+                     "expected_conflict": 0.12, "excess_conflict": 0.0,
+                     "subspace_overlap": 0.2, "subspace_weight": 1.35}
+        }
+        magnitude_samples = [
+            torch.tensor([1.5, 3.0]),   # LoRA 0: scaled by abs(strength=1.5)
+            torch.tensor([0.9, 1.8]),   # LoRA 1: scaled by abs(strength=0.9)
+        ]
+        per_lora_norm_sq = {0: 2.25, 1: 0.81}
+        result = (
+            "prefix_x", partial_stats, pair_conflicts,
+            magnitude_samples, ("layer.weight", False),
+            0, 2, per_lora_norm_sq,
+        )
+        active_loras = [
+            {"name": "a.safetensors", "strength": 1.5, "clip_strength": None},
+            {"name": "b.safetensors", "strength": 0.9, "clip_strength": None},
+        ]
+        extracted = lora_optimizer.LoRAOptimizer._extract_for_analysis_cache(
+            result, active_loras)
+
+        # Pair key must be a string
+        self.assertIn("0,1", extracted["pair_conflicts"])
+        # Samples unscaled: divide by abs(strength)
+        self.assertAlmostEqual(extracted["magnitude_samples_unscaled"]["0"][0],
+                               1.5 / 1.5, places=5)
+        self.assertAlmostEqual(extracted["magnitude_samples_unscaled"]["1"][0],
+                               0.9 / 0.9, places=5)
+        self.assertEqual(extracted["per_lora_norm_sq"]["0"], 2.25)
+        self.assertEqual(extracted["target_key"], "layer.weight")
+        self.assertFalse(extracted["is_clip"])
+        self.assertEqual(extracted["strength_signs"]["0"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

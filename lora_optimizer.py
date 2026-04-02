@@ -4634,6 +4634,50 @@ class LoRAOptimizer(_LoRAMergeBase):
             per_lora_norm_sq,
         )
 
+    @staticmethod
+    def _extract_for_analysis_cache(result, active_loras):
+        """
+        Extract the strength-invariant parts of an _analyze_target_group result
+        into a JSON-serializable dict for .analysis.json storage.
+
+        result: 8-tuple (prefix, partial_stats, pair_conflicts, magnitude_samples,
+                         (target_key, is_clip), skip_count, raw_n, per_lora_norm_sq)
+        """
+        (prefix, partial_stats, pair_conflicts, magnitude_samples,
+         target_info, skip_count, raw_n, per_lora_norm_sq) = result
+        target_key, is_clip = target_info
+
+        # Serialize target_key (may be str or tuple)
+        tk_serial = list(target_key) if isinstance(target_key, tuple) else target_key
+
+        # Serialize pair_conflict keys: (i,j) -> "i,j"; values are already plain dicts
+        pc_serial = {f"{i},{j}": metrics for (i, j), metrics in pair_conflicts.items()}
+
+        # Unscale magnitude_samples: divide by abs(strength) per LoRA
+        lora_indices = [s[0] for s in partial_stats]
+        mag_unscaled = {}
+        for pos, i in enumerate(lora_indices):
+            abs_strength = abs(active_loras[i]["strength"])
+            if pos < len(magnitude_samples):
+                raw = magnitude_samples[pos]
+                mag_unscaled[str(i)] = (raw / abs_strength if abs_strength > 0
+                                        else raw).tolist()
+            else:
+                mag_unscaled[str(i)] = []
+
+        return {
+            "pair_conflicts": pc_serial,
+            "per_lora_norm_sq": {str(k): float(v) for k, v in per_lora_norm_sq.items()},
+            "magnitude_samples_unscaled": mag_unscaled,
+            "ranks": {str(s[0]): s[1] for s in partial_stats},
+            "target_key": tk_serial,
+            "is_clip": is_clip,
+            "raw_n": raw_n,
+            "skip_count": skip_count,
+            "strength_signs": {str(i): (1 if active_loras[i]["strength"] >= 0 else -1)
+                               for i in lora_indices},
+        }
+
     def _run_group_analysis(self, target_groups, active_loras, model, clip,
                             compute_device, clip_strength_multiplier=1.0,
                             merge_refinement="none",
