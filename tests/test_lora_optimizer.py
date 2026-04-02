@@ -1169,9 +1169,6 @@ class TestExtractLoRAFromDelta(unittest.TestCase):
 
 @unittest.skipIf(torch is None, "torch is not installed")
 class AnalysisCacheTests(unittest.TestCase):
-    def setUp(self):
-        self.tuner = lora_optimizer.LoRAAutoTuner()
-
     def test_names_only_hash_excludes_strength(self):
         """Same LoRA files at different strengths produce the same hash."""
         with tempfile.TemporaryDirectory() as tmpdir:

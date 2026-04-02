@@ -7422,9 +7422,12 @@ class LoRAAutoTuner(LoRAOptimizer):
     @staticmethod
     def _compute_names_only_hash(active_loras):
         """
-        Compute a hash of LoRA file identity (name + mtime + size) independent
-        of strength values. Returns (hash_str, signs) where signs is
-        {lora_index: +1 or -1} for sign-flip detection at synthesis.
+        Compute a hash of LoRA file identity independent of strength values.
+        Hash is order-independent (entries sorted before hashing) and based on
+        name + mtime + size — not file content, so same-size same-timestamp
+        replacements are not detected.
+        Returns (hash_str, signs) where signs is {lora_index: +1 or -1} using
+        the original input-list order as indices (matching active_loras indexing).
         """
         entries = []
         for item in active_loras:
