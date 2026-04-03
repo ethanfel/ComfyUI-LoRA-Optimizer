@@ -8443,7 +8443,9 @@ class LoRAAutoTuner(LoRAOptimizer):
             new_for_lora = new_lora_entries.get(i, {})
             if new_for_lora:
                 existing_lora = self._lora_cache_load(h) or {}
-                existing_lora.update(new_for_lora)
+                for pfx, entry in new_for_lora.items():
+                    if entry is not None or pfx not in existing_lora:
+                        existing_lora[pfx] = entry
                 self._lora_cache_save(h, existing_lora)
         for (i, j) in pairs_for_cache:
             new_for_pair = new_pair_entries.get((i, j), {})
