@@ -7954,6 +7954,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             cached_analysis = self._analysis_partial_load(names_only_hash)
             if cached_analysis is not None:
                 using_partial = True
+                self._analysis_partial_delete(names_only_hash)
                 logging.info(
                     f"[AutoTuner Analysis Partial] Resume — "
                     f"{len(cached_analysis)} prefixes already done")
