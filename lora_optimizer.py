@@ -4867,7 +4867,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                             merge_refinement="none",
                             decision_smoothing=0.0, progress_cb=None,
                             cached_analysis=None, track_new_entries=False,
-                            on_prefix_done=None):
+                            on_prefix_done=None,
+                            lora_caches=None, pair_caches=None, lora_hashes=None):
         """
         Shared Pass 1 runner used by both the optimizer and AutoTuner.
         Returns the same lightweight accumulators both call sites need.
@@ -4997,6 +4998,29 @@ class LoRAOptimizer(_LoRAMergeBase):
                 }
 
         new_analysis_entries = {}
+        new_lora_entries = {i: {} for i in range(len(active_loras))}
+        new_pair_entries = {(i, j): {} for i, j in pairs}
+
+        def _pair_lora_cache_hit(prefix):
+            """Return (lora_entries, pair_entries) if full hit, else None."""
+            if lora_caches is None or pair_caches is None or lora_hashes is None:
+                return None
+            lora_entries = {}
+            for i in range(len(active_loras)):
+                cache = lora_caches.get(i)
+                if cache is None or prefix not in cache:
+                    return None
+                lora_entries[i] = cache[prefix]
+            participating = {i for i, e in lora_entries.items() if e is not None}
+            pair_entries = {}
+            for (i, j) in pairs:
+                if i in participating and j in participating:
+                    cache = pair_caches.get((i, j))
+                    if cache is None or prefix not in cache:
+                        return None
+                    pair_entries[(i, j)] = cache[prefix]
+            return lora_entries, pair_entries
+
         group_items = list(target_groups.values())
         if use_gpu:
             for target_group in group_items:
@@ -5005,6 +5029,12 @@ class LoRAOptimizer(_LoRAMergeBase):
                 if cached_analysis is not None and prefix in cached_analysis:
                     result = self._reconstruct_from_analysis_cache(
                         prefix, cached_analysis[prefix], active_loras)
+                if result is None:
+                    hit = _pair_lora_cache_hit(prefix)
+                    if hit is not None:
+                        lora_entries, pair_entries = hit
+                        result = self._reconstruct_from_pair_lora_cache(
+                            prefix, lora_entries, pair_entries, active_loras, lora_hashes)
                 if result is None:
                     result = self._analyze_target_group(
                         target_group, active_loras, model, clip, compute_device,
@@ -5016,6 +5046,16 @@ class LoRAOptimizer(_LoRAMergeBase):
                         new_analysis_entries[prefix] = entry
                         if on_prefix_done is not None:
                             on_prefix_done(prefix, entry)
+                        if lora_caches is not None:
+                            for i in range(len(active_loras)):
+                                new_lora_entries[i][prefix] = self._extract_for_lora_cache(
+                                    result, i, active_loras)
+                        if pair_caches is not None:
+                            for (i, j) in pairs:
+                                lora_entry = self._extract_for_pair_cache(
+                                    result, i, j, lora_hashes[i], lora_hashes[j])
+                                if lora_entry is not None:
+                                    new_pair_entries[(i, j)][prefix] = lora_entry
                 _collect_analysis_result(result)
                 if progress_cb is not None:
                     progress_cb()
@@ -5028,6 +5068,16 @@ class LoRAOptimizer(_LoRAMergeBase):
                     if cached_analysis is not None and prefix in cached_analysis:
                         result = self._reconstruct_from_analysis_cache(
                             prefix, cached_analysis[prefix], active_loras)
+                        if result is not None:
+                            _collect_analysis_result(result)
+                            if progress_cb is not None:
+                                progress_cb()
+                            continue
+                    hit = _pair_lora_cache_hit(prefix)
+                    if hit is not None:
+                        lora_entries_hit, pair_entries_hit = hit
+                        result = self._reconstruct_from_pair_lora_cache(
+                            prefix, lora_entries_hit, pair_entries_hit, active_loras, lora_hashes)
                         if result is not None:
                             _collect_analysis_result(result)
                             if progress_cb is not None:
@@ -5047,6 +5097,16 @@ class LoRAOptimizer(_LoRAMergeBase):
                             new_analysis_entries[prefix] = entry
                             if on_prefix_done is not None:
                                 on_prefix_done(prefix, entry)
+                            if lora_caches is not None:
+                                for i in range(len(active_loras)):
+                                    new_lora_entries[i][prefix] = self._extract_for_lora_cache(
+                                        result, i, active_loras)
+                            if pair_caches is not None:
+                                for (i, j) in pairs:
+                                    lora_entry = self._extract_for_pair_cache(
+                                        result, i, j, lora_hashes[i], lora_hashes[j])
+                                    if lora_entry is not None:
+                                        new_pair_entries[(i, j)][prefix] = lora_entry
                     _collect_analysis_result(result)
                     if progress_cb is not None:
                         progress_cb()
@@ -5065,6 +5125,8 @@ class LoRAOptimizer(_LoRAMergeBase):
             "skipped_keys": skipped_keys,
             "pairs": pairs,
             "new_analysis_entries": new_analysis_entries,
+            "new_lora_entries": new_lora_entries,
+            "new_pair_entries": new_pair_entries,
         }
 
     def _estimate_density(self, all_key_diffs, arch_preset=None):
