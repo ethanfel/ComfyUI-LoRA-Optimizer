@@ -1695,6 +1695,14 @@ class TestAnalysisPartialLifecycle(unittest.TestCase):
                     ["prefix_a"], {"prefix_a": "layer.weight"}, {})
                 device = torch.device("cpu")
 
+                # Ensure clean state: remove any stale full cache from prior runs
+                full_path = tuner._analysis_cache_path(names_only_hash)
+                try:
+                    os.unlink(full_path)
+                except OSError:
+                    pass
+                tuner._analysis_partial_delete(names_only_hash)
+
                 # First: compute full analysis and manually save only to partial
                 result = tuner._run_group_analysis(
                     target_groups, active_loras, model, None, device,
@@ -1704,8 +1712,7 @@ class TestAnalysisPartialLifecycle(unittest.TestCase):
                 partial_entries = result["new_analysis_entries"]
                 tuner._analysis_partial_save(names_only_hash, partial_entries, source_loras)
 
-                # Verify: full cache does NOT exist yet
-                full_path = tuner._analysis_cache_path(names_only_hash)
+                # Verify: full cache does NOT exist yet (only partial was saved)
                 self.assertFalse(os.path.exists(full_path))
 
                 # Now simulate resume: load from partial (all prefixes cached), run analysis
