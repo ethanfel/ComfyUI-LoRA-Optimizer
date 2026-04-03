@@ -7672,7 +7672,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             os.replace(tmp_path, path)
             logging.info(f"[AutoTuner Analysis Partial] Saved: {path}")
         except Exception as e:
-            logging.warning(f"[AutoTuner Analysis Partial] Failed to save partial: {e}")
+            logging.warning(f"[AutoTuner Analysis Partial] Failed to save: {e}")
             try:
                 os.unlink(tmp_path)
             except OSError:
@@ -7955,7 +7955,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             if cached_analysis is not None:
                 using_partial = True
                 logging.info(
-                    f"[AutoTuner Analysis Cache] Partial resume — "
+                    f"[AutoTuner Analysis Partial] Resume — "
                     f"{len(cached_analysis)} prefixes already done")
             else:
                 logging.info("[AutoTuner Analysis Cache] MISS — will run full analysis")
@@ -8009,6 +8009,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                     os.unlink(analysis_path)
                 self._analysis_partial_delete(names_only_hash)
                 cached_analysis = None
+                using_partial = False
 
             if memory_mode in ("auto", "read_only"):
                 cached_tuner_data = self._memory_load(
