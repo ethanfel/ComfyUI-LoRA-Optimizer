@@ -1260,6 +1260,65 @@ class AnalysisCacheTests(unittest.TestCase):
                 result = lora_optimizer.LoRAAutoTuner._analysis_cache_load(stale_hash)
                 self.assertIsNone(result)
 
+    def test_analysis_partial_path_uses_partial_suffix(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                path = lora_optimizer.LoRAAutoTuner._analysis_partial_path("abc123")
+                self.assertTrue(path.endswith("abc123.analysis.partial.json"))
+
+    def test_analysis_partial_load_missing_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                self.assertIsNone(
+                    lora_optimizer.LoRAAutoTuner._analysis_partial_load("nonexistent"))
+
+    def test_analysis_partial_load_stale_algo_version_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                path = os.path.join(tmpdir, "stale.analysis.partial.json")
+                with open(path, "w") as f:
+                    json.dump({"algo_version": "0.0.0", "per_prefix": {}}, f)
+                self.assertIsNone(
+                    lora_optimizer.LoRAAutoTuner._analysis_partial_load("stale"))
+
+    def test_analysis_partial_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                per_prefix = {"prefix_a": {"ranks": {"0": 16}, "is_clip": False}}
+                source_loras = [{"name": "a.safetensors"}]
+                lora_optimizer.LoRAAutoTuner._analysis_partial_save(
+                    "abc123", per_prefix, source_loras)
+                loaded = lora_optimizer.LoRAAutoTuner._analysis_partial_load("abc123")
+                self.assertIsNotNone(loaded)
+                self.assertIn("prefix_a", loaded)
+
+    def test_analysis_partial_save_is_atomic(self):
+        """Save uses tmp+replace so a crash mid-write doesn't corrupt the file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                lora_optimizer.LoRAAutoTuner._analysis_partial_save(
+                    "abc123", {"p": {}}, [])
+                partial_path = lora_optimizer.LoRAAutoTuner._analysis_partial_path("abc123")
+                tmp_path = partial_path + ".tmp"
+                self.assertTrue(os.path.exists(partial_path))
+                self.assertFalse(os.path.exists(tmp_path))
+
+    def test_analysis_partial_delete_removes_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                lora_optimizer.LoRAAutoTuner._analysis_partial_save(
+                    "abc123", {}, [])
+                path = lora_optimizer.LoRAAutoTuner._analysis_partial_path("abc123")
+                self.assertTrue(os.path.exists(path))
+                lora_optimizer.LoRAAutoTuner._analysis_partial_delete("abc123")
+                self.assertFalse(os.path.exists(path))
+
+    def test_analysis_partial_delete_silent_on_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                # Should not raise
+                lora_optimizer.LoRAAutoTuner._analysis_partial_delete("nonexistent")
+
     def test_extract_for_analysis_cache_strips_strength(self):
         """Extracted data has unscaled magnitude samples; tuple keys become strings."""
         partial_stats = [(0, 16, 1.5, 2.25), (1, 32, 0.9, 0.81)]

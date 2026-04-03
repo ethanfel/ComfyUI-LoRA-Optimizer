@@ -7627,6 +7627,61 @@ class LoRAAutoTuner(LoRAOptimizer):
                 pass
 
     @staticmethod
+    def _analysis_partial_path(names_only_hash):
+        return os.path.join(AUTOTUNER_MEMORY_DIR,
+                            f"{names_only_hash}.analysis.partial.json")
+
+    @staticmethod
+    def _analysis_partial_load(names_only_hash):
+        """Load partial analysis checkpoint. Returns per_prefix dict or None."""
+        path = LoRAAutoTuner._analysis_partial_path(names_only_hash)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if data.get("algo_version") != AUTOTUNER_ALGO_VERSION:
+                logging.info("[AutoTuner Analysis Cache] Partial file stale algo version, ignoring")
+                return None
+            return data.get("per_prefix")
+        except Exception as e:
+            logging.warning(f"[AutoTuner Analysis Cache] Failed to load partial: {e}")
+            return None
+
+    @staticmethod
+    def _analysis_partial_save(names_only_hash, per_prefix, source_loras):
+        """Atomic write of partial analysis checkpoint to disk."""
+        from datetime import datetime
+        path = LoRAAutoTuner._analysis_partial_path(names_only_hash)
+        entry = {
+            "analysis_version": 1,
+            "algo_version": AUTOTUNER_ALGO_VERSION,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source_loras": source_loras,
+            "per_prefix": per_prefix,
+        }
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(entry, f)
+            os.replace(tmp_path, path)
+        except Exception as e:
+            logging.warning(f"[AutoTuner Analysis Cache] Failed to save partial: {e}")
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _analysis_partial_delete(names_only_hash):
+        """Delete partial checkpoint file, silently ignoring missing files."""
+        path = LoRAAutoTuner._analysis_partial_path(names_only_hash)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    @staticmethod
     def _memory_load(lora_hash, settings_hash, requested_top_n):
         """Load and validate a memory entry. Returns tuner_data or None."""
         path = LoRAAutoTuner._memory_file_path(lora_hash, settings_hash)
