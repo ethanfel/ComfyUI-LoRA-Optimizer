@@ -7748,6 +7748,51 @@ class LoRAAutoTuner(LoRAOptimizer):
                 pass
 
     @staticmethod
+    def _pair_cache_path(hash_a, hash_b):
+        ha, hb = (hash_a, hash_b) if hash_a < hash_b else (hash_b, hash_a)
+        return os.path.join(AUTOTUNER_MEMORY_DIR, f"{ha}_{hb}.pair.json")
+
+    @staticmethod
+    def _pair_cache_load(hash_a, hash_b):
+        """Load per-pair prefix metrics. Returns per_prefix dict or None on miss/stale."""
+        path = LoRAAutoTuner._pair_cache_path(hash_a, hash_b)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if data.get("algo_version") != AUTOTUNER_ALGO_VERSION:
+                logging.info("[AutoTuner Pair Cache] Stale algo version, ignoring")
+                return None
+            return data.get("per_prefix")
+        except Exception as e:
+            logging.warning(f"[AutoTuner Pair Cache] Failed to load: {e}")
+            return None
+
+    @staticmethod
+    def _pair_cache_save(hash_a, hash_b, per_prefix):
+        """Atomic write of per-pair cache to disk."""
+        from datetime import datetime
+        path = LoRAAutoTuner._pair_cache_path(hash_a, hash_b)
+        entry = {
+            "algo_version": AUTOTUNER_ALGO_VERSION,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "per_prefix": per_prefix,
+        }
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(entry, f)
+            os.replace(tmp_path, path)
+            logging.info(f"[AutoTuner Pair Cache] Saved: {path}")
+        except Exception as e:
+            logging.warning(f"[AutoTuner Pair Cache] Failed to save: {e}")
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    @staticmethod
     def _memory_load(lora_hash, settings_hash, requested_top_n):
         """Load and validate a memory entry. Returns tuner_data or None."""
         path = LoRAAutoTuner._memory_file_path(lora_hash, settings_hash)

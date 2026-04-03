@@ -1841,5 +1841,66 @@ class TestLoraCacheIO(unittest.TestCase):
                 self.assertFalse(os.path.exists(path + ".tmp"))
 
 
+class TestPairCacheIO(unittest.TestCase):
+
+    def test_pair_cache_path_sorts_hashes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                path_ab = lora_optimizer.LoRAAutoTuner._pair_cache_path("aaa", "bbb")
+                path_ba = lora_optimizer.LoRAAutoTuner._pair_cache_path("bbb", "aaa")
+                self.assertEqual(path_ab, path_ba)
+                self.assertIn("aaa_bbb", path_ab)
+
+    def test_pair_cache_load_missing_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                self.assertIsNone(
+                    lora_optimizer.LoRAAutoTuner._pair_cache_load("missing1", "missing2"))
+
+    def test_pair_cache_load_stale_algo_version_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                path = os.path.join(tmpdir, "stale1_stale2.pair.json")
+                with open(path, "w") as f:
+                    json.dump({"algo_version": "0.0.0", "per_prefix": {}}, f)
+                self.assertIsNone(
+                    lora_optimizer.LoRAAutoTuner._pair_cache_load("stale1", "stale2"))
+
+    def test_pair_cache_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                per_prefix = {
+                    "prefix_a": {
+                        "overlap": 100, "conflict": 30, "dot": 0.5,
+                        "norm_a_sq": 1.0, "norm_b_sq": 0.5,
+                        "weighted_total": 0.8, "weighted_conflict": 0.2,
+                        "expected_conflict": 0.15, "excess_conflict": 0.05,
+                        "subspace_overlap": 0.3, "subspace_weight": 1.0,
+                    }
+                }
+                lora_optimizer.LoRAAutoTuner._pair_cache_save("aaa", "bbb", per_prefix)
+                loaded = lora_optimizer.LoRAAutoTuner._pair_cache_load("aaa", "bbb")
+                self.assertIsNotNone(loaded)
+                self.assertEqual(loaded["prefix_a"]["overlap"], 100)
+
+    def test_pair_cache_load_commutative(self):
+        """_pair_cache_load("a","b") and ("b","a") return the same data."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                per_prefix = {"prefix_a": {"overlap": 50}}
+                lora_optimizer.LoRAAutoTuner._pair_cache_save("aaa", "bbb", per_prefix)
+                loaded_ab = lora_optimizer.LoRAAutoTuner._pair_cache_load("aaa", "bbb")
+                loaded_ba = lora_optimizer.LoRAAutoTuner._pair_cache_load("bbb", "aaa")
+                self.assertEqual(loaded_ab, loaded_ba)
+
+    def test_pair_cache_save_is_atomic(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                lora_optimizer.LoRAAutoTuner._pair_cache_save("aaa", "bbb", {})
+                path = lora_optimizer.LoRAAutoTuner._pair_cache_path("aaa", "bbb")
+                self.assertTrue(os.path.exists(path))
+                self.assertFalse(os.path.exists(path + ".tmp"))
+
+
 if __name__ == "__main__":
     unittest.main()
