@@ -8016,6 +8016,38 @@ class LoRAAutoTuner(LoRAOptimizer):
         return tuner_data
 
     @staticmethod
+    def _memory_find_by_names(lora_names_sorted, settings_hash, requested_top_n):
+        """Scan for any strength-sensitive entry whose LoRA names match, ignoring strengths.
+        Among matches, returns the entry with the highest total absolute strength."""
+        import glob as _glob
+        pattern = os.path.join(AUTOTUNER_MEMORY_DIR, f"*_{settings_hash}.memory.json")
+        candidates = []
+        for path in _glob.glob(pattern):
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            if data.get("algo_version") != AUTOTUNER_ALGO_VERSION:
+                continue
+            if data.get("memory_version") != AUTOTUNER_MEMORY_VERSION:
+                continue
+            tuner_data = data.get("tuner_data")
+            if not tuner_data or "top_n" not in tuner_data:
+                continue
+            if len(tuner_data["top_n"]) < requested_top_n:
+                continue
+            source_loras = data.get("source_loras", [])
+            if sorted([l["name"] for l in source_loras]) != lora_names_sorted:
+                continue
+            total_strength = sum(abs(l.get("strength", 0)) for l in source_loras)
+            candidates.append((total_strength, tuner_data))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    @staticmethod
     def _memory_save(lora_hash, settings_hash, settings, source_loras, tuner_data):
         """Atomic write of memory entry to disk."""
         from datetime import datetime
@@ -8312,6 +8344,18 @@ class LoRAAutoTuner(LoRAOptimizer):
             if memory_mode in ("auto", "auto_ignore_strength", "read_only"):
                 cached_tuner_data = self._memory_load(
                     memory_lora_hash, settings_hash, top_n)
+                if cached_tuner_data is None and memory_mode == "auto_ignore_strength":
+                    # Fallback: find any strength-sensitive entry with matching LoRA names,
+                    # preferring the one trained at the highest absolute strengths
+                    lora_names_sorted = sorted([l["name"] for l in active_loras])
+                    cached_tuner_data = self._memory_find_by_names(
+                        lora_names_sorted, settings_hash, top_n)
+                    if cached_tuner_data is not None:
+                        logging.info("[AutoTuner Memory] HIT (strength-sensitive fallback) — "
+                                     "using highest-strength cached entry")
+                        # Promote to names-only key so future runs hit directly
+                        self._memory_save(memory_lora_hash, settings_hash,
+                                          memory_settings, active_loras, cached_tuner_data)
                 if cached_tuner_data is not None:
                     logging.info("[AutoTuner Memory] HIT — loading cached tuning results")
                     # Truncate top_n if needed
