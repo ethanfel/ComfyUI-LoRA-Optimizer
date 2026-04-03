@@ -732,6 +732,8 @@ def _reconstruct_from_pair_lora_cache(prefix, lora_entries, pair_entries,
     lora_hashes: {lora_idx: hash_str}
     """
     participating = {i for i, entry in lora_entries.items() if entry is not None}
+    if not participating:
+        return None  # no LoRAs active for this prefix; fall back to _analyze_target_group
 
     # Sign-flip check
     for i in participating:
@@ -1018,14 +1020,39 @@ for target_group in group_items:
                         result, i, active_loras)
             if pair_caches is not None:
                 for (i, j) in pairs:
-                    new_pair_entries[(i, j)][prefix] = self._extract_for_pair_cache(
+                    entry = self._extract_for_pair_cache(
                         result, i, j, lora_hashes[i], lora_hashes[j])
+                    if entry is not None:  # never store None — only real pair data
+                        new_pair_entries[(i, j)][prefix] = entry
     _collect_analysis_result(result)
     if progress_cb is not None:
         progress_cb()
 ```
 
-Apply the same pattern to the CPU path (the futures loop): after `entry = self._extract_for_analysis_cache(...)`, add the lora and pair extraction blocks.
+For the CPU path, two changes are needed:
+
+**A — Before `executor.submit`, add a pair/lora cache hit check** (mirrors the existing run-level cache `continue` at line 4913):
+
+```python
+# Pair/lora cache check (before submitting to thread pool)
+hit = _pair_lora_cache_hit(prefix)
+if hit is not None:
+    lora_entries_hit, pair_entries_hit = hit
+    result = self._reconstruct_from_pair_lora_cache(
+        prefix, lora_entries_hit, pair_entries_hit, active_loras, lora_hashes)
+    if result is not None:
+        _collect_analysis_result(result)
+        if progress_cb is not None:
+            progress_cb()
+        continue
+futures[executor.submit(
+    self._analyze_target_group, target_group, active_loras,
+    model, clip, compute_device, clip_strength_multiplier,
+    merge_refinement
+)] = prefix
+```
+
+**B — In the futures loop**, after `entry = self._extract_for_analysis_cache(...)`, add the same lora and pair extraction blocks as the GPU path (including the `if entry is not None` guard for pairs).
 
 Update the return dict at line 4929 to include:
 
