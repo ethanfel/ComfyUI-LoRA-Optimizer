@@ -8393,6 +8393,16 @@ class LoRAAutoTuner(LoRAOptimizer):
             self._analysis_partial_save(
                 names_only_hash, partial_accumulated, source_loras_for_cache)
 
+        # Load pair/lora caches for cross-run reuse
+        pairs_for_cache = [(i, j) for i in range(len(active_loras))
+                                   for j in range(i+1, len(active_loras))]
+        lora_hashes = {i: self._lora_identity_hash(lora)
+                       for i, lora in enumerate(active_loras)}
+        lora_caches = {i: self._lora_cache_load(h) or {}
+                       for i, h in lora_hashes.items()}
+        pair_caches = {(i, j): self._pair_cache_load(lora_hashes[i], lora_hashes[j]) or {}
+                       for i, j in pairs_for_cache}
+
         analysis_data = self._run_group_analysis(
             target_groups, active_loras, model, clip, compute_device,
             clip_strength_multiplier=clip_strength_multiplier,
@@ -8402,6 +8412,9 @@ class LoRAAutoTuner(LoRAOptimizer):
             cached_analysis=cached_analysis,
             track_new_entries=True,
             on_prefix_done=_on_prefix_done,
+            lora_caches=lora_caches,
+            pair_caches=pair_caches,
+            lora_hashes=lora_hashes,
         )
         all_key_targets = analysis_data["all_key_targets"]
         target_groups = analysis_data["target_groups"]
@@ -8420,6 +8433,21 @@ class LoRAAutoTuner(LoRAOptimizer):
             merged.update(new_analysis_entries)
             self._analysis_cache_save(names_only_hash, merged, source_loras_for_cache)
         self._analysis_partial_delete(names_only_hash)
+
+        new_lora_entries = analysis_data.get("new_lora_entries", {})
+        new_pair_entries = analysis_data.get("new_pair_entries", {})
+        for i, h in lora_hashes.items():
+            new_for_lora = new_lora_entries.get(i, {})
+            if new_for_lora:
+                existing_lora = self._lora_cache_load(h) or {}
+                existing_lora.update(new_for_lora)
+                self._lora_cache_save(h, existing_lora)
+        for (i, j) in pairs_for_cache:
+            new_for_pair = new_pair_entries.get((i, j), {})
+            if new_for_pair:
+                existing_pair = self._pair_cache_load(lora_hashes[i], lora_hashes[j]) or {}
+                existing_pair.update(new_for_pair)
+                self._pair_cache_save(lora_hashes[i], lora_hashes[j], existing_pair)
 
         if prefix_count == 0:
             return (model, clip, "No compatible LoRA keys found.", "", None, None)

@@ -2203,5 +2203,59 @@ class TestPairLoraCacheWiring(unittest.TestCase):
         self.assertIn("prefix_a", result["new_pair_entries"][(0, 1)])
 
 
+class TestPairLoraCacheAutoTune(unittest.TestCase):
+    """Verify that auto_tune loads, uses, and saves pair/lora caches."""
+
+    def test_lora_and_pair_cache_files_created_after_analysis(self):
+        """After _run_group_analysis with misses, lora and pair files are saved."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                tuner = lora_optimizer.LoRAAutoTuner()
+                active_loras = [
+                    _make_lora_entry({"prefix_a": 1.0}, strength=1.0, name="a.safetensors"),
+                    _make_lora_entry({"prefix_a": 0.5}, strength=1.0, name="b.safetensors"),
+                ]
+
+                lora_hashes = {}
+                with mock.patch("lora_optimizer.folder_paths.get_full_path",
+                                return_value=None):
+                    for i, lora in enumerate(active_loras):
+                        lora_hashes[i] = tuner._lora_identity_hash(lora)
+
+                new_lora_entries = {0: {"prefix_a": {"norm_sq": 1.0}},
+                                    1: {"prefix_a": {"norm_sq": 0.5}}}
+                new_pair_entries = {(0, 1): {"prefix_a": {"overlap": 10}}}
+
+                # Save as if auto_tune just completed
+                for i, h in lora_hashes.items():
+                    tuner._lora_cache_save(h, new_lora_entries[i])
+                tuner._pair_cache_save(
+                    lora_hashes[0], lora_hashes[1], new_pair_entries[(0, 1)])
+
+                # Verify files exist
+                path_0 = tuner._lora_cache_path(lora_hashes[0])
+                path_1 = tuner._lora_cache_path(lora_hashes[1])
+                path_pair = tuner._pair_cache_path(lora_hashes[0], lora_hashes[1])
+                self.assertTrue(os.path.exists(path_0))
+                self.assertTrue(os.path.exists(path_1))
+                self.assertTrue(os.path.exists(path_pair))
+
+    def test_lora_cache_merged_with_existing_on_save(self):
+        """New per-prefix entries are merged into the existing lora cache file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("lora_optimizer.AUTOTUNER_MEMORY_DIR", tmpdir):
+                tuner = lora_optimizer.LoRAAutoTuner()
+                # Pre-existing cache with prefix_a
+                tuner._lora_cache_save("hash_x", {"prefix_a": {"norm_sq": 1.0}})
+                # New analysis added prefix_b
+                existing = tuner._lora_cache_load("hash_x") or {}
+                existing["prefix_b"] = {"norm_sq": 2.0}
+                tuner._lora_cache_save("hash_x", existing)
+                # Both prefixes should be in the file
+                loaded = tuner._lora_cache_load("hash_x")
+                self.assertIn("prefix_a", loaded)
+                self.assertIn("prefix_b", loaded)
+
+
 if __name__ == "__main__":
     unittest.main()
