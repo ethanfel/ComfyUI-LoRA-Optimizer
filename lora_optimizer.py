@@ -7332,10 +7332,11 @@ class LoRAAutoTunerSettings:
                     "default": "disabled",
                     "tooltip": "Saves detailed scoring data to a file for analysis. Only useful for developers tuning the scoring system."
                 }),
-                "memory_mode": (["disabled", "auto", "read_only", "clear_and_run"], {
+                "memory_mode": (["disabled", "auto", "auto_ignore_strength", "read_only", "clear_and_run"], {
                     "default": "auto",
                     "tooltip": "Persistent memory for tuning results across sessions.\n"
                                "auto: Load cached results if available, save after tuning.\n"
+                               "auto_ignore_strength: Same as auto but the cache key ignores LoRA strengths — useful when sweeping strengths on orthogonal LoRAs where rankings don't change.\n"
                                "read_only: Use cached results but don't save new ones.\n"
                                "clear_and_run: Delete cached entry and re-tune from scratch."
                 }),
@@ -7702,10 +7703,11 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "default": False,
                     "tooltip": "When enabled, uses smoothed cosine (decision_cosine) for SLERP gate instead of raw avg_cos_sim. Can affect SLERP/weighted_average ratio."
                 }),
-                "memory_mode": (["disabled", "auto", "read_only", "clear_and_run"], {
+                "memory_mode": (["disabled", "auto", "auto_ignore_strength", "read_only", "clear_and_run"], {
                     "default": "auto",
                     "tooltip": "Persistent memory for tuning results across sessions.\n"
                                "auto: Load cached results if available, save after tuning.\n"
+                               "auto_ignore_strength: Same as auto but the cache key ignores LoRA strengths — useful when sweeping strengths on orthogonal LoRAs where rankings don't change.\n"
                                "read_only: Use cached results but don't save new ones.\n"
                                "clear_and_run: Delete cached entry and re-tune from scratch.\n\n"
                                "Cache key uses LoRA names + strengths (order-independent) and tuning settings. "
@@ -8255,9 +8257,12 @@ class LoRAAutoTuner(LoRAOptimizer):
 
         # Order-independent hash for persistent memory (sorted pairs)
         if memory_mode != "disabled" and not _is_sub_merge:
+            if memory_mode == "auto_ignore_strength":
+                _mem_key = sorted([l["name"] for l in active_loras])
+            else:
+                _mem_key = sorted([(l["name"], l["strength"]) for l in active_loras])
             memory_lora_hash = hashlib.sha256(
-                json.dumps(sorted([(l["name"], l["strength"]) for l in active_loras]),
-                           separators=(",", ":")).encode()
+                json.dumps(_mem_key, separators=(",", ":")).encode()
             ).hexdigest()[:16]
 
         evaluator_hash = self._stable_data_hash(evaluator) if evaluator is not None else ""
@@ -8304,7 +8309,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 cached_analysis = None
                 using_partial = False
 
-            if memory_mode in ("auto", "read_only"):
+            if memory_mode in ("auto", "auto_ignore_strength", "read_only"):
                 cached_tuner_data = self._memory_load(
                     memory_lora_hash, settings_hash, top_n)
                 if cached_tuner_data is not None:
@@ -8935,7 +8940,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         prefix_stats.clear()
 
         # Save to persistent memory
-        if memory_mode in ("auto", "clear_and_run") and not _is_sub_merge:
+        if memory_mode in ("auto", "auto_ignore_strength", "clear_and_run") and not _is_sub_merge:
             memory_settings = {
                 "normalize_keys": normalize_keys,
                 "scoring_svd": scoring_svd,
