@@ -4793,6 +4793,75 @@ class LoRAOptimizer(_LoRAMergeBase):
             per_lora_norm_sq,
         )
 
+    @staticmethod
+    def _reconstruct_from_pair_lora_cache(prefix, lora_entries, pair_entries,
+                                           active_loras, lora_hashes):
+        """
+        Reconstruct the _analyze_target_group 8-tuple from per-LoRA and per-pair
+        cache entries. Returns None if any participating LoRA has a sign flip.
+
+        lora_entries: {lora_idx: dict_or_None} — None means non-participating
+        pair_entries: {(i,j): dict} — only pairs where both LoRAs participate
+        lora_hashes: {lora_idx: hash_str}
+        """
+        participating = {i for i, entry in lora_entries.items() if entry is not None}
+        if not participating:
+            return None  # no LoRAs active for this prefix; fall back to _analyze_target_group
+
+        # Sign-flip check
+        for i in participating:
+            entry = lora_entries[i]
+            current_sign = 1 if active_loras[i]["strength"] >= 0 else -1
+            if current_sign != entry.get("strength_sign", 1):
+                logging.info(
+                    f"[AutoTuner Pair/Lora Cache] Sign flip on LoRA {i} "
+                    f"for {prefix!r}, falling back to full analysis")
+                return None
+
+        # Build partial_stats and magnitude_samples
+        partial_stats = []
+        magnitude_samples = []
+        for i in sorted(participating):
+            entry = lora_entries[i]
+            norm_sq = entry["norm_sq"]
+            clip_s = active_loras[i].get("clip_strength")
+            is_clip = entry["is_clip"]
+            eff_s = clip_s if (clip_s is not None and is_clip) else active_loras[i]["strength"]
+            abs_strength = abs(eff_s)
+            display_l2 = math.sqrt(norm_sq) * abs_strength
+            partial_stats.append((i, entry["rank"], display_l2, norm_sq))
+            raw = torch.tensor(entry["magnitude_samples_unscaled"], dtype=torch.float32)
+            magnitude_samples.append(raw * abs_strength)
+
+        # Build pair_conflicts — restore norm_a/norm_b to positional order
+        pair_conflicts = {}
+        for (i, j), metrics in pair_entries.items():
+            m = dict(metrics)
+            hash_i, hash_j = lora_hashes[i], lora_hashes[j]
+            if hash_i > hash_j:
+                # File stores norm_a for smaller hash = j; swap back to i=a, j=b
+                m["norm_a_sq"], m["norm_b_sq"] = m["norm_b_sq"], m["norm_a_sq"]
+            pair_conflicts[(i, j)] = m
+
+        # Build per_lora_norm_sq
+        per_lora_norm_sq = {i: lora_entries[i]["norm_sq"] for i in participating}
+
+        # Get prefix-level metadata from any participating LoRA's entry
+        first = lora_entries[min(participating)]
+        tk = first["target_key"]
+        target_key = tuple(tk) if isinstance(tk, list) else tk
+
+        return (
+            prefix,
+            partial_stats,
+            pair_conflicts,
+            magnitude_samples,
+            (target_key, first["is_clip"]),
+            first["skip_count"],
+            first["raw_n"],
+            per_lora_norm_sq,
+        )
+
     def _run_group_analysis(self, target_groups, active_loras, model, clip,
                             compute_device, clip_strength_multiplier=1.0,
                             merge_refinement="none",

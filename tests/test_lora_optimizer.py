@@ -1981,5 +1981,146 @@ class TestCacheExtraction(unittest.TestCase):
         self.assertIsNone(entry)
 
 
+class TestPairLoraReconstruction(unittest.TestCase):
+
+    def _make_lora_entries(self):
+        return {
+            0: {
+                "norm_sq": 2.25, "rank": 16,
+                "magnitude_samples_unscaled": [0.5, 1.0],
+                "strength_sign": 1,
+                "target_key": "layer.weight",
+                "is_clip": False, "skip_count": 0, "raw_n": 2,
+            },
+            1: {
+                "norm_sq": 0.81, "rank": 32,
+                "magnitude_samples_unscaled": [0.3, 0.6],
+                "strength_sign": 1,
+                "target_key": "layer.weight",
+                "is_clip": False, "skip_count": 0, "raw_n": 2,
+            },
+        }
+
+    def _make_pair_entries(self, hash_0="aaa", hash_1="bbb"):
+        # hash_0 < hash_1, so norm_a_sq = lora 0
+        return {
+            (0, 1): {
+                "overlap": 50, "conflict": 10, "dot": 0.4,
+                "norm_a_sq": 2.25, "norm_b_sq": 0.81,
+                "weighted_total": 0.6, "weighted_conflict": 0.1,
+                "expected_conflict": 0.12, "excess_conflict": 0.0,
+                "subspace_overlap": 0.2, "subspace_weight": 0.5,
+            }
+        }
+
+    def test_reconstruction_returns_8tuple(self):
+        active_loras = [
+            {"name": "a.safetensors", "strength": 1.5},
+            {"name": "b.safetensors", "strength": 0.9},
+        ]
+        lora_hashes = {0: "aaa", 1: "bbb"}
+        result = lora_optimizer.LoRAOptimizer._reconstruct_from_pair_lora_cache(
+            "prefix_a",
+            lora_entries=self._make_lora_entries(),
+            pair_entries=self._make_pair_entries(),
+            active_loras=active_loras,
+            lora_hashes=lora_hashes,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 8)
+        prefix, partial_stats, pair_conflicts, magnitude_samples, target_info, skip_count, raw_n, per_lora_norm_sq = result
+        self.assertEqual(prefix, "prefix_a")
+        self.assertEqual(len(partial_stats), 2)
+        self.assertIn((0, 1), pair_conflicts)
+        self.assertAlmostEqual(per_lora_norm_sq[0], 2.25)
+
+    def test_reconstruction_rescales_magnitude_by_current_strength(self):
+        active_loras = [
+            {"name": "a.safetensors", "strength": 2.0},  # different from cache
+            {"name": "b.safetensors", "strength": 1.0},
+        ]
+        lora_hashes = {0: "aaa", 1: "bbb"}
+        result = lora_optimizer.LoRAOptimizer._reconstruct_from_pair_lora_cache(
+            "prefix_a",
+            lora_entries=self._make_lora_entries(),
+            pair_entries=self._make_pair_entries(),
+            active_loras=active_loras,
+            lora_hashes=lora_hashes,
+        )
+        _, _, _, magnitude_samples, _, _, _, _ = result
+        # unscaled[0] = 0.5, rescaled by strength=2.0 → 1.0
+        self.assertAlmostEqual(magnitude_samples[0][0].item(), 1.0, places=5)
+
+    def test_reconstruction_returns_none_on_sign_flip(self):
+        active_loras = [
+            {"name": "a.safetensors", "strength": -1.0},  # sign flipped vs cached +1
+            {"name": "b.safetensors", "strength": 1.0},
+        ]
+        lora_hashes = {0: "aaa", 1: "bbb"}
+        result = lora_optimizer.LoRAOptimizer._reconstruct_from_pair_lora_cache(
+            "prefix_a",
+            lora_entries=self._make_lora_entries(),
+            pair_entries=self._make_pair_entries(),
+            active_loras=active_loras,
+            lora_hashes=lora_hashes,
+        )
+        self.assertIsNone(result)
+
+    def test_reconstruction_swaps_norm_when_hash_ordering_differs(self):
+        """When lora 0's hash > lora 1's hash, norm_a_sq in pair file is lora 1's."""
+        active_loras = [
+            {"name": "a.safetensors", "strength": 1.0},
+            {"name": "b.safetensors", "strength": 1.0},
+        ]
+        lora_hashes = {0: "zzz", 1: "aaa"}  # lora 1 has smaller hash
+        # In the pair file, norm_a_sq = lora with smaller hash = lora 1 = 0.81
+        pair_entries = {
+            (0, 1): {
+                "overlap": 50, "conflict": 10, "dot": 0.4,
+                "norm_a_sq": 0.81,   # lora 1 (smaller hash "aaa")
+                "norm_b_sq": 2.25,   # lora 0 (larger hash "zzz")
+                "weighted_total": 0.6, "weighted_conflict": 0.1,
+                "expected_conflict": 0.12, "excess_conflict": 0.0,
+                "subspace_overlap": 0.2, "subspace_weight": 0.5,
+            }
+        }
+        result = lora_optimizer.LoRAOptimizer._reconstruct_from_pair_lora_cache(
+            "prefix_a",
+            lora_entries=self._make_lora_entries(),
+            pair_entries=pair_entries,
+            active_loras=active_loras,
+            lora_hashes=lora_hashes,
+        )
+        self.assertIsNotNone(result)
+        _, _, pair_conflicts, _, _, _, _, _ = result
+        # After reconstruction, norm_a_sq should be for lora 0 = 2.25
+        self.assertAlmostEqual(pair_conflicts[(0, 1)]["norm_a_sq"], 2.25)
+        self.assertAlmostEqual(pair_conflicts[(0, 1)]["norm_b_sq"], 0.81)
+
+    def test_reconstruction_handles_non_participating_loras(self):
+        """LoRA with None entry (non-participating) is excluded from partial_stats."""
+        active_loras = [
+            {"name": "a.safetensors", "strength": 1.0},
+            {"name": "b.safetensors", "strength": 1.0},
+            {"name": "c.safetensors", "strength": 1.0},  # non-participating
+        ]
+        lora_hashes = {0: "aaa", 1: "bbb", 2: "ccc"}
+        lora_entries = {**self._make_lora_entries(), 2: None}
+        pair_entries = self._make_pair_entries()  # only (0,1)
+        result = lora_optimizer.LoRAOptimizer._reconstruct_from_pair_lora_cache(
+            "prefix_a",
+            lora_entries=lora_entries,
+            pair_entries=pair_entries,
+            active_loras=active_loras,
+            lora_hashes=lora_hashes,
+        )
+        self.assertIsNotNone(result)
+        _, partial_stats, pair_conflicts, _, _, _, _, _ = result
+        lora_indices_in_stats = [s[0] for s in partial_stats]
+        self.assertNotIn(2, lora_indices_in_stats)
+        self.assertNotIn((0, 2), pair_conflicts)
+        self.assertNotIn((1, 2), pair_conflicts)
+
+
 if __name__ == "__main__":
     unittest.main()
