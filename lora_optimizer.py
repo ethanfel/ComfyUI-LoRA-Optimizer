@@ -85,7 +85,8 @@ folder_paths.add_model_folder_path("tuner_data", TUNER_DATA_DIR)
 AUTOTUNER_MEMORY_DIR = os.path.join(folder_paths.models_dir, "autotuner_memory")
 os.makedirs(AUTOTUNER_MEMORY_DIR, exist_ok=True)
 AUTOTUNER_MEMORY_VERSION = 1
-AUTOTUNER_ALGO_VERSION = "1.6.0"  # Bump when scoring/analysis logic changes
+AUTOTUNER_ALGO_VERSION = "1.5.0"   # Bump when scoring formula or memory/config format changes
+ANALYSIS_CACHE_VERSION = "1.6.0"   # Bump when per-prefix conflict math changes (lora/pair/analysis caches)
 COMMUNITY_CACHE_REPO = "ethanfel/lora-optimizer-community-cache"
 COMMUNITY_CACHE_BASE_URL = (
     f"https://huggingface.co/datasets/{COMMUNITY_CACHE_REPO}/resolve/main"
@@ -7805,7 +7806,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         try:
             with open(path) as f:
                 data = json.load(f)
-            if data.get("algo_version") != AUTOTUNER_ALGO_VERSION:
+            if data.get("algo_version") != ANALYSIS_CACHE_VERSION:
                 logging.info("[AutoTuner Analysis Cache] Stale algo version, ignoring")
                 return None
             return data.get("per_prefix")
@@ -7820,7 +7821,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         path = LoRAAutoTuner._analysis_cache_path(names_only_hash)
         entry = {
             "analysis_version": 1,
-            "algo_version": AUTOTUNER_ALGO_VERSION,
+            "algo_version": ANALYSIS_CACHE_VERSION,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "source_loras": source_loras,
             "per_prefix": per_prefix,
@@ -7852,7 +7853,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         try:
             with open(path) as f:
                 data = json.load(f)
-            if data.get("algo_version") != AUTOTUNER_ALGO_VERSION:
+            if data.get("algo_version") != ANALYSIS_CACHE_VERSION:
                 logging.info("[AutoTuner Analysis Partial] Stale algo version, ignoring")
                 return None
             return data.get("per_prefix")
@@ -7867,7 +7868,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         path = LoRAAutoTuner._analysis_partial_path(names_only_hash)
         entry = {
             "analysis_version": 1,
-            "algo_version": AUTOTUNER_ALGO_VERSION,
+            "algo_version": ANALYSIS_CACHE_VERSION,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "source_loras": source_loras,
             "per_prefix": per_prefix,
@@ -8017,7 +8018,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         for i, ch in content_hashes.items():
             try:
                 data = LoRAAutoTuner._community_download(f"lora/{ch}.lora.json")
-                if (data and data.get("algo_version") == AUTOTUNER_ALGO_VERSION
+                if (data and data.get("algo_version") == ANALYSIS_CACHE_VERSION
                         and "per_prefix" in data):
                     for k, v in data["per_prefix"].items():
                         if k not in lora_caches[i]:
@@ -8034,7 +8035,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 try:
                     ha, hb = sorted([content_hashes[i], content_hashes[j]])
                     data = LoRAAutoTuner._community_download(f"pair/{ha}_{hb}.pair.json")
-                    if (data and data.get("algo_version") == AUTOTUNER_ALGO_VERSION
+                    if (data and data.get("algo_version") == ANALYSIS_CACHE_VERSION
                             and "per_prefix" in data):
                         cache = pair_caches.get((i, j), {})
                         for k, v in data["per_prefix"].items():
@@ -8107,7 +8108,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 if existing:
                     LoRAAutoTuner._community_upload(
                         f"lora/{ch}.lora.json",
-                        {"algo_version": AUTOTUNER_ALGO_VERSION, "per_prefix": existing},
+                        {"algo_version": ANALYSIS_CACHE_VERSION, "per_prefix": existing},
                         token,
                     )
             except Exception as e:
@@ -8124,7 +8125,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 if existing:
                     LoRAAutoTuner._community_upload(
                         f"pair/{ha}_{hb}.pair.json",
-                        {"algo_version": AUTOTUNER_ALGO_VERSION, "per_prefix": existing},
+                        {"algo_version": ANALYSIS_CACHE_VERSION, "per_prefix": existing},
                         token,
                     )
             except Exception as e:
@@ -8170,7 +8171,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         try:
             with open(path) as f:
                 data = json.load(f)
-            if data.get("algo_version") != AUTOTUNER_ALGO_VERSION:
+            if data.get("algo_version") != ANALYSIS_CACHE_VERSION:
                 logging.info("[AutoTuner Lora Cache] Stale algo version, ignoring")
                 return None
             return data.get("per_prefix")
@@ -8184,7 +8185,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         from datetime import datetime
         path = LoRAAutoTuner._lora_cache_path(lora_hash)
         entry = {
-            "algo_version": AUTOTUNER_ALGO_VERSION,
+            "algo_version": ANALYSIS_CACHE_VERSION,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "per_prefix": per_prefix,
         }
@@ -8215,7 +8216,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         try:
             with open(path) as f:
                 data = json.load(f)
-            if data.get("algo_version") != AUTOTUNER_ALGO_VERSION:
+            if data.get("algo_version") != ANALYSIS_CACHE_VERSION:
                 logging.info("[AutoTuner Pair Cache] Stale algo version, ignoring")
                 return None
             return data.get("per_prefix")
@@ -8229,7 +8230,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         from datetime import datetime
         path = LoRAAutoTuner._pair_cache_path(hash_a, hash_b)
         entry = {
-            "algo_version": AUTOTUNER_ALGO_VERSION,
+            "algo_version": ANALYSIS_CACHE_VERSION,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "per_prefix": per_prefix,
         }
