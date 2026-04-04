@@ -85,7 +85,11 @@ folder_paths.add_model_folder_path("tuner_data", TUNER_DATA_DIR)
 AUTOTUNER_MEMORY_DIR = os.path.join(folder_paths.models_dir, "autotuner_memory")
 os.makedirs(AUTOTUNER_MEMORY_DIR, exist_ok=True)
 AUTOTUNER_MEMORY_VERSION = 1
-AUTOTUNER_ALGO_VERSION = "1.5.0"  # Bump when scoring/analysis logic changes
+AUTOTUNER_ALGO_VERSION = "1.6.0"  # Bump when scoring/analysis logic changes
+COMMUNITY_CACHE_REPO = "ethanfel/lora-optimizer-community-cache"
+COMMUNITY_CACHE_BASE_URL = (
+    f"https://huggingface.co/datasets/{COMMUNITY_CACHE_REPO}/resolve/main"
+)
 
 
 
@@ -7340,9 +7344,11 @@ class LoRAAutoTunerSettings:
                     "default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05,
                     "tooltip": "How much of your free RAM the diff cache can use (in 'auto' mode). 0.5 = up to half your available RAM."
                 }),
-                "record_dataset": (["disabled", "enabled"], {
+                "community_cache": (["disabled", "download_only", "upload_and_download"], {
                     "default": "disabled",
-                    "tooltip": "Saves detailed scoring data to a file for analysis. Only useful for developers tuning the scoring system."
+                    "tooltip": "Community cache: share and reuse LoRA analysis results via Hugging Face.\n"
+                               "download_only: anonymously download cached results before analysis — no account needed.\n"
+                               "upload_and_download: also upload your results after tuning. Requires HF_TOKEN environment variable."
                 }),
                 "memory_mode": (["disabled", "auto", "auto_ignore_strength", "read_only", "clear_and_run"], {
                     "default": "auto",
@@ -7379,7 +7385,7 @@ class LoRAAutoTunerSettings:
 
     def build_settings(self, top_n, scoring_svd, scoring_device,
                        scoring_speed, scoring_formula,
-                       diff_cache_mode, diff_cache_ram_pct, record_dataset,
+                       diff_cache_mode, diff_cache_ram_pct, community_cache,
                        memory_mode="disabled", selection=1,
                        merge_settings=None, evaluator=None):
         ms = merge_settings if merge_settings is not None else LoRAMergeSettings._DEFAULTS
@@ -7400,7 +7406,7 @@ class LoRAAutoTunerSettings:
             "cache_patches": ms["cache_patches"],
             "diff_cache_mode": diff_cache_mode,
             "diff_cache_ram_pct": diff_cache_ram_pct,
-            "record_dataset": record_dataset,
+            "community_cache": community_cache,
             "evaluator": evaluator,
             "memory_mode": memory_mode,
             "selection": selection,
@@ -7534,7 +7540,7 @@ class LoRAOptimizerSimple(LoRAOptimizer):
                     cache_patches=settings["cache_patches"],
                     diff_cache_mode=settings["diff_cache_mode"],
                     diff_cache_ram_pct=settings["diff_cache_ram_pct"],
-                    record_dataset=settings["record_dataset"],
+                    community_cache=settings.get("community_cache", "disabled"),
                     evaluator=settings.get("evaluator"),
                     memory_mode=settings.get("memory_mode", "disabled"),
                     selection=settings.get("selection", 1),
@@ -7670,9 +7676,9 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "evaluator": ("AUTOTUNER_EVALUATOR", {
                     "tooltip": "Optional external evaluator spec. Use this to blend prompt/reference scoring from your own generation code with the built-in merge metrics."
                 }),
-                "record_dataset": (["disabled", "enabled"], {
+                "community_cache": (["disabled", "download_only", "upload_and_download"], {
                     "default": "disabled",
-                    "tooltip": "Record analysis metrics and scored configs to a JSONL dataset file for threshold tuning research. Saved to lora_optimizer_reports/autotuner_dataset.jsonl."
+                    "tooltip": "Community-backed cache on Hugging Face. 'download_only': download precomputed results anonymously. 'upload_and_download': also upload your results (requires HF_TOKEN env var and huggingface_hub installed)."
                 }),
                 "cache_patches": (["enabled", "disabled"], {
                     "default": "enabled",
@@ -7904,6 +7910,254 @@ class LoRAAutoTuner(LoRAOptimizer):
         hash_input = json.dumps(entry, separators=(",", ":"))
         return hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
+    # --- Community cache: content-based hashing ---
+
+    @staticmethod
+    def _content_hash_cache_path():
+        return os.path.join(AUTOTUNER_MEMORY_DIR, ".content_hashes.json")
+
+    @staticmethod
+    def _load_content_hash_cache():
+        try:
+            with open(LoRAAutoTuner._content_hash_cache_path(), "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_content_hash_cache(cache):
+        try:
+            path = LoRAAutoTuner._content_hash_cache_path()
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(cache, f, separators=(",", ":"))
+            os.replace(tmp, path)
+        except Exception as e:
+            logging.warning(f"[AutoTuner Community] Could not save content hash cache: {e}")
+
+    @staticmethod
+    def _lora_content_hash(lora_item):
+        """SHA256[:16] of file contents, cached locally by (path, mtime, size)."""
+        try:
+            name = lora_item["name"]
+            path = folder_paths.get_full_path("loras", name)
+            if path is None:
+                return None
+            st = os.stat(path)
+            cache_key = f"{path}|{st.st_mtime}|{st.st_size}"
+            cache = LoRAAutoTuner._load_content_hash_cache()
+            if cache_key in cache:
+                return cache[cache_key]
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            content_hash = h.hexdigest()[:16]
+            cache[cache_key] = content_hash
+            LoRAAutoTuner._save_content_hash_cache(cache)
+            return content_hash
+        except Exception as e:
+            logging.warning(f"[AutoTuner Community] Could not compute content hash for "
+                            f"'{lora_item.get('name', '?')}': {e}")
+            return None
+
+    # --- Community cache: network I/O ---
+
+    @staticmethod
+    def _community_download(path_in_repo):
+        """Download a JSON file from the community cache repo. Returns dict or None."""
+        import urllib.request, urllib.error
+        url = f"{COMMUNITY_CACHE_BASE_URL}/{path_in_repo}"
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            logging.warning(f"[AutoTuner Community] Download failed ({e.code}): {url}")
+            return None
+        except Exception as e:
+            logging.warning(f"[AutoTuner Community] Download error: {e}")
+            return None
+
+    @staticmethod
+    def _community_upload(path_in_repo, data, token):
+        """Upload a JSON file to the community cache repo. Returns True on success."""
+        try:
+            from huggingface_hub import HfApi
+        except ImportError:
+            logging.warning("[AutoTuner Community] huggingface_hub not installed — "
+                            "skipping upload. Install it with: pip install huggingface_hub")
+            return False
+        try:
+            import io
+            content = json.dumps(data, separators=(",", ":")).encode()
+            HfApi(token=token).upload_file(
+                path_or_fileobj=io.BytesIO(content),
+                path_in_repo=path_in_repo,
+                repo_id=COMMUNITY_CACHE_REPO,
+                repo_type="dataset",
+            )
+            logging.info(f"[AutoTuner Community] Uploaded: {path_in_repo}")
+            return True
+        except Exception as e:
+            logging.warning(f"[AutoTuner Community] Upload failed for {path_in_repo}: {e}")
+            return False
+
+    @staticmethod
+    def _community_download_caches(active_loras, content_hashes, lora_caches,
+                                    pair_caches, arch_preset, top_n):
+        """Download community pair/lora caches and config. Mutates lora_caches and
+        pair_caches in place (fill-missing-only — local data always wins).
+        Returns reconstructed tuner_data if a config hit occurs, else None."""
+        n_lora_hits = 0
+        n_pair_hits = 0
+
+        # Step 1: lora caches (each in its own try so mutations persist on partial failure)
+        for i, ch in content_hashes.items():
+            try:
+                data = LoRAAutoTuner._community_download(f"lora/{ch}.lora.json")
+                if (data and data.get("algo_version") == AUTOTUNER_ALGO_VERSION
+                        and "per_prefix" in data):
+                    for k, v in data["per_prefix"].items():
+                        if k not in lora_caches[i]:
+                            lora_caches[i][k] = v
+                    n_lora_hits += 1
+            except Exception as e:
+                logging.warning(f"[AutoTuner Community] Error merging lora cache {i}: {e}")
+
+        # Step 2: pair caches
+        for i in range(len(active_loras)):
+            for j in range(i + 1, len(active_loras)):
+                if i not in content_hashes or j not in content_hashes:
+                    continue
+                try:
+                    ha, hb = sorted([content_hashes[i], content_hashes[j]])
+                    data = LoRAAutoTuner._community_download(f"pair/{ha}_{hb}.pair.json")
+                    if (data and data.get("algo_version") == AUTOTUNER_ALGO_VERSION
+                            and "per_prefix" in data):
+                        cache = pair_caches.get((i, j), {})
+                        for k, v in data["per_prefix"].items():
+                            if k not in cache:
+                                cache[k] = v
+                        pair_caches[(i, j)] = cache
+                        n_pair_hits += 1
+                except Exception as e:
+                    logging.warning(f"[AutoTuner Community] Error merging pair cache ({i},{j}): {e}")
+
+        if n_lora_hits or n_pair_hits:
+            logging.info(f"[AutoTuner Community] Cache fill: {n_lora_hits} lora, {n_pair_hits} pair")
+
+        # Step 3: config
+        try:
+            sorted_hashes = sorted(content_hashes.values())
+            joined = "_".join(sorted_hashes)
+            data = LoRAAutoTuner._community_download(f"config/{joined}_{arch_preset}.config.json")
+            if data is None:
+                return None
+            if data.get("algo_version") != AUTOTUNER_ALGO_VERSION:
+                logging.info("[AutoTuner Community] Config version mismatch, ignoring")
+                return None
+            if "config" not in data or "score" not in data:
+                return None
+            return {
+                "version": 1,
+                "lora_hash": "",
+                "source_loras": [],
+                "normalize_keys": "enabled",
+                "architecture_preset": data.get("arch_preset", arch_preset),
+                "auto_strength_floor": -1.0,
+                "decision_smoothing": 0.25,
+                "analysis_summary": {
+                    "n_loras": len(active_loras),
+                    "prefix_count": 0,
+                    "avg_conflict_ratio": 0.0,
+                    "avg_excess_conflict": 0.0,
+                    "avg_subspace_overlap": 0.0,
+                    "avg_cosine_sim": 0.0,
+                    "magnitude_ratio": 1.0,
+                    "decision_smoothing": 0.25,
+                },
+                "top_n": [{
+                    "rank": 1,
+                    "score_heuristic": 0.0,
+                    "score_measured": data["score"],
+                    "score_external": None,
+                    "score_final": data["score"],
+                    "config": data["config"],
+                    "metrics": {},
+                    "external_details": None,
+                }],
+            }
+        except Exception as e:
+            logging.warning(f"[AutoTuner Community] Error downloading config: {e}")
+            return None
+
+    @staticmethod
+    def _community_upload_results(new_lora_entries, new_pair_entries, content_hashes,
+                                   lora_hashes, tuner_data, arch_preset, token):
+        """Upload newly computed lora/pair caches and (if best) a winning config."""
+        # Upload new lora caches
+        for i, new_entries in new_lora_entries.items():
+            if not new_entries or i not in content_hashes:
+                continue
+            try:
+                ch = content_hashes[i]
+                existing = LoRAAutoTuner._lora_cache_load(lora_hashes[i]) or {}
+                existing.update({k: v for k, v in new_entries.items() if v is not None})
+                if existing:
+                    LoRAAutoTuner._community_upload(
+                        f"lora/{ch}.lora.json",
+                        {"algo_version": AUTOTUNER_ALGO_VERSION, "per_prefix": existing},
+                        token,
+                    )
+            except Exception as e:
+                logging.warning(f"[AutoTuner Community] Error uploading lora cache {i}: {e}")
+
+        # Upload new pair caches
+        for (i, j), new_entries in new_pair_entries.items():
+            if not new_entries or i not in content_hashes or j not in content_hashes:
+                continue
+            try:
+                ha, hb = sorted([content_hashes[i], content_hashes[j]])
+                existing = LoRAAutoTuner._pair_cache_load(lora_hashes[i], lora_hashes[j]) or {}
+                existing.update(new_entries)
+                if existing:
+                    LoRAAutoTuner._community_upload(
+                        f"pair/{ha}_{hb}.pair.json",
+                        {"algo_version": AUTOTUNER_ALGO_VERSION, "per_prefix": existing},
+                        token,
+                    )
+            except Exception as e:
+                logging.warning(f"[AutoTuner Community] Error uploading pair cache ({i},{j}): {e}")
+
+        # Upload config if local score beats community
+        try:
+            if not tuner_data.get("top_n"):
+                return
+            best = tuner_data["top_n"][0]
+            local_score = best.get("score_final", 0.0)
+            sorted_hashes = sorted(content_hashes.values())
+            joined = "_".join(sorted_hashes)
+            config_path = f"config/{joined}_{arch_preset}.config.json"
+            existing_config = LoRAAutoTuner._community_download(config_path)
+            if existing_config and existing_config.get("score", 0.0) >= local_score:
+                logging.info("[AutoTuner Community] Community config score >= local, not uploading")
+                return
+            LoRAAutoTuner._community_upload(
+                config_path,
+                {
+                    "algo_version": AUTOTUNER_ALGO_VERSION,
+                    "arch_preset": arch_preset,
+                    "lora_content_hashes": sorted_hashes,
+                    "score": local_score,
+                    "config": best["config"],
+                },
+                token,
+            )
+        except Exception as e:
+            logging.warning(f"[AutoTuner Community] Error uploading config: {e}")
+
     @staticmethod
     def _lora_cache_path(lora_hash):
         return os.path.join(AUTOTUNER_MEMORY_DIR, f"{lora_hash}.lora.json")
@@ -8128,7 +8382,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                   scoring_svd="disabled",
                   scoring_device="gpu",
                   architecture_preset="auto", auto_strength_floor=-1.0, evaluator=None,
-                  record_dataset="disabled",
+                  community_cache="disabled",
                   cache_patches="enabled",
                   diff_cache_mode="disabled", diff_cache_ram_pct=0.5, vram_budget=0.0,
                   scoring_speed="full", scoring_formula="v2", output_mode="merge",
@@ -8219,7 +8473,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                         architecture_preset=preset_key,
                         auto_strength_floor=auto_strength_floor,
                         evaluator=evaluator,
-                        record_dataset=record_dataset,
+                        community_cache=community_cache,
                         cache_patches=cache_patches,
                         diff_cache_mode=diff_cache_mode,
                         diff_cache_ram_pct=diff_cache_ram_pct,
@@ -8466,6 +8720,82 @@ class LoRAAutoTuner(LoRAOptimizer):
                        for i, h in lora_hashes.items()}
         pair_caches = {(i, j): self._pair_cache_load(lora_hashes[i], lora_hashes[j]) or {}
                        for i, j in pairs_for_cache}
+
+        # --- Community cache download ---
+        _community_tuner_data = None
+        content_hashes = {}
+        if community_cache in ("download_only", "upload_and_download") and not _is_sub_merge:
+            logging.info("[AutoTuner Community] Computing content hashes...")
+            _all_hashed = True
+            for _i, _lora in enumerate(active_loras):
+                _ch = self._lora_content_hash(_lora)
+                if _ch is not None:
+                    content_hashes[_i] = _ch
+                else:
+                    logging.warning(
+                        f"[AutoTuner Community] Could not hash '{_lora['name']}', disabling community cache")
+                    _all_hashed = False
+                    break
+            if _all_hashed:
+                _arch_key_for_community = (getattr(self, '_detected_arch', None) or
+                                           architecture_preset)
+                _community_tuner_data = self._community_download_caches(
+                    active_loras, content_hashes, lora_caches, pair_caches,
+                    arch_preset=_arch_key_for_community, top_n=top_n)
+            else:
+                content_hashes = {}
+
+        if _community_tuner_data is not None and not _is_sub_merge:
+            logging.info("[AutoTuner Community] COMMUNITY CACHE HIT — replaying config")
+            if len(_community_tuner_data["top_n"]) > top_n:
+                _community_tuner_data["top_n"] = _community_tuner_data["top_n"][:top_n]
+            _sel_idx = min(selection, len(_community_tuner_data["top_n"])) - 1
+            _comm_report = self._build_memory_hit_report(
+                "community", _community_tuner_data, output_strength,
+                scoring_speed=scoring_speed, applied_rank=_sel_idx + 1)
+            _comm_report = "[COMMUNITY CACHE HIT]\n" + _comm_report
+
+            if output_mode == "tuning_only":
+                _comm_result = (model, clip, _comm_report, "", _community_tuner_data, None)
+                if cache_patches == "enabled":
+                    if not hasattr(self, '_autotuner_cache'):
+                        self._autotuner_cache = {}
+                    self._autotuner_cache[at_cache_key] = (_comm_result, "tuning_only")
+                return _comm_result
+
+            _comm_config = _community_tuner_data["top_n"][_sel_idx]["config"]
+            _comm_strategy_override = (_comm_config["merge_mode"]
+                                        if _comm_config["optimization_mode"] == "global" else "")
+            _comm_model, _comm_clip, _, _comm_analysis_report, _comm_lora_data = super().optimize_merge(
+                model, lora_stack, output_strength,
+                clip=clip,
+                clip_strength_multiplier=clip_strength_multiplier,
+                auto_strength=_comm_config["auto_strength"],
+                auto_strength_floor=_community_tuner_data.get(
+                    "auto_strength_floor", auto_strength_floor),
+                optimization_mode=_comm_config["optimization_mode"],
+                sparsification=_comm_config["sparsification"],
+                sparsification_density=_comm_config["sparsification_density"],
+                dare_dampening=_comm_config["dare_dampening"],
+                merge_refinement=_comm_config["merge_refinement"],
+                merge_strategy_override=_comm_strategy_override,
+                strategy_set=_comm_config.get("strategy_set", "full"),
+                normalize_keys=_community_tuner_data.get("normalize_keys", normalize_keys),
+                architecture_preset=_community_tuner_data.get(
+                    "architecture_preset", architecture_preset),
+                decision_smoothing=_community_tuner_data.get(
+                    "decision_smoothing", decision_smoothing),
+                smooth_slerp_gate=smooth_slerp_gate,
+                cache_patches=cache_patches,
+                vram_budget=vram_budget,
+            )
+            _comm_result = (_comm_model, _comm_clip, _comm_report,
+                            _comm_analysis_report, _community_tuner_data, _comm_lora_data)
+            if cache_patches == "enabled":
+                if not hasattr(self, '_autotuner_cache'):
+                    self._autotuner_cache = {}
+                self._autotuner_cache[at_cache_key] = (_comm_result, "merge")
+            return _comm_result
 
         analysis_data = self._run_group_analysis(
             target_groups, active_loras, model, clip, compute_device,
@@ -8986,13 +9316,6 @@ class LoRAAutoTuner(LoRAOptimizer):
             } for r in results],
         }
 
-        # Save dataset entry for threshold tuning (opt-in)
-        if record_dataset == "enabled":
-            self._save_tuner_dataset_entry(
-                tuner_data, active_loras, prefix_stats,
-                getattr(self, '_detected_arch', None),
-                names_only_hash=names_only_hash,
-                new_analysis_entries=new_analysis_entries)
         prefix_stats.clear()
 
         # Save to persistent memory
@@ -9012,6 +9335,17 @@ class LoRAAutoTuner(LoRAOptimizer):
             settings_hash = self._memory_settings_hash(memory_settings)
             self._memory_save(memory_lora_hash, settings_hash,
                               memory_settings, active_loras, tuner_data)
+
+        # --- Community cache upload ---
+        if (community_cache == "upload_and_download" and not _is_sub_merge
+                and len(content_hashes) == len(active_loras)):
+            _hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            if not _hf_token:
+                logging.warning("[AutoTuner Community] HF_TOKEN not set, skipping upload")
+            else:
+                self._community_upload_results(
+                    new_lora_entries, new_pair_entries,
+                    content_hashes, lora_hashes, tuner_data, tuner_preset_key, _hf_token)
 
         # Clamp selection to available results
         sel_idx = min(selection, len(results)) - 1
@@ -9138,7 +9472,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                         # Override settings for sub-merge
                         sub_kwargs = dict(at_kwargs)
                         sub_kwargs["cache_patches"] = "disabled"
-                        sub_kwargs["record_dataset"] = "disabled"
+                        sub_kwargs["community_cache"] = "disabled"
                         sub_kwargs["output_mode"] = "merge"
                         sub_kwargs["_is_sub_merge"] = True
                         sub_kwargs["_suppress_pbar"] = True
@@ -9345,7 +9679,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                    clip_strength_multiplier=1.0, top_n=3, normalize_keys="disabled",
                    scoring_svd="disabled",
                    scoring_device="gpu",
-                   architecture_preset="auto", auto_strength_floor=-1.0, evaluator=None, record_dataset="disabled",
+                   architecture_preset="auto", auto_strength_floor=-1.0, evaluator=None, community_cache="disabled",
                    cache_patches="enabled",
                    diff_cache_mode="disabled", diff_cache_ram_pct=0.5,
                    vram_budget=0.0, scoring_speed="full", scoring_formula="v2",
@@ -9355,7 +9689,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         return (id(model), id(lora_stack), output_strength, clip_strength_multiplier, top_n,
                 normalize_keys, scoring_svd, scoring_device,
                 architecture_preset,
-                vram_budget, record_dataset, scoring_speed, scoring_formula, output_mode,
+                vram_budget, community_cache, scoring_speed, scoring_formula, output_mode,
                 auto_strength_floor, decision_smoothing, evaluator_hash, memory_mode,
                 selection)
 

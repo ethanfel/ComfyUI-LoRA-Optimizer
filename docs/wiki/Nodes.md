@@ -139,7 +139,7 @@ AutoTuner-specific configuration. Accepts optional Merge Settings input.
 | `scoring_formula` | COMBO | Yes | `v2` | `v2`, `v1` — scoring formula version |
 | `diff_cache_mode` | COMBO | Yes | `auto` | `disabled`, `auto`, `ram`, `disk` |
 | `diff_cache_ram_pct` | FLOAT | Yes | 0.5 | RAM fraction for auto diff cache (0.1–0.9) |
-| `record_dataset` | COMBO | Yes | `disabled` | `enabled`, `disabled` — save metrics to JSONL |
+| `community_cache` | COMBO | Yes | `disabled` | `disabled`, `download_only`, `upload_and_download` — community HF cache |
 | `memory_mode` | COMBO | Yes | `auto` | `disabled`, `auto`, `read_only`, `clear_and_run` — persistent tuning result cache across sessions |
 | `selection` | INT | Yes | 1 | Which ranked config to replay from memory on a cache hit (1 = top-ranked) |
 
@@ -250,7 +250,7 @@ All inputs from the Legacy optimizer, plus:
 | `auto_strength_floor` | FLOAT | -1.0 | Minimum auto-strength scale factor for orthogonal LoRAs |
 | `decision_smoothing` | FLOAT | 0.25 | Same smoothing control as the optimizer; affects both ranking and final merge |
 | `evaluator` | AUTOTUNER_EVALUATOR | — | Optional external evaluator hook for prompt/reference scoring |
-| `record_dataset` | COMBO | disabled | `enabled`, `disabled` — save metrics to JSONL for research |
+| `community_cache` | COMBO | disabled | `disabled`, `download_only`, `upload_and_download` — community HF cache (no names shared, content hashes only) |
 | `memory_mode` | COMBO | auto | `disabled`, `auto`, `read_only`, `clear_and_run` — persistent tuning result cache across sessions |
 | `selection` | INT | 1 | Which ranked config to replay from memory on a cache hit (1 = top-ranked) |
 | `cache_patches` | COMBO | enabled | Cache the final AutoTuner result in RAM for fast re-execution |

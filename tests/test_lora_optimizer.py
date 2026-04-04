@@ -584,7 +584,7 @@ class LoRAOptimizerTests(unittest.TestCase):
         self.assertTrue(calls[0].get("_is_sub_merge", False))
         self.assertTrue(calls[0].get("_suppress_pbar", False))
         self.assertEqual(calls[0].get("cache_patches"), "disabled")
-        self.assertEqual(calls[0].get("record_dataset"), "disabled")
+        self.assertEqual(calls[0].get("community_cache"), "disabled")
         self.assertEqual(calls[0].get("output_mode"), "merge")
 
     def test_autotune_resolve_tree_single_item_passthrough(self):
