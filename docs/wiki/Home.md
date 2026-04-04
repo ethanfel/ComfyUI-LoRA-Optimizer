@@ -31,6 +31,7 @@ The optimizer handles everything automatically — conflict analysis, strategy s
 
 - **[[Workflows]]** — Common workflow patterns with ASCII diagrams: basic merging, autotuning, conflict editing, WanVideo, per-prompt hooks, and exporting.
 - **[[Tips and Troubleshooting]]** — Best practices, common pitfalls, what NOT to merge, and memory optimization.
+- **[[Community Cache]]** — Share and reuse AutoTuner results across the community via Hugging Face. Skip sweeps entirely when others have already found the best config for your LoRAs.
 
 ### Background
 
@@ -54,6 +55,7 @@ The optimizer handles everything automatically — conflict analysis, strategy s
 | **Settings nodes** | Modular configuration: Merge Settings (shared), Optimizer Settings, AutoTuner Settings — optional, sensible defaults without them |
 | **Compatibility analyzer** | Planning node that groups merge-safe LoRAs, surfaces conflicts, and optionally auto-creates optimized node setups |
 | **Low memory** | Two-pass streaming architecture — peak memory scales with the largest active target group, not the full stack |
+| **Community cache** | Share AutoTuner results via Hugging Face — skip sweeps when the best config is already known |
 | **8 architectures** | SD 1.5, SDXL, FLUX, Z-Image, Wan, LTX Video, ACE-Step, Qwen-Image |
 
 ---
