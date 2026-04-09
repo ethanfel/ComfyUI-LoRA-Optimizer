@@ -2108,7 +2108,7 @@ class _LoRAMergeBase:
         if n > 100000:
             target_device = flat_a.device
             g = torch.Generator(device=target_device).manual_seed(42)
-            indices = torch.randperm(n, device=target_device, generator=g)[:100000]
+            indices = torch.randint(0, n, (100000,), device=target_device, generator=g)
             flat_a = flat_a[indices]
             flat_b = flat_b[indices]
 

@@ -2330,6 +2330,37 @@ class TestPairLoraCacheAutoTune(unittest.TestCase):
                 self.assertIn("prefix_a", loaded)
                 self.assertIn("prefix_b", loaded)
 
+    def test_score_merge_result_lora_adapter_on_device(self):
+        """_score_merge_result should handle LoRAAdapter patches correctly."""
+        LoRAAdapter = lora_optimizer.LoRAAdapter
+        up = torch.randn(8, 4)
+        down = torch.randn(4, 16)
+        alpha = 4.0
+        adapter = LoRAAdapter(
+            loaded_keys=set(),
+            weights=(up, down, alpha, None, None, None),
+        )
+        patches = {("key1",): adapter}
+        result = lora_optimizer._score_merge_result(patches, {}, compute_svd=False)
+        self.assertIn("norm_mean", result)
+        self.assertGreater(result["norm_mean"], 0)
+        self.assertIn("composite_score", result)
+
+    def test_sample_pair_metrics_downsamples_large_vectors(self):
+        """Pair metrics should work correctly with large vectors that trigger downsampling."""
+        optimizer = lora_optimizer.LoRAOptimizer()
+        a = torch.randn(200000)
+        b = torch.randn(200000)
+        result = optimizer._sample_pair_metrics(a, b)
+        self.assertIn("overlap", result)
+        self.assertIn("conflict", result)
+        self.assertIn("dot", result)
+        self.assertGreater(result["overlap"], 0)
+        result2 = optimizer._sample_pair_metrics(a, b)
+        self.assertEqual(result["overlap"], result2["overlap"])
+        self.assertEqual(result["conflict"], result2["conflict"])
+        self.assertAlmostEqual(result["dot"], result2["dot"], places=4)
+
 
 if __name__ == "__main__":
     unittest.main()
