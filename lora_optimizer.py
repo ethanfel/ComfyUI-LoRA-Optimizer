@@ -9109,7 +9109,6 @@ class LoRAAutoTuner(LoRAOptimizer):
             if prefix_stats.get(pfx, {}).get("n_loras", 0) <= 1:
                 single_lora_keys.add(info[0])  # info is (target_key, is_clip)
         _cached_sl_baseline = None
-        _target_key = lambda k: k[0] if isinstance(k, tuple) else k
 
         for rank_idx, (h_score, config) in enumerate(top_candidates):
             logging.info(f"[LoRA AutoTuner]   Candidate {rank_idx + 1}/{len(top_candidates)}: "
@@ -9168,16 +9167,16 @@ class LoRAAutoTuner(LoRAOptimizer):
 
             if single_lora_keys:
                 m_multi = {k: v for k, v in m_patches.items()
-                           if _target_key(k) not in single_lora_keys}
+                           if k not in single_lora_keys}
                 c_multi = {k: v for k, v in c_patches.items()
-                           if _target_key(k) not in single_lora_keys}
+                           if k not in single_lora_keys}
 
                 if _cached_sl_baseline is None:
                     # First candidate: score single-LoRA patches, cache raw lists
                     m_single = {k: v for k, v in m_patches.items()
-                                if _target_key(k) in single_lora_keys}
+                                if k in single_lora_keys}
                     c_single = {k: v for k, v in c_patches.items()
-                                if _target_key(k) in single_lora_keys}
+                                if k in single_lora_keys}
                     sl_measured = _score_merge_result(
                         m_single, c_single, compute_svd=compute_svd,
                         score_device=score_dev, arch_preset=score_arch,
