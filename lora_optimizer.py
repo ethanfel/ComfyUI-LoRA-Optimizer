@@ -683,6 +683,7 @@ class _LoRAMergeBase:
 
     def __init__(self):
         self.loaded_loras = {}
+        self._lora_format_cache = {}  # id(lora_dict) -> format_index (0-3)
 
     @staticmethod
     def _get_compute_device():
@@ -1796,27 +1797,34 @@ class _LoRAMergeBase:
             ("{}.lora.up.weight", "{}.lora.down.weight"),           # diffusers3
         ]
 
-        for up_fmt, down_fmt in formats:
+        def _extract(up_key, down_key):
+            mat_up = lora_dict[up_key]
+            mat_down = lora_dict[down_key]
+            alpha_key = "{}.alpha".format(key_prefix)
+            alpha = lora_dict.get(alpha_key, None)
+            if alpha is not None:
+                alpha = alpha.item()
+            else:
+                alpha = mat_down.shape[0]
+            mid_key = "{}.lora_mid.weight".format(key_prefix)
+            mid = lora_dict.get(mid_key, None)
+            return (mat_up, mat_down, alpha, mid)
+
+        # Try cached format first
+        dict_id = id(lora_dict)
+        cached_fmt = self._lora_format_cache.get(dict_id)
+        if cached_fmt is not None:
+            up_key = formats[cached_fmt][0].format(key_prefix)
+            down_key = formats[cached_fmt][1].format(key_prefix)
+            if up_key in lora_dict and down_key in lora_dict:
+                return _extract(up_key, down_key)
+
+        for fmt_idx, (up_fmt, down_fmt) in enumerate(formats):
             up_key = up_fmt.format(key_prefix)
             down_key = down_fmt.format(key_prefix)
-
             if up_key in lora_dict and down_key in lora_dict:
-                mat_up = lora_dict[up_key]
-                mat_down = lora_dict[down_key]
-
-                # Alpha
-                alpha_key = "{}.alpha".format(key_prefix)
-                alpha = lora_dict.get(alpha_key, None)
-                if alpha is not None:
-                    alpha = alpha.item()
-                else:
-                    alpha = mat_down.shape[0]  # rank as default
-
-                # Mid (for LoCon)
-                mid_key = "{}.lora_mid.weight".format(key_prefix)
-                mid = lora_dict.get(mid_key, None)
-
-                return (mat_up, mat_down, alpha, mid)
+                self._lora_format_cache[dict_id] = fmt_idx
+                return _extract(up_key, down_key)
 
         return None
 

@@ -154,6 +154,21 @@ class LoRAOptimizerTests(unittest.TestCase):
         self.optimizer = lora_optimizer.LoRAOptimizer()
         self.model = _make_model()
 
+    def test_lora_format_cache_avoids_repeated_detection(self):
+        """After detecting a LoRA's format once, subsequent prefixes should reuse it."""
+        optimizer = lora_optimizer.LoRAOptimizer()
+        lora_dict = {
+            "unet.a.lora_B.weight": torch.tensor([[1.0]], dtype=torch.float32),
+            "unet.a.lora_A.weight": torch.tensor([[1.0]], dtype=torch.float32),
+            "unet.b.lora_B.weight": torch.tensor([[2.0]], dtype=torch.float32),
+            "unet.b.lora_A.weight": torch.tensor([[1.0]], dtype=torch.float32),
+        }
+        result1 = optimizer._get_lora_key_info(lora_dict, "unet.a")
+        self.assertIsNotNone(result1)
+        self.assertIn(id(lora_dict), optimizer._lora_format_cache)
+        result2 = optimizer._get_lora_key_info(lora_dict, "unet.b")
+        self.assertIsNotNone(result2)
+
     def test_target_groups_merge_aliases_for_same_target(self):
         groups = self.optimizer._build_target_groups(
             ["alias_a", "alias_b", "other"],
