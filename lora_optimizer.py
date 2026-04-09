@@ -9109,6 +9109,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             if prefix_stats.get(pfx, {}).get("n_loras", 0) <= 1:
                 single_lora_keys.add(info[0])  # info is (target_key, is_clip)
         _cached_sl_baseline = None
+        _target_key = lambda k: k[0] if isinstance(k, tuple) else k
 
         for rank_idx, (h_score, config) in enumerate(top_candidates):
             logging.info(f"[LoRA AutoTuner]   Candidate {rank_idx + 1}/{len(top_candidates)}: "
@@ -9166,9 +9167,6 @@ class LoRAAutoTuner(LoRAOptimizer):
             score_arch = tuner_arch_preset if scoring_formula == "v2" else None
 
             if single_lora_keys:
-                def _target_key(k):
-                    return k[0] if isinstance(k, tuple) else k
-
                 m_multi = {k: v for k, v in m_patches.items()
                            if _target_key(k) not in single_lora_keys}
                 c_multi = {k: v for k, v in c_patches.items()
