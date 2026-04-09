@@ -392,6 +392,10 @@ class LoRAStackDynamic:
             }
         }
         for i in range(1, cls.MAX_LORAS + 1):
+            inputs["required"][f"enabled_{i}"] = ("BOOLEAN", {
+                "default": True,
+                "tooltip": f"Enable or disable LoRA #{i} without removing it from the list.",
+            })
             inputs["required"][f"lora_name_{i}"] = (loras, {
                 "tooltip": f"LoRA #{i} — pick a LoRA file or leave as 'None' to skip this slot."
             })
@@ -495,6 +499,8 @@ class LoRAStackDynamic:
         loras = []
         use_text = input_mode == "text"
         for i in range(1, lora_count + 1):
+            if not kwargs.get(f"enabled_{i}", True):
+                continue
             if use_text:
                 name = kwargs.get(f"lora_name_text_{i}", "None")
             else:

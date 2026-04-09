@@ -714,6 +714,33 @@ class LoRAOptimizerTests(unittest.TestCase):
         self.assertEqual(len(resolve_calls), 1)
         self.assertEqual(resolve_calls[0]["type"], "group")
 
+    def test_build_stack_skips_disabled_slots(self):
+        from unittest import mock
+        node = lora_optimizer.LoRAStackDynamic()
+        with mock.patch.object(
+            lora_optimizer.LoRAStackDynamic, "_resolve_lora_name",
+            side_effect=lambda n: n,
+        ):
+            result, = node.build_stack(
+                settings_visibility="simple",
+                input_mode="text",
+                lora_count=3,
+                lora_name_text_1="lora_a",
+                lora_name_text_2="lora_b",
+                lora_name_text_3="lora_c",
+                strength_1=1.0,
+                strength_2=0.8,
+                strength_3=0.5,
+                enabled_1=True,
+                enabled_2=False,
+                enabled_3=True,
+            )
+        names = [entry[0] for entry in result]
+        self.assertEqual(len(result), 2)
+        self.assertIn("lora_a", names)
+        self.assertIn("lora_c", names)
+        self.assertNotIn("lora_b", names)
+
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class LoRASettingsNodeTests(unittest.TestCase):
