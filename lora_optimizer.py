@@ -4159,6 +4159,13 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "forceInput": True,
                     "tooltip": "Connect the merge_strategy output from a LoRA Conflict Editor to override the optimizer's auto-detected strategy."
                 }),
+                "settings_source": (["manual", "from_autotuner", "from_tuner_data"], {
+                    "default": "manual",
+                    "tooltip": "manual: use widget settings. from_autotuner: passthrough when chained with a live AutoTuner. from_tuner_data: apply the top-ranked config from loaded tuner data (use with Load Tuner Data)."
+                }),
+                "tuner_data": ("TUNER_DATA", {
+                    "tooltip": "Connect from the LoRA AutoTuner's tuner_data output. Used when settings_source is 'from_autotuner'."
+                }),
                 "decision_smoothing": ("FLOAT", {
                     "default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Smooth per-group strategy metrics toward each block's average before Pass 2 decisions. 0 disables smoothing; 0.2-0.4 usually removes noisy mode flips without washing out real differences."
@@ -4166,13 +4173,6 @@ class LoRAOptimizer(_LoRAMergeBase):
                 "smooth_slerp_gate": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "When enabled, uses smoothed cosine (decision_cosine) for SLERP gate instead of raw avg_cos_sim. Can affect SLERP/weighted_average ratio."
-                }),
-                "tuner_data": ("TUNER_DATA", {
-                    "tooltip": "Connect from the LoRA AutoTuner's tuner_data output. Used when settings_source is 'from_autotuner'."
-                }),
-                "settings_source": (["manual", "from_autotuner", "from_tuner_data"], {
-                    "default": "manual",
-                    "tooltip": "manual: use widget settings. from_autotuner: passthrough when chained with a live AutoTuner. from_tuner_data: apply the top-ranked config from loaded tuner data (use with Load Tuner Data)."
                 }),
             }
         }
@@ -8159,6 +8159,17 @@ class LoRAAutoTuner(LoRAOptimizer):
                 logging.info(f"[AutoTuner Community] Config not uploaded — community score "
                              f"({existing_config.get('score', 0.0):.4f}) >= local ({local_score:.4f})")
                 return
+            candidates = [
+                {
+                    "rank": entry.get("rank", idx + 1),
+                    "config": entry["config"],
+                    "score_heuristic": entry.get("score_heuristic", 0.0),
+                    "score_measured": entry.get("score_measured", 0.0),
+                    "score_final": entry.get("score_final", 0.0),
+                }
+                for idx, entry in enumerate(tuner_data["top_n"])
+                if "config" in entry
+            ]
             LoRAAutoTuner._community_upload(
                 config_path,
                 {
@@ -8167,6 +8178,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "lora_content_hashes": sorted_hashes,
                     "score": local_score,
                     "config": best["config"],
+                    "candidates": candidates,
                 },
                 token,
             )
