@@ -103,6 +103,7 @@ function updateVisibility(node) {
     for (let i = 1; i <= MAX; i++) {
         const visible = i <= count;
 
+        toggleWidget(node, findWidget(node, `enabled_${i}`), visible);
         toggleWidget(node, findWidget(node, `lora_name_${i}`), visible && !isText);
         toggleWidget(node, findWidget(node, `lora_name_text_${i}`), visible && isText);
         toggleWidget(node, findWidget(node, `strength_${i}`), visible && isSimple);
@@ -116,6 +117,14 @@ function updateVisibility(node) {
     const filterWidget = findWidget(node, "base_model_filter");
     if (filterWidget) {
         toggleWidget(node, filterWidget, !isText);
+    }
+
+    // Apply gray state for disabled slots
+    for (let i = 1; i <= MAX; i++) {
+        const enabledW = findWidget(node, `enabled_${i}`);
+        if (enabledW) {
+            setSlotGrayed(node, i, !enabledW.value);
+        }
     }
 
     const newHeight = node.computeSize()[1];
@@ -301,6 +310,40 @@ function patchLoraWidgets(node) {
     }
 }
 
+const GRAY_ALPHA = 0.35;
+
+function setSlotGrayed(node, i, grayed) {
+    const siblings = [
+        `lora_name_${i}`,
+        `lora_name_text_${i}`,
+        `strength_${i}`,
+        `model_strength_${i}`,
+        `clip_strength_${i}`,
+        `conflict_mode_${i}`,
+        `key_filter_${i}`,
+    ];
+    for (const name of siblings) {
+        const w = findWidget(node, name);
+        if (!w) continue;
+        if (grayed) {
+            if (!w._origDraw) {
+                w._origDraw = w.draw?.bind(w) ?? null;
+            }
+            w.draw = function (ctx, node, width, y, height) {
+                ctx.save();
+                ctx.globalAlpha = GRAY_ALPHA;
+                if (w._origDraw) w._origDraw(ctx, node, width, y, height);
+                ctx.restore();
+            };
+        } else {
+            if (w._origDraw !== undefined) {
+                w.draw = w._origDraw ?? undefined;
+                delete w._origDraw;
+            }
+        }
+    }
+}
+
 // --- Node Registration ---
 
 app.registerExtension({
@@ -317,6 +360,17 @@ app.registerExtension({
                 });
             } else if (w.name === "settings_visibility" || w.name === "lora_count") {
                 interceptWidgetValue(w, () => updateVisibility(node));
+            }
+        }
+
+        // Intercept enabled_{i} toggles for gray-out
+        for (let i = 1; i <= 10; i++) {
+            const enabledW = findWidget(node, `enabled_${i}`);
+            if (enabledW) {
+                interceptWidgetValue(enabledW, (newVal) => {
+                    setSlotGrayed(node, i, !newVal);
+                    app.canvas?.setDirty?.(true, true);
+                });
             }
         }
 
