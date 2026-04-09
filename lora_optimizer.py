@@ -3623,7 +3623,8 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
 
 
 def _score_merge_result(model_patches, clip_patches, compute_svd=True,
-                        score_device=None, arch_preset=None, lora_svd=False):
+                        score_device=None, arch_preset=None, lora_svd=False,
+                        _baseline=None, _return_raw=False):
     """
     Score an actual merge result by measuring output quality metrics.
     Returns dict with individual metrics and composite score in [0, 1].
@@ -3635,10 +3636,16 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
     When arch_preset is provided, uses arch-aware ideal sparsity from
     dare_ideal_density instead of hardcoded 40%.
     """
-    norms = []
-    importance_values = []
-    effective_ranks = []
-    sparsities = []
+    if _baseline is not None:
+        norms = list(_baseline["norms"])
+        importance_values = list(_baseline["importance_values"])
+        effective_ranks = list(_baseline["effective_ranks"])
+        sparsities = list(_baseline["sparsities"])
+    else:
+        norms = []
+        importance_values = []
+        effective_ranks = []
+        sparsities = []
     _svd_tasks = []  # (gram_up [rank,rank], rank_int) — batched after loop
 
     all_patches = (
@@ -3857,6 +3864,13 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
         score += metrics["sparsity_fit"] * 0.5
 
     metrics["composite_score"] = score
+    if _return_raw:
+        metrics["_raw"] = {
+            "norms": norms,
+            "importance_values": importance_values,
+            "effective_ranks": effective_ranks,
+            "sparsities": sparsities,
+        }
     return metrics
 
 
@@ -9087,6 +9101,15 @@ class LoRAAutoTuner(LoRAOptimizer):
         best_config = None
         logging.info(f"[LoRA AutoTuner] Phase 2: Merging and measuring top {len(top_candidates)} candidates...")
 
+        # Pre-identify single-LoRA target keys for scoring cache.
+        # Single-LoRA patches are identical across candidates (merge strategies
+        # don't apply — early return at _merge_diffs line 2868). Score once, reuse.
+        single_lora_keys = set()
+        for pfx, info in all_key_targets.items():
+            if prefix_stats.get(pfx, {}).get("n_loras", 0) <= 1:
+                single_lora_keys.add(info[0])  # info is (target_key, is_clip)
+        _cached_sl_baseline = None
+
         for rank_idx, (h_score, config) in enumerate(top_candidates):
             logging.info(f"[LoRA AutoTuner]   Candidate {rank_idx + 1}/{len(top_candidates)}: "
                          f"{config['merge_mode']}, {config['merge_refinement']}"
@@ -9141,11 +9164,39 @@ class LoRAAutoTuner(LoRAOptimizer):
             score_dev = torch.device("cuda") if scoring_device == "gpu" and torch.cuda.is_available() else None
             t_score = time.time()
             score_arch = tuner_arch_preset if scoring_formula == "v2" else None
-            measured = _score_merge_result(
-                m_patches, c_patches, compute_svd=compute_svd,
-                score_device=score_dev, arch_preset=score_arch,
-                lora_svd=compute_lora_svd
-            )
+
+            if single_lora_keys:
+                def _target_key(k):
+                    return k[0] if isinstance(k, tuple) else k
+
+                m_multi = {k: v for k, v in m_patches.items()
+                           if _target_key(k) not in single_lora_keys}
+                c_multi = {k: v for k, v in c_patches.items()
+                           if _target_key(k) not in single_lora_keys}
+
+                if _cached_sl_baseline is None:
+                    # First candidate: score single-LoRA patches, cache raw lists
+                    m_single = {k: v for k, v in m_patches.items()
+                                if _target_key(k) in single_lora_keys}
+                    c_single = {k: v for k, v in c_patches.items()
+                                if _target_key(k) in single_lora_keys}
+                    sl_measured = _score_merge_result(
+                        m_single, c_single, compute_svd=compute_svd,
+                        score_device=score_dev, arch_preset=score_arch,
+                        lora_svd=compute_lora_svd, _return_raw=True)
+                    _cached_sl_baseline = sl_measured.get("_raw")
+                    del m_single, c_single, sl_measured
+
+                measured = _score_merge_result(
+                    m_multi, c_multi, compute_svd=compute_svd,
+                    score_device=score_dev, arch_preset=score_arch,
+                    lora_svd=compute_lora_svd,
+                    _baseline=_cached_sl_baseline)
+            else:
+                measured = _score_merge_result(
+                    m_patches, c_patches, compute_svd=compute_svd,
+                    score_device=score_dev, arch_preset=score_arch,
+                    lora_svd=compute_lora_svd)
             t_score_elapsed = time.time() - t_score
             # --- Post-scoring adjustments ---
             if scoring_formula == "v1":

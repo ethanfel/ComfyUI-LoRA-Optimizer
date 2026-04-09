@@ -776,6 +776,37 @@ class LoRAOptimizerTests(unittest.TestCase):
             )
         self.assertEqual(len(result), 2)
 
+    def test_score_merge_result_baseline_matches_full(self):
+        """Scoring multi-LoRA patches with single-LoRA baseline should match full scoring."""
+        LoRAAdapter = lora_optimizer.LoRAAdapter
+        single_patches = {}
+        multi_patches = {}
+        all_patches = {}
+        for i in range(10):
+            up = torch.randn(8, 4)
+            down = torch.randn(4, 16)
+            adapter = LoRAAdapter(set(), (up, down, 4.0, None, None, None))
+            key = f"key{i}"
+            all_patches[key] = adapter
+            if i < 5:
+                single_patches[key] = adapter
+            else:
+                multi_patches[key] = adapter
+
+        full = lora_optimizer._score_merge_result(all_patches, {}, compute_svd=False)
+
+        sl = lora_optimizer._score_merge_result(
+            single_patches, {}, compute_svd=False, _return_raw=True)
+        baseline = sl["_raw"]
+        combined = lora_optimizer._score_merge_result(
+            multi_patches, {}, compute_svd=False, _baseline=baseline)
+
+        self.assertAlmostEqual(full["composite_score"], combined["composite_score"], places=6)
+        self.assertAlmostEqual(full["norm_mean"], combined["norm_mean"], places=6)
+        self.assertAlmostEqual(full["norm_cv"], combined["norm_cv"], places=6)
+        self.assertAlmostEqual(full["sparsity_mean"], combined["sparsity_mean"], places=6)
+        self.assertAlmostEqual(full["norm_energy_sq"], combined["norm_energy_sq"], places=4)
+
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class LoRASettingsNodeTests(unittest.TestCase):
