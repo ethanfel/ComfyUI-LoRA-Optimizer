@@ -741,6 +741,26 @@ class LoRAOptimizerTests(unittest.TestCase):
         self.assertIn("lora_c", names)
         self.assertNotIn("lora_b", names)
 
+    def test_build_stack_absent_enabled_treated_as_enabled(self):
+        from unittest import mock
+        node = lora_optimizer.LoRAStackDynamic()
+        # No enabled_{i} keys passed — must behave as if all enabled
+        with mock.patch.object(
+            lora_optimizer.LoRAStackDynamic, "_resolve_lora_name",
+            side_effect=lambda n: n,
+        ):
+            result, = node.build_stack(
+                settings_visibility="simple",
+                input_mode="text",
+                lora_count=2,
+                lora_name_text_1="lora_a",
+                lora_name_text_2="lora_b",
+                strength_1=1.0,
+                strength_2=0.8,
+                # No enabled_1 or enabled_2 passed
+            )
+        self.assertEqual(len(result), 2)
+
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class LoRASettingsNodeTests(unittest.TestCase):
