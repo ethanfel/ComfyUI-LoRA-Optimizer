@@ -3693,11 +3693,13 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
             if mat_up is not None and mat_down is not None:
                 rank = mat_down.shape[0] if mat_down.dim() >= 1 else 1
                 scale = alpha / rank if rank > 0 else 1.0
-                up_flat = mat_up.flatten(start_dim=1).float()
-                down_flat = mat_down.flatten(start_dim=1).float()
+                up_flat = mat_up.flatten(start_dim=1)
+                down_flat = mat_down.flatten(start_dim=1)
                 if score_device is not None:
                     up_flat = up_flat.to(score_device)
                     down_flat = down_flat.to(score_device)
+                up_flat = up_flat.float()
+                down_flat = down_flat.float()
                 # ||AB||_F^2 = tr(A^T A B B^T) — avoids materializing full diff
                 gram_up = torch.mm(up_flat.T, up_flat)
                 gram_down = torch.mm(down_flat, down_flat.T)
@@ -9269,16 +9271,17 @@ class LoRAAutoTuner(LoRAOptimizer):
                 best_config = config
             del m_patches, c_patches  # Drop patch-dict references so tensors can free
             gc.collect(0)  # gen-0 only: ~10x faster, catches fresh cycles from ModelPatcher
-            # Log memory usage to help diagnose leaks on large models
-            try:
-                import psutil
-                proc = psutil.Process()
-                rss_gb = proc.memory_info().rss / (1024**3)
-                dc_mb = _diff_cache.size_mb() if _diff_cache else 0
-                logging.info(f"[LoRA AutoTuner]   Memory: process={rss_gb:.1f}GB"
-                             f"{f', diff_cache={dc_mb:.0f}MB' if dc_mb > 0 else ''}")
-            except ImportError:
-                pass
+            # Log memory usage on first/last iteration to diagnose leaks
+            if rank_idx == 0 or rank_idx == len(top_candidates) - 1:
+                try:
+                    import psutil
+                    proc = psutil.Process()
+                    rss_gb = proc.memory_info().rss / (1024**3)
+                    dc_mb = _diff_cache.size_mb() if _diff_cache else 0
+                    logging.info(f"[LoRA AutoTuner]   Memory: process={rss_gb:.1f}GB"
+                                 f"{f', diff_cache={dc_mb:.0f}MB' if dc_mb > 0 else ''}")
+                except ImportError:
+                    pass
 
             results.append({
                 "rank": rank_idx + 1,
