@@ -464,8 +464,6 @@ app.registerExtension({
                         }
                         clearSlotValues(node_, count);
                         if (countWidget && count > 1) countWidget.value = count - 1;
-                        updateVisibility(node_);
-                        app.canvas?.setDirty?.(true, true);
                     },
                 },
             ];
