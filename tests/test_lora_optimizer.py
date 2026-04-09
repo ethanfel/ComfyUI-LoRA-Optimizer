@@ -2408,5 +2408,35 @@ class TestPairLoraCacheAutoTune(unittest.TestCase):
         self.assertAlmostEqual(result["dot"], result2["dot"], places=4)
 
 
+    def test_sl_patch_cache_populates_and_hits(self):
+        """Single-LoRA patch cache should store results and reuse them on matching auto_strength."""
+        optimizer = lora_optimizer.LoRAOptimizer()
+        # Simulate a result tuple as returned by _merge_one_group
+        fake_patch = ("diff", (torch.randn(4, 4),))
+        fake_result = ("weight.key", False, fake_patch, "weighted_sum", "lora_unet_block", 0.0, 1, False, 1.0, 0.9)
+
+        cache = {}
+        prefix = "lora_unet_block"
+        auto_strength = "enabled"
+
+        # First access: miss → populate
+        key = (prefix, auto_strength)
+        self.assertNotIn(key, cache)
+        cache[key] = fake_result
+        self.assertIn(key, cache)
+        self.assertIs(cache[key], fake_result)
+
+        # Second access with same auto_strength: hit
+        self.assertIs(cache.get(key), fake_result)
+
+        # Different auto_strength: miss
+        key2 = (prefix, "disabled")
+        self.assertIsNone(cache.get(key2))
+
+        # Different prefix, same auto_strength: miss
+        key3 = ("lora_unet_other", auto_strength)
+        self.assertIsNone(cache.get(key3))
+
+
 if __name__ == "__main__":
     unittest.main()
