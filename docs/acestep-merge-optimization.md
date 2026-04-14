@@ -118,10 +118,12 @@ the merge strategy.
 
 ### Why cross-attention is critical
 
-In ACE-Step 1.5, voice identity enters the model exclusively through
-cross-attention. The timbre encoder produces a representation of the reference
-voice, which is concatenated with text and lyric embeddings and attended to
-by the DiT's cross-attention layers.
+In ACE-Step 1.5, the model operates on a "unified conditioning stack where
+Qwen3-0.6B caption embeddings are concatenated with dedicated timbre and lyric
+encoders and injected via Cross-Attention" (arXiv:2602.00744v3, Section 3.2).
+Cross-attention is the primary injection point for voice conditioning, though
+once injected, voice information propagates through self-attention and MLP
+layers as well.
 
 When a vocal LoRA is trained, its cross-attention weights learn to respond
 strongly to the voice's timbre representation. When a music LoRA is trained
@@ -132,7 +134,7 @@ different aspects of the conditioning signal.
 Naive averaging or TIES trimming on cross-attention layers destroys the
 vocal LoRA's learned response to timbre conditioning.
 
-Source: [ACE-Step v1.0 paper (arXiv:2506.00045)](https://arxiv.org/abs/2506.00045),
+Source: [ACE-Step 1.5 paper (arXiv:2602.00744v3)](https://arxiv.org/html/2602.00744v3),
 [Voice cloning discussion (Issue #259)](https://github.com/ace-step/ACE-Step/issues/259),
 [Architecture analysis (zenn.dev)](https://zenn.dev/asap/articles/6a717d7a68ec02?locale=en)
 
