@@ -2331,5 +2331,189 @@ class TestPairLoraCacheAutoTune(unittest.TestCase):
                 self.assertIn("prefix_b", loaded)
 
 
+@unittest.skipIf(torch is None, "torch is not installed in this environment")
+class TestAceStepDetection(unittest.TestCase):
+    """Test _detect_architecture for ACE-Step v1.0 and v1.5 key patterns."""
+
+    def _detect(self, keys):
+        sd = {k: torch.zeros(1) for k in keys}
+        return lora_optimizer._LoRAMergeBase._detect_architecture(sd)
+
+    # --- v1.5 PEFT format ---
+    def test_v15_peft_self_attn(self):
+        keys = [
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.weight",
+            "base_model.model.layers.0.self_attn.q_proj.lora_B.weight",
+        ]
+        self.assertEqual(self._detect(keys), "acestep")
+
+    def test_v15_peft_cross_attn(self):
+        keys = [
+            "base_model.model.layers.12.cross_attn.k_proj.lora_A.weight",
+            "base_model.model.layers.12.cross_attn.k_proj.lora_B.weight",
+        ]
+        self.assertEqual(self._detect(keys), "acestep")
+
+    def test_v15_peft_mlp_only_not_detected(self):
+        """MLP-only LoRA without attn keys should not detect as acestep."""
+        keys = [
+            "base_model.model.layers.0.mlp.gate_proj.lora_A.weight",
+            "base_model.model.layers.0.mlp.gate_proj.lora_B.weight",
+        ]
+        # No self_attn/cross_attn keys, so won't match acestep pattern
+        self.assertNotEqual(self._detect(keys), "acestep")
+
+    def test_v15_bare_layers(self):
+        """v1.5 keys without base_model.model. prefix."""
+        keys = [
+            "layers.5.self_attn.v_proj.lora_up.weight",
+            "layers.5.self_attn.v_proj.lora_down.weight",
+        ]
+        self.assertEqual(self._detect(keys), "acestep")
+
+    # --- v1.0 diffusers format ---
+    def test_v10_transformer_blocks(self):
+        keys = [
+            "transformer_blocks.0.attn.to_q.lora_A.weight",
+            "transformer_blocks.0.attn.to_q.lora_B.weight",
+            "transformer_blocks.0.cross_attn.to_k.lora_A.weight",
+            "transformer_blocks.0.cross_attn.to_k.lora_B.weight",
+        ]
+        self.assertEqual(self._detect(keys), "acestep")
+
+    def test_v10_speaker_embedder(self):
+        keys = [
+            "speaker_embedder.lora_A.weight",
+            "speaker_embedder.lora_B.weight",
+        ]
+        self.assertEqual(self._detect(keys), "acestep")
+
+    def test_v10_lyric_encoder(self):
+        keys = [
+            "lyric_encoder.encoders.0.self_attn.linear_q.lora_A.weight",
+            "lyric_encoder.encoders.0.self_attn.linear_q.lora_B.weight",
+        ]
+        self.assertEqual(self._detect(keys), "acestep")
+
+
+@unittest.skipIf(torch is None, "torch is not installed in this environment")
+class TestAceStepNormalization(unittest.TestCase):
+    """Test _normalize_keys_acestep for v1.0 and v1.5 key formats."""
+
+    def _norm(self, keys):
+        sd = {k: torch.zeros(1) for k in keys}
+        return lora_optimizer._LoRAMergeBase._normalize_keys_acestep(sd)
+
+    # --- v1.5 PEFT format ---
+    def test_v15_peft_strips_prefix(self):
+        result = self._norm([
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.weight",
+        ])
+        self.assertIn("diffusion_model.layers.0.self_attn.q_proj.lora_A.weight", result)
+
+    def test_v15_bare_layers_adds_prefix(self):
+        result = self._norm(["layers.5.cross_attn.k_proj.lora_up.weight"])
+        self.assertIn("diffusion_model.layers.5.cross_attn.k_proj.lora_up.weight", result)
+
+    def test_v15_kohya_underscore(self):
+        result = self._norm(["lora_unet_layers_3_self_attn_q_proj.lora_down.weight"])
+        self.assertIn("diffusion_model.layers.3.self_attn.q_proj.lora_down.weight", result)
+
+    def test_v15_mlp_keys(self):
+        result = self._norm([
+            "base_model.model.layers.10.mlp.gate_proj.lora_A.weight",
+        ])
+        self.assertIn("diffusion_model.layers.10.mlp.gate_proj.lora_A.weight", result)
+
+    # --- v1.0 → v1.5 mapping ---
+    def test_v10_transformer_blocks_to_layers(self):
+        result = self._norm([
+            "transformer_blocks.7.attn.to_q.lora_A.weight",
+        ])
+        self.assertIn("diffusion_model.layers.7.self_attn.q_proj.lora_A.weight", result)
+
+    def test_v10_cross_attn_preserved(self):
+        result = self._norm([
+            "transformer_blocks.3.cross_attn.to_v.lora_B.weight",
+        ])
+        self.assertIn("diffusion_model.layers.3.cross_attn.v_proj.lora_B.weight", result)
+
+    def test_v10_to_out_0_to_o_proj(self):
+        result = self._norm([
+            "transformer_blocks.0.attn.to_out.0.lora_A.weight",
+        ])
+        self.assertIn("diffusion_model.layers.0.self_attn.o_proj.lora_A.weight", result)
+
+    def test_v10_cross_attn_to_out_0(self):
+        result = self._norm([
+            "transformer_blocks.5.cross_attn.to_out.0.lora_B.weight",
+        ])
+        self.assertIn("diffusion_model.layers.5.cross_attn.o_proj.lora_B.weight", result)
+
+    def test_v10_speaker_embedder(self):
+        result = self._norm(["speaker_embedder.lora_A.weight"])
+        self.assertIn("diffusion_model.speaker_embedder.lora_A.weight", result)
+
+    def test_v10_lyric_encoder(self):
+        result = self._norm([
+            "lyric_encoder.encoders.2.self_attn.linear_q.lora_A.weight",
+        ])
+        self.assertIn(
+            "diffusion_model.lyric_encoder.encoders.2.self_attn.q_proj.lora_A.weight",
+            result,
+        )
+
+    def test_v10_lyric_encoder_linear_v(self):
+        result = self._norm([
+            "lyric_encoder.encoders.0.self_attn.linear_v.lora_B.weight",
+        ])
+        self.assertIn(
+            "diffusion_model.lyric_encoder.encoders.0.self_attn.v_proj.lora_B.weight",
+            result,
+        )
+
+    # --- Mixed format: ensure no cross-contamination ---
+    def test_self_attn_not_double_prefixed(self):
+        """self_attn should not become self_self_attn."""
+        result = self._norm([
+            "transformer_blocks.0.cross_attn.to_q.lora_A.weight",
+        ])
+        key = list(result.keys())[0]
+        self.assertNotIn("self_self_attn", key)
+        self.assertNotIn("self_cross_attn", key)
+
+
+@unittest.skipIf(torch is None, "torch is not installed in this environment")
+class TestAceStepPreset(unittest.TestCase):
+    """Test ACE-Step architecture preset and auto-detection integration."""
+
+    def test_acestep_maps_to_dedicated_preset(self):
+        self.assertEqual(lora_optimizer._ARCH_TO_PRESET["acestep"], "acestep_dit")
+        self.assertIn("acestep_dit", lora_optimizer._ARCH_PRESETS)
+
+    def test_acestep_preset_has_wider_orthogonal_band(self):
+        dit = lora_optimizer._ARCH_PRESETS["dit"]
+        ace = lora_optimizer._ARCH_PRESETS["acestep_dit"]
+        self.assertGreater(ace["orthogonal_cos_sim_max"], dit["orthogonal_cos_sim_max"])
+
+    def test_acestep_preset_has_higher_ties_threshold(self):
+        dit = lora_optimizer._ARCH_PRESETS["dit"]
+        ace = lora_optimizer._ARCH_PRESETS["acestep_dit"]
+        self.assertGreater(ace["ties_conflict_threshold"], dit["ties_conflict_threshold"])
+
+    def test_acestep_preset_full_magnitude_preservation(self):
+        ace = lora_optimizer._ARCH_PRESETS["acestep_dit"]
+        self.assertEqual(ace["auto_strength_orthogonal_floor"], 1.0)
+
+    def test_resolve_arch_preset_acestep(self):
+        key, preset = lora_optimizer._resolve_arch_preset("auto", "acestep")
+        self.assertEqual(key, "acestep_dit")
+        self.assertEqual(preset["display_name"], "ACE-Step (Music DiT)")
+
+    def test_resolve_arch_preset_manual_override(self):
+        key, preset = lora_optimizer._resolve_arch_preset("acestep_dit", "unknown")
+        self.assertEqual(key, "acestep_dit")
+
+
 if __name__ == "__main__":
     unittest.main()

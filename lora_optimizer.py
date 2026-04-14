@@ -194,14 +194,46 @@ _ARCH_PRESETS = {
             "auto_strength_floor": 1.0,
         },
     },
+    # ACE-Step v1.5: 24-block Linear DiT for music generation.
+    # Cross-attention is the primary voice-identity pathway — it always uses
+    # full/global attention (never sliding window) to attend to concatenated
+    # [text + lyrics + timbre] conditioning.  Self-attention alternates:
+    # odd layers = sliding window (local timbre/transients), even layers =
+    # global GQA (long-range musical structure).
+    # Vocal + music LoRAs typically produce orthogonal updates in cross-attn
+    # (encoding voice vs genre conditioning), so TIES trimming is destructive.
+    # Tuned for: wider orthogonal band (→ more SLERP), higher TIES threshold
+    # (→ less aggressive trimming), full magnitude preservation.
+    "acestep_dit": {
+        "density_noise_floor_ratio": 0.05,
+        "density_clamp_min": 0.4,
+        "density_clamp_max": 0.95,
+        "dare_ideal_density": 0.85,
+        "consensus_cos_sim_min": 0.5,
+        "consensus_conflict_max": 0.15,
+        "orthogonal_cos_sim_max": 0.30,
+        "orthogonal_conflict_max": 0.65,
+        "ties_conflict_threshold": 0.35,
+        "magnitude_ratio_total_sign": 2.0,
+        "alignment_threshold": 0.1,
+        "suggested_max_strength_cap": 5.0,
+        "auto_strength_orthogonal_floor": 1.0,
+        "display_name": "ACE-Step (Music DiT)",
+        "full_rank": {
+            "rank_threshold": 512,
+            "disable_slerp_upgrade": True,
+            "prefer_sum_orthogonal": True,
+            "auto_strength_floor": 1.0,
+        },
+    },
 }
 
-_VIDEO_ARCH_ORTHOGONAL_FLOOR = {"wan": 1.0, "ltx": 1.0}
+_VIDEO_ARCH_ORTHOGONAL_FLOOR = {"wan": 1.0, "ltx": 1.0, "acestep": 1.0}
 
 _ARCH_TO_PRESET = {
     "sdxl": "sd_unet", "sd15": "sd_unet", "unknown": "sd_unet",
     "flux": "dit", "wan": "dit", "zimage": "dit", "ltx": "dit",
-    "acestep": "dit",
+    "acestep": "acestep_dit",
     "qwen_image": "llm",
 }
 
@@ -743,17 +775,29 @@ class _LoRAMergeBase:
         if any('double_blocks' in k or 'single_blocks' in k for k in keys):
             return 'flux'
 
-        # Wan: blocks.N with self_attn/cross_attn/ffn
-        if any(('blocks.' in k or 'blocks_' in k) and
-               any(x in k for x in ['self_attn', 'cross_attn', 'ffn'])
-               for k in keys):
-            return 'wan'
-
-        # ACE-Step: layers.N with self_attn/cross_attn using q_proj/k_proj/v_proj
+        # ACE-Step v1.5: layers.N with self_attn/cross_attn using q_proj/k_proj/v_proj
         if any('layers.' in k and ('self_attn' in k or 'cross_attn' in k)
                and any(x in k for x in ['q_proj', 'k_proj', 'v_proj', 'o_proj'])
                for k in keys):
             return 'acestep'
+
+        # ACE-Step v1.0: transformer_blocks.N with attn/cross_attn and to_q/to_k/to_v,
+        # or unique keys like speaker_embedder / lyric_encoder
+        if any('speaker_embedder' in k or 'lyric_encoder' in k for k in keys):
+            return 'acestep'
+        if any(re.search(r'transformer_blocks\.\d+\.(?:attn|cross_attn)\.to_(?:q|k|v|out)', k)
+               for k in keys):
+            return 'acestep'
+
+        # Wan: blocks.N with self_attn/cross_attn/ffn (exclude transformer_blocks which is ACE-Step v1.0)
+        def _is_wan_key(k):
+            if 'transformer_blocks' in k:
+                return False
+            return ('blocks.' in k or 'blocks_' in k) and any(
+                x in k for x in ['self_attn', 'cross_attn', 'ffn']
+            )
+        if any(_is_wan_key(k) for k in keys):
+            return 'wan'
 
         # LTX Video: transformer_blocks with attn1/attn2 and adaln_single
         if any('adaln_single' in k for k in keys):
@@ -1276,6 +1320,9 @@ class _LoRAMergeBase:
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
         "lora_up", "lora_down", "lora_A", "lora_B", "lora_mid",
+        "speaker_embedder", "lyric_encoder",
+        "linear_q", "linear_k", "linear_v",
+        "to_out", "to_q", "to_k", "to_v",
     ], key=len, reverse=True)
 
     @classmethod
@@ -1297,28 +1344,66 @@ class _LoRAMergeBase:
     def _normalize_keys_acestep(cls, lora_sd):
         """
         Normalize ACE-Step LoRA keys to canonical
-        diffusion_model.layers.N.{self,cross}_attn.* form.
+        diffusion_model.layers.N.{self,cross}_attn.{q,k,v,o}_proj form.
+
+        Handles:
+        - v1.5 PEFT: base_model.model.layers.N.{self,cross}_attn.{q,k,v,o}_proj
+        - v1.5 Kohya: lora_unet_layers_N_self_attn_q_proj
+        - v1.0 diffusers: transformer_blocks.N.{attn,cross_attn}.to_{q,k,v}
+        - v1.0 special: speaker_embedder, lyric_encoder.encoders.N.self_attn.linear_{q,k,v}
         """
         normalized = {}
         for k, v in lora_sd.items():
             new_k = k
 
+            # Strip PEFT prefix (v1.5)
             if new_k.startswith("base_model.model."):
                 new_k = new_k[len("base_model.model."):]
 
+            # Kohya underscore format → dotted
             if new_k.startswith("lora_unet_"):
                 rest = new_k[len("lora_unet_"):]
                 rest = cls._acestep_underscore_to_dot(rest)
                 new_k = f"diffusion_model.{rest}"
 
+            # Common prefix normalization
             new_k = re.sub(r"^transformer\.", "diffusion_model.", new_k)
             new_k = re.sub(r"^model\.", "diffusion_model.", new_k)
 
             if new_k.startswith("layers."):
                 new_k = "diffusion_model." + new_k
+            if new_k.startswith("transformer_blocks."):
+                new_k = "diffusion_model." + new_k
 
+            # v1.0 → v1.5: transformer_blocks.N → layers.N
+            new_k = re.sub(
+                r"^diffusion_model\.transformer_blocks\.(\d+)\.",
+                r"diffusion_model.layers.\1.", new_k
+            )
+
+            # v1.0 → v1.5: bare .attn. → .self_attn. (cross_attn already correct)
+            # Safe: .cross_attn. and .self_attn. have _ before attn, not .
+            new_k = re.sub(r"\.attn\.", ".self_attn.", new_k)
+
+            # v1.0 → v1.5: to_q/to_k/to_v → q_proj/k_proj/v_proj
             if new_k.startswith("diffusion_model.layers."):
-                new_k = re.sub(r"\.to_(q|k|v|out)\.", lambda m: f".{m.group(1)}_proj.", new_k)
+                new_k = re.sub(
+                    r"\.to_(q|k|v)\.", lambda m: f".{m.group(1)}_proj.", new_k
+                )
+                new_k = re.sub(r"\.to_out\.0\.", ".o_proj.", new_k)
+                new_k = re.sub(r"\.to_out\.", ".o_proj.", new_k)
+
+            # v1.0 lyric_encoder: linear_q/k/v → q_proj/k_proj/v_proj
+            if "lyric_encoder" in new_k:
+                new_k = new_k.replace(".linear_q.", ".q_proj.")
+                new_k = new_k.replace(".linear_k.", ".k_proj.")
+                new_k = new_k.replace(".linear_v.", ".v_proj.")
+                if not new_k.startswith("diffusion_model."):
+                    new_k = "diffusion_model." + new_k
+
+            # v1.0 speaker_embedder: keep as-is but add prefix
+            if new_k.startswith("speaker_embedder"):
+                new_k = "diffusion_model." + new_k
 
             normalized[new_k] = v
         return normalized
@@ -4220,11 +4305,13 @@ class LoRAOptimizer(_LoRAMergeBase):
                                "'basic': only TIES vs weighted_average, no advanced strategy selection. "
                                "(Previously: this setting was called 'behavior_profile' with values v1.2/no_slerp/classic.)"
                 }),
-                "architecture_preset": (["auto", "sd_unet", "dit", "llm"], {
+                "architecture_preset": (["auto", "sd_unet", "dit", "acestep_dit", "llm"], {
                     "default": "auto",
                     "tooltip": "Architecture-aware threshold tuning. 'auto' detects from LoRA keys. "
                                "'sd_unet': SD/SDXL UNet defaults. 'dit': DiT models (Flux, WAN, Z-Image, LTX, HunyuanVideo) "
-                               "with higher density floors and wider strength range. 'llm': LLM-based models (Qwen, LLaMA)."
+                               "with higher density floors and wider strength range. "
+                               "'acestep_dit': ACE-Step music DiT — tuned for voice preservation with wider orthogonal band "
+                               "and conservative TIES threshold. 'llm': LLM-based models (Qwen, LLaMA)."
                 }),
                 "merge_strategy_override": ("STRING", {
                     "default": "",
@@ -7230,9 +7317,9 @@ class LoRAMergeSettings:
                     "default": "enabled",
                     "tooltip": "Ensures LoRAs from different training tools (Kohya, PEFT, etc.) work together. Keep enabled unless you have a specific reason to disable."
                 }),
-                "architecture_preset": (["auto", "sd_unet", "dit", "llm"], {
+                "architecture_preset": (["auto", "sd_unet", "dit", "acestep_dit", "llm"], {
                     "default": "auto",
-                    "tooltip": "Tells the optimizer what type of model you're using so it can pick the best merge settings. 'auto' detects it for you. Only change if auto-detection gets it wrong."
+                    "tooltip": "Tells the optimizer what type of model you're using so it can pick the best merge settings. 'auto' detects it for you. 'acestep_dit' is tuned for ACE-Step music LoRA merging with voice preservation. Only change if auto-detection gets it wrong."
                 }),
                 "auto_strength_floor": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
@@ -7746,9 +7833,9 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "default": "gpu",
                     "tooltip": "Device for scoring computations. GPU is much faster with SVD scoring modes."
                 }),
-                "architecture_preset": (["auto", "sd_unet", "dit", "llm"], {
+                "architecture_preset": (["auto", "sd_unet", "dit", "acestep_dit", "llm"], {
                     "default": "auto",
-                    "tooltip": "Architecture-aware threshold tuning. 'auto' detects from LoRA keys."
+                    "tooltip": "Architecture-aware threshold tuning. 'auto' detects from LoRA keys. 'acestep_dit' is tuned for ACE-Step music LoRA voice preservation."
                 }),
                 "auto_strength_floor": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
