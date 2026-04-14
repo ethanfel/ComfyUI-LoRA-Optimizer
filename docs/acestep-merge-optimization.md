@@ -333,15 +333,21 @@ Source for MERGE-LORA.py: [DisturbingTheField HuggingFace repos](https://hugging
 
 ## Practical Recommendations for ACE-Step Users
 
-### Merging vocal + music LoRAs
+### Merging ACE-Step LoRAs
 
-1. Load both LoRAs into the ZImage LoRA Merger node
+1. Load LoRAs into a **LoRA Stack** node and connect to a **LoRA Optimizer** node
+   (or use **LoRA AutoTuner** for automatic quality optimization)
 2. Architecture preset will auto-detect as `acestep_dit`
 3. Use `per_prefix` optimization mode (default)
 4. Keep `normalize_keys` enabled (handles v1.0/v1.5/Kohya/PEFT format differences)
 5. Set LoRA scale to 0.3–0.5 at inference for best results
 
-### If voice quality degrades
+This applies to all ACE-Step LoRA merges — vocal + music, genre + genre,
+instrument + style, etc. The `acestep_dit` preset is tuned for preserving
+distinct signals (voice, genre, instrument character) that would otherwise
+be diluted by naive averaging.
+
+### If voice quality degrades (vocal + music merges)
 
 - Try `merge_strategy_override: slerp` to force SLERP on all prefixes
 - Reduce the music LoRA's strength relative to the vocal LoRA
