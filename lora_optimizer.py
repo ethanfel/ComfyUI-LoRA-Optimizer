@@ -12173,12 +12173,17 @@ class LoRACombinationGenerator:
         prefixes = tuple(p.strip() for p in folder_filter.split(",") if p.strip())
         lora_names = [n for n in lora_names if n.startswith(prefixes)]
         if len(lora_names) < 2:
-            raise ValueError("Need at least 2 LoRAs to generate combinations.")
+            raise ValueError(f"Need at least 2 LoRAs matching filter '{folder_filter}', "
+                             f"found {len(lora_names)}: {lora_names}")
 
         combos = self._generate_combos(lora_names, combo_size)
         shuffled = self._shuffle_combos(combos, seed)
         completed, _ = self._load_progress(self._progress_path, seed)
         total = len(shuffled)
+        logging.info("[LoRA Combo] seed=%d, pool=%d LoRAs, %d combos, "
+                     "%d already completed, progress file: %s",
+                     seed, len(lora_names), total, len(completed),
+                     self._progress_path)
 
         combo = self._find_next(shuffled, completed)
 
@@ -12220,6 +12225,7 @@ class LoRACombinationGenerator:
         info = (f"Combo {done}/{total} | "
                 f"{' + '.join(combo)} | "
                 f"Remaining: {total - done}")
+        logging.info("[LoRA Combo] Returning: %s", info)
 
         return (lora_list, info)
 
@@ -12296,8 +12302,14 @@ class LoRACombinationGenerator:
             "completed": sorted(completed),
             "total": total,
         }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+        try:
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+            logging.info("[LoRA Combo] Progress saved: %d/%d completed → %s",
+                         len(completed), total, path)
+        except OSError as e:
+            logging.error("[LoRA Combo] Failed to save progress to %s: %s",
+                          path, e)
 
 
 # Node registration
