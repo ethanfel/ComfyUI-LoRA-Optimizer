@@ -2628,6 +2628,27 @@ class TestLoRACombinationGenerator(unittest.TestCase):
             self.assertEqual(completed, set())
             self.assertEqual(total, 0)
 
+    # -- node interface --
+
+    def test_input_types_has_required_fields(self):
+        inputs = lora_optimizer.LoRACombinationGenerator.INPUT_TYPES()
+        req = inputs["required"]
+        self.assertIn("seed", req)
+        self.assertIn("strength", req)
+        self.assertIn("combo_size", req)
+
+    def test_return_types(self):
+        self.assertEqual(
+            lora_optimizer.LoRACombinationGenerator.RETURN_TYPES,
+            ("LORA_STACK", "STRING"),
+        )
+
+    def test_is_changed_returns_nan(self):
+        result = lora_optimizer.LoRACombinationGenerator.IS_CHANGED(
+            seed=0, strength=1.0, combo_size="2",
+        )
+        self.assertTrue(math.isnan(result))
+
 
 if __name__ == "__main__":
     unittest.main()

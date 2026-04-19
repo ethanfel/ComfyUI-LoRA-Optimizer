@@ -12036,6 +12036,82 @@ class LoRACombinationGenerator:
     """Generate all 2-way and/or 3-way LoRA combinations for AutoTuner
     dataset collection, with deterministic shuffling and progress tracking."""
 
+    def __init__(self):
+        self._progress_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "combo_progress.json"
+        )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
+                "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05,
+                             "tooltip": "Default strength applied to all LoRAs in each combination."}),
+                "combo_size": (["2", "3", "2_and_3"], {
+                    "default": "2_and_3",
+                    "tooltip": "Generate pairs (2), triples (3), or both (2_and_3)."}),
+            },
+        }
+
+    RETURN_TYPES = ("LORA_STACK", "STRING")
+    RETURN_NAMES = ("lora_stack", "combo_info")
+    FUNCTION = "get_next_combo"
+    CATEGORY = "LoRA Optimizer"
+    DESCRIPTION = ("Generates all LoRA combinations for AutoTuner dataset "
+                   "collection. Tracks progress to avoid duplicates.")
+    OUTPUT_NODE = False
+
+    @classmethod
+    def IS_CHANGED(cls, seed, strength, combo_size):
+        return float("nan")
+
+    def get_next_combo(self, seed, strength, combo_size):
+        lora_names = folder_paths.get_filename_list("loras")
+        if len(lora_names) < 2:
+            raise ValueError("Need at least 2 LoRAs to generate combinations.")
+
+        combos = self._generate_combos(lora_names, combo_size)
+        shuffled = self._shuffle_combos(combos, seed)
+        completed, _ = self._load_progress(self._progress_path, seed)
+        total = len(shuffled)
+
+        combo = self._find_next(shuffled, completed)
+        if combo is None:
+            raise RuntimeError(
+                f"All {total} combinations completed for seed {seed}."
+            )
+
+        # Load LoRAs into stack format
+        lora_list = []
+        for name in combo:
+            lora_path = folder_paths.get_full_path("loras", name)
+            if lora_path is None:
+                # LoRA was deleted — skip this combo, mark done, try next
+                completed.add(self._combo_hash(combo))
+                self._save_progress(self._progress_path, seed, completed, total)
+                return self.get_next_combo(seed, strength, combo_size)
+            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            lora_list.append({
+                "name": name,
+                "lora": lora,
+                "strength": strength,
+                "conflict_mode": "all",
+                "key_filter": "all",
+                "metadata": _read_safetensors_metadata(lora_path),
+            })
+
+        # Mark completed and save
+        completed.add(self._combo_hash(combo))
+        self._save_progress(self._progress_path, seed, completed, total)
+
+        done = len(completed)
+        info = (f"Combo {done}/{total} | "
+                f"{' + '.join(name for name in combo)} | "
+                f"Remaining: {total - done}")
+
+        return (lora_list, info)
+
     @staticmethod
     def _generate_combos(lora_names, combo_size):
         """Return a sorted list of tuples from *lora_names*.
@@ -12136,6 +12212,7 @@ NODE_CLASS_MAPPINGS = {
     "LoRAMetadataReader": LoRAMetadataReader,
     "LoRAMergeFormula": LoRAMergeFormula,
     "LoRAExtractFromModel": LoRAExtractFromModel,
+    "LoRACombinationGenerator": LoRACombinationGenerator,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -12160,4 +12237,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoRAMetadataReader": "LoRA Metadata Reader",
     "LoRAMergeFormula": "LoRA Merge Formula",
     "LoRAExtractFromModel": "LoRA Extract from Model",
+    "LoRACombinationGenerator": "LoRA Combination Generator",
 }
