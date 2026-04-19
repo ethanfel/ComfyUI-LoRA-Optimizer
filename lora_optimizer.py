@@ -12083,6 +12083,8 @@ class LoRACombinationGenerator:
             for name in combo:
                 lora_path = folder_paths.get_full_path("loras", name)
                 if lora_path is None:
+                    logging.warning("[LoRA Combination Generator] Skipping combo — "
+                                    "LoRA '%s' not found, marking complete.", name)
                     completed.add(self._combo_hash(combo))
                     skip = True
                     break
