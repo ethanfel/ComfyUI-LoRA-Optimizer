@@ -2636,6 +2636,19 @@ class TestLoRACombinationGenerator(unittest.TestCase):
         self.assertIn("seed", req)
         self.assertIn("strength", req)
         self.assertIn("combo_size", req)
+        self.assertIn("folder_filter", req)
+
+    def test_folder_filter_narrows_pool(self):
+        """Filtering by prefix should reduce the combo pool."""
+        all_loras = [
+            "zimage/style1.safetensors", "zimage/style2.safetensors",
+            "zimage/style3.safetensors", "sdxl/char1.safetensors",
+        ]
+        filtered = [n for n in all_loras if n.startswith("zimage/")]
+        combos_all = lora_optimizer.LoRACombinationGenerator._generate_combos(all_loras, "2")
+        combos_filtered = lora_optimizer.LoRACombinationGenerator._generate_combos(filtered, "2")
+        self.assertEqual(len(combos_all), 6)   # C(4,2)
+        self.assertEqual(len(combos_filtered), 3)  # C(3,2)
 
     def test_return_types(self):
         self.assertEqual(

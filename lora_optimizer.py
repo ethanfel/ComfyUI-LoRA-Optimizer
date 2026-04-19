@@ -12052,6 +12052,9 @@ class LoRACombinationGenerator:
                 "combo_size": (["2", "3", "2_and_3"], {
                     "default": "2_and_3",
                     "tooltip": "Generate pairs (2), triples (3), or both (2_and_3)."}),
+                "folder_filter": ("STRING", {
+                    "default": "",
+                    "tooltip": "Only include LoRAs whose path starts with this prefix (e.g. 'zimage/' or 'sdxl/'). Empty = all LoRAs."}),
             },
         }
 
@@ -12062,11 +12065,13 @@ class LoRACombinationGenerator:
     DESCRIPTION = ("Generates all LoRA combinations for AutoTuner dataset "
                    "collection. Tracks progress to avoid duplicates.")
     @classmethod
-    def IS_CHANGED(cls, seed, strength, combo_size):
+    def IS_CHANGED(cls, seed, strength, combo_size, folder_filter=""):
         return float("nan")
 
-    def get_next_combo(self, seed, strength, combo_size):
+    def get_next_combo(self, seed, strength, combo_size, folder_filter=""):
         lora_names = folder_paths.get_filename_list("loras")
+        if folder_filter:
+            lora_names = [n for n in lora_names if n.startswith(folder_filter)]
         if len(lora_names) < 2:
             raise ValueError("Need at least 2 LoRAs to generate combinations.")
 
