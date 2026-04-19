@@ -2515,5 +2515,123 @@ class TestAceStepPreset(unittest.TestCase):
         self.assertEqual(key, "acestep_dit")
 
 
+class TestLoRACombinationGenerator(unittest.TestCase):
+    """Tests for LoRACombinationGenerator static combo generation and tracking."""
+
+    def setUp(self):
+        self.lora_names = ["alpha.safetensors", "beta.safetensors",
+                           "gamma.safetensors", "delta.safetensors"]
+
+    # -- combo generation --
+
+    def test_generates_all_pairs_from_lora_list(self):
+        combos = lora_optimizer.LoRACombinationGenerator._generate_combos(
+            self.lora_names, combo_size=2,
+        )
+        self.assertEqual(len(combos), 6)  # C(4,2)
+        for c in combos:
+            self.assertEqual(len(c), 2)
+
+    def test_generates_all_triples_from_lora_list(self):
+        combos = lora_optimizer.LoRACombinationGenerator._generate_combos(
+            self.lora_names, combo_size=3,
+        )
+        self.assertEqual(len(combos), 4)  # C(4,3)
+        for c in combos:
+            self.assertEqual(len(c), 3)
+
+    def test_generates_both_pairs_and_triples(self):
+        pairs = lora_optimizer.LoRACombinationGenerator._generate_combos(
+            self.lora_names, combo_size=2,
+        )
+        triples = lora_optimizer.LoRACombinationGenerator._generate_combos(
+            self.lora_names, combo_size=3,
+        )
+        all_combos = pairs + triples
+        self.assertEqual(len(all_combos), 10)  # C(4,2)+C(4,3) = 6+4
+
+    # -- deterministic shuffle --
+
+    def test_shuffle_is_deterministic_with_seed(self):
+        combos = lora_optimizer.LoRACombinationGenerator._generate_combos(
+            self.lora_names, combo_size=2,
+        )
+        a = lora_optimizer.LoRACombinationGenerator._shuffle_combos(combos, seed=42)
+        b = lora_optimizer.LoRACombinationGenerator._shuffle_combos(combos, seed=42)
+        self.assertEqual(a, b)
+
+    def test_different_seeds_produce_different_order(self):
+        combos = lora_optimizer.LoRACombinationGenerator._generate_combos(
+            self.lora_names, combo_size=2,
+        )
+        a = lora_optimizer.LoRACombinationGenerator._shuffle_combos(combos, seed=42)
+        b = lora_optimizer.LoRACombinationGenerator._shuffle_combos(combos, seed=99)
+        # Same elements, different order
+        self.assertEqual(sorted(a), sorted(b))
+        self.assertNotEqual(a, b)
+
+    # -- combo hash --
+
+    def test_combo_hash_is_order_independent(self):
+        h1 = lora_optimizer.LoRACombinationGenerator._combo_hash(("a", "b"))
+        h2 = lora_optimizer.LoRACombinationGenerator._combo_hash(("b", "a"))
+        self.assertEqual(h1, h2)
+
+    # -- find_next --
+
+    def test_find_next_skips_completed(self):
+        combos = [("a", "b"), ("c", "d"), ("e", "f")]
+        done_hash = lora_optimizer.LoRACombinationGenerator._combo_hash(("a", "b"))
+        result = lora_optimizer.LoRACombinationGenerator._find_next(
+            combos, completed={done_hash},
+        )
+        self.assertEqual(result, ("c", "d"))
+
+    def test_find_next_returns_none_when_all_done(self):
+        combos = [("a", "b"), ("c", "d")]
+        completed = {
+            lora_optimizer.LoRACombinationGenerator._combo_hash(c) for c in combos
+        }
+        result = lora_optimizer.LoRACombinationGenerator._find_next(
+            combos, completed=completed,
+        )
+        self.assertIsNone(result)
+
+    # -- progress persistence --
+
+    def test_progress_save_and_load(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "progress.json")
+            completed = {"abc123", "def456"}
+            lora_optimizer.LoRACombinationGenerator._save_progress(
+                path, seed=42, completed=completed, total=10,
+            )
+            loaded_completed, loaded_total = (
+                lora_optimizer.LoRACombinationGenerator._load_progress(path, seed=42)
+            )
+            self.assertEqual(loaded_completed, completed)
+            self.assertEqual(loaded_total, 10)
+
+    def test_progress_load_missing_file_returns_empty(self):
+        completed, total = lora_optimizer.LoRACombinationGenerator._load_progress(
+            "/tmp/nonexistent_combo_progress_xyz.json", seed=42,
+        )
+        self.assertEqual(completed, set())
+        self.assertEqual(total, 0)
+
+    def test_progress_load_different_seed_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "progress.json")
+            lora_optimizer.LoRACombinationGenerator._save_progress(
+                path, seed=42, completed={"abc123"}, total=5,
+            )
+            # Load with a different seed -- should return empty
+            completed, total = (
+                lora_optimizer.LoRACombinationGenerator._load_progress(path, seed=99)
+            )
+            self.assertEqual(completed, set())
+            self.assertEqual(total, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

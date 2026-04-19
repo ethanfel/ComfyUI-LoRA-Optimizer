@@ -10,6 +10,8 @@ import math
 import os
 import json
 import hashlib
+import itertools
+import random
 import time
 import re
 import gc
@@ -12028,6 +12030,79 @@ class LoRAExtractFromModel:
         }
 
         return (lora_stack, lora_data)
+
+
+class LoRACombinationGenerator:
+    """Generate all 2-way and/or 3-way LoRA combinations for AutoTuner
+    dataset collection, with deterministic shuffling and progress tracking."""
+
+    @staticmethod
+    def _generate_combos(lora_names, combo_size):
+        """Return a sorted list of tuples of *combo_size* from *lora_names*.
+
+        Names are sorted before generating combinations so output is
+        deterministic regardless of input order.
+        """
+        return list(itertools.combinations(sorted(lora_names), combo_size))
+
+    @staticmethod
+    def _shuffle_combos(combos, seed):
+        """Return a new list with *combos* shuffled deterministically."""
+        out = list(combos)
+        random.Random(seed).shuffle(out)
+        return out
+
+    @staticmethod
+    def _combo_hash(combo):
+        """Order-independent hash of a combo tuple (12-char hex digest)."""
+        key = "|".join(sorted(combo))
+        return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+    @staticmethod
+    def _find_next(shuffled_combos, completed):
+        """Return the first combo whose hash is not in *completed*, or None."""
+        for combo in shuffled_combos:
+            if LoRACombinationGenerator._combo_hash(combo) not in completed:
+                return combo
+        return None
+
+    @staticmethod
+    def _load_progress(path, seed):
+        """Load progress JSON for *seed*.  Returns (completed_set, total).
+
+        Returns ``(set(), 0)`` if the file is missing or the seed doesn't
+        match any stored entry.
+        """
+        if not os.path.exists(path):
+            return set(), 0
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return set(), 0
+        seed_key = str(seed)
+        entry = data.get(seed_key)
+        if entry is None:
+            return set(), 0
+        return set(entry.get("completed", [])), entry.get("total", 0)
+
+    @staticmethod
+    def _save_progress(path, seed, completed, total):
+        """Save/update progress JSON for *seed*."""
+        data = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        seed_key = str(seed)
+        data[seed_key] = {
+            "completed": sorted(completed),
+            "total": total,
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
 
 
 # Node registration
