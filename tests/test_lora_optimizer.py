@@ -154,6 +154,21 @@ class LoRAOptimizerTests(unittest.TestCase):
         self.optimizer = lora_optimizer.LoRAOptimizer()
         self.model = _make_model()
 
+    def test_lora_format_cache_avoids_repeated_detection(self):
+        """After detecting a LoRA's format once, subsequent prefixes should reuse it."""
+        optimizer = lora_optimizer.LoRAOptimizer()
+        lora_dict = {
+            "unet.a.lora_B.weight": torch.tensor([[1.0]], dtype=torch.float32),
+            "unet.a.lora_A.weight": torch.tensor([[1.0]], dtype=torch.float32),
+            "unet.b.lora_B.weight": torch.tensor([[2.0]], dtype=torch.float32),
+            "unet.b.lora_A.weight": torch.tensor([[1.0]], dtype=torch.float32),
+        }
+        result1 = optimizer._get_lora_key_info(lora_dict, "unet.a")
+        self.assertIsNotNone(result1)
+        self.assertIn(id(lora_dict), optimizer._lora_format_cache)
+        result2 = optimizer._get_lora_key_info(lora_dict, "unet.b")
+        self.assertIsNotNone(result2)
+
     def test_target_groups_merge_aliases_for_same_target(self):
         groups = self.optimizer._build_target_groups(
             ["alias_a", "alias_b", "other"],
@@ -760,6 +775,37 @@ class LoRAOptimizerTests(unittest.TestCase):
                 # No enabled_1 or enabled_2 passed
             )
         self.assertEqual(len(result), 2)
+
+    def test_score_merge_result_baseline_matches_full(self):
+        """Scoring multi-LoRA patches with single-LoRA baseline should match full scoring."""
+        LoRAAdapter = lora_optimizer.LoRAAdapter
+        single_patches = {}
+        multi_patches = {}
+        all_patches = {}
+        for i in range(10):
+            up = torch.randn(8, 4)
+            down = torch.randn(4, 16)
+            adapter = LoRAAdapter(set(), (up, down, 4.0, None, None, None))
+            key = f"key{i}"
+            all_patches[key] = adapter
+            if i < 5:
+                single_patches[key] = adapter
+            else:
+                multi_patches[key] = adapter
+
+        full = lora_optimizer._score_merge_result(all_patches, {}, compute_svd=False)
+
+        sl = lora_optimizer._score_merge_result(
+            single_patches, {}, compute_svd=False, _return_raw=True)
+        baseline = sl["_raw"]
+        combined = lora_optimizer._score_merge_result(
+            multi_patches, {}, compute_svd=False, _baseline=baseline)
+
+        self.assertAlmostEqual(full["composite_score"], combined["composite_score"], places=6)
+        self.assertAlmostEqual(full["norm_mean"], combined["norm_mean"], places=6)
+        self.assertAlmostEqual(full["norm_cv"], combined["norm_cv"], places=6)
+        self.assertAlmostEqual(full["sparsity_mean"], combined["sparsity_mean"], places=6)
+        self.assertAlmostEqual(full["norm_energy_sq"], combined["norm_energy_sq"], places=4)
 
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
@@ -2329,6 +2375,67 @@ class TestPairLoraCacheAutoTune(unittest.TestCase):
                 loaded = tuner._lora_cache_load("hash_x")
                 self.assertIn("prefix_a", loaded)
                 self.assertIn("prefix_b", loaded)
+
+    def test_score_merge_result_lora_adapter_on_device(self):
+        """_score_merge_result should handle LoRAAdapter patches correctly."""
+        LoRAAdapter = lora_optimizer.LoRAAdapter
+        up = torch.randn(8, 4)
+        down = torch.randn(4, 16)
+        alpha = 4.0
+        adapter = LoRAAdapter(
+            loaded_keys=set(),
+            weights=(up, down, alpha, None, None, None),
+        )
+        patches = {("key1",): adapter}
+        result = lora_optimizer._score_merge_result(patches, {}, compute_svd=False)
+        self.assertIn("norm_mean", result)
+        self.assertGreater(result["norm_mean"], 0)
+        self.assertIn("composite_score", result)
+
+    def test_sample_pair_metrics_downsamples_large_vectors(self):
+        """Pair metrics should work correctly with large vectors that trigger downsampling."""
+        optimizer = lora_optimizer.LoRAOptimizer()
+        a = torch.randn(200000)
+        b = torch.randn(200000)
+        result = optimizer._sample_pair_metrics(a, b)
+        self.assertIn("overlap", result)
+        self.assertIn("conflict", result)
+        self.assertIn("dot", result)
+        self.assertGreater(result["overlap"], 0)
+        result2 = optimizer._sample_pair_metrics(a, b)
+        self.assertEqual(result["overlap"], result2["overlap"])
+        self.assertEqual(result["conflict"], result2["conflict"])
+        self.assertAlmostEqual(result["dot"], result2["dot"], places=4)
+
+
+    def test_sl_patch_cache_populates_and_hits(self):
+        """Single-LoRA patch cache should store results and reuse them on matching auto_strength."""
+        optimizer = lora_optimizer.LoRAOptimizer()
+        # Simulate a result tuple as returned by _merge_one_group
+        fake_patch = ("diff", (torch.randn(4, 4),))
+        fake_result = ("weight.key", False, fake_patch, "weighted_sum", "lora_unet_block", 0.0, 1, False, 1.0, 0.9)
+
+        cache = {}
+        prefix = "lora_unet_block"
+        auto_strength = "enabled"
+
+        # First access: miss → populate
+        key = (prefix, auto_strength)
+        self.assertNotIn(key, cache)
+        cache[key] = fake_result
+        self.assertIn(key, cache)
+        self.assertIs(cache[key], fake_result)
+
+        # Second access with same auto_strength: hit
+        self.assertIs(cache.get(key), fake_result)
+
+        # Different auto_strength: miss
+        key2 = (prefix, "disabled")
+        self.assertIsNone(cache.get(key2))
+
+        # Different prefix, same auto_strength: miss
+        key3 = ("lora_unet_other", auto_strength)
+        self.assertIsNone(cache.get(key3))
 
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")

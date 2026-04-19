@@ -718,6 +718,7 @@ class _LoRAMergeBase:
 
     def __init__(self):
         self.loaded_loras = {}
+        self._lora_format_cache = {}  # id(lora_dict) -> format_index (0-3)
 
     @staticmethod
     def _get_compute_device():
@@ -1950,27 +1951,34 @@ class _LoRAMergeBase:
             ("{}.lora.up.weight", "{}.lora.down.weight"),           # diffusers3
         ]
 
-        for up_fmt, down_fmt in formats:
+        def _extract(up_key, down_key):
+            mat_up = lora_dict[up_key]
+            mat_down = lora_dict[down_key]
+            alpha_key = "{}.alpha".format(key_prefix)
+            alpha = lora_dict.get(alpha_key, None)
+            if alpha is not None:
+                alpha = alpha.item()
+            else:
+                alpha = mat_down.shape[0]
+            mid_key = "{}.lora_mid.weight".format(key_prefix)
+            mid = lora_dict.get(mid_key, None)
+            return (mat_up, mat_down, alpha, mid)
+
+        # Try cached format first
+        dict_id = id(lora_dict)
+        cached_fmt = self._lora_format_cache.get(dict_id)
+        if cached_fmt is not None:
+            up_key = formats[cached_fmt][0].format(key_prefix)
+            down_key = formats[cached_fmt][1].format(key_prefix)
+            if up_key in lora_dict and down_key in lora_dict:
+                return _extract(up_key, down_key)
+
+        for fmt_idx, (up_fmt, down_fmt) in enumerate(formats):
             up_key = up_fmt.format(key_prefix)
             down_key = down_fmt.format(key_prefix)
-
             if up_key in lora_dict and down_key in lora_dict:
-                mat_up = lora_dict[up_key]
-                mat_down = lora_dict[down_key]
-
-                # Alpha
-                alpha_key = "{}.alpha".format(key_prefix)
-                alpha = lora_dict.get(alpha_key, None)
-                if alpha is not None:
-                    alpha = alpha.item()
-                else:
-                    alpha = mat_down.shape[0]  # rank as default
-
-                # Mid (for LoCon)
-                mid_key = "{}.lora_mid.weight".format(key_prefix)
-                mid = lora_dict.get(mid_key, None)
-
-                return (mat_up, mat_down, alpha, mid)
+                self._lora_format_cache[dict_id] = fmt_idx
+                return _extract(up_key, down_key)
 
         return None
 
@@ -2262,7 +2270,7 @@ class _LoRAMergeBase:
         if n > 100000:
             target_device = flat_a.device
             g = torch.Generator(device=target_device).manual_seed(42)
-            indices = torch.randperm(n, device=target_device, generator=g)[:100000]
+            indices = torch.randint(0, n, (100000,), device=target_device, generator=g)
             flat_a = flat_a[indices]
             flat_b = flat_b[indices]
 
@@ -3769,7 +3777,8 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
 
 
 def _score_merge_result(model_patches, clip_patches, compute_svd=True,
-                        score_device=None, arch_preset=None, lora_svd=False):
+                        score_device=None, arch_preset=None, lora_svd=False,
+                        _baseline=None, _return_raw=False):
     """
     Score an actual merge result by measuring output quality metrics.
     Returns dict with individual metrics and composite score in [0, 1].
@@ -3781,10 +3790,16 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
     When arch_preset is provided, uses arch-aware ideal sparsity from
     dare_ideal_density instead of hardcoded 40%.
     """
-    norms = []
-    importance_values = []
-    effective_ranks = []
-    sparsities = []
+    if _baseline is not None:
+        norms = list(_baseline["norms"])
+        importance_values = list(_baseline["importance_values"])
+        effective_ranks = list(_baseline["effective_ranks"])
+        sparsities = list(_baseline["sparsities"])
+    else:
+        norms = []
+        importance_values = []
+        effective_ranks = []
+        sparsities = []
     _svd_tasks = []  # (gram_up [rank,rank], rank_int) — batched after loop
 
     all_patches = (
@@ -3847,11 +3862,13 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
             if mat_up is not None and mat_down is not None:
                 rank = mat_down.shape[0] if mat_down.dim() >= 1 else 1
                 scale = alpha / rank if rank > 0 else 1.0
-                up_flat = mat_up.flatten(start_dim=1).float()
-                down_flat = mat_down.flatten(start_dim=1).float()
+                up_flat = mat_up.flatten(start_dim=1)
+                down_flat = mat_down.flatten(start_dim=1)
                 if score_device is not None:
                     up_flat = up_flat.to(score_device)
                     down_flat = down_flat.to(score_device)
+                up_flat = up_flat.float()
+                down_flat = down_flat.float()
                 # ||AB||_F^2 = tr(A^T A B B^T) — avoids materializing full diff
                 gram_up = torch.mm(up_flat.T, up_flat)
                 gram_down = torch.mm(down_flat, down_flat.T)
@@ -4001,6 +4018,13 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
         score += metrics["sparsity_fit"] * 0.5
 
     metrics["composite_score"] = score
+    if _return_raw:
+        metrics["_raw"] = {
+            "norms": norms,
+            "importance_values": importance_values,
+            "effective_ranks": effective_ranks,
+            "sparsities": sparsities,
+        }
     return metrics
 
 
@@ -6215,7 +6239,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             smooth_slerp_gate=smooth_slerp_gate,
         )
 
-    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", auto_strength_floor=-1.0, free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", patch_compression="smart", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_refinement="none", strategy_set="full", architecture_preset="auto", decision_smoothing=0.25, smooth_slerp_gate=False, _analysis_cache=None, _diff_cache=None, _skip_report=False, _skip_qkv_refusion=False):
+    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", auto_strength_floor=-1.0, free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", patch_compression="smart", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_refinement="none", strategy_set="full", architecture_preset="auto", decision_smoothing=0.25, smooth_slerp_gate=False, _analysis_cache=None, _diff_cache=None, _skip_report=False, _skip_qkv_refusion=False, _sl_patch_cache=None):
         """
         Main entry point. Two-pass streaming architecture:
         Pass 1: Resolve aliases to target groups, compute diffs, sample metrics, discard diffs
@@ -6924,10 +6948,21 @@ class LoRAOptimizer(_LoRAMergeBase):
             strategy_counts[used_mode] = strategy_counts.get(used_mode, 0) + 1
             prefix_decisions.append((prefix, used_mode, conflict, n_loras))
 
+        _sl_cache_hits = 0
         if use_gpu:
             group_items = list(target_groups.items())
             n_loras = len(active_loras)
             for idx, (label_prefix, target_group) in enumerate(group_items):
+                # Single-LoRA patch cache: reuse across Phase 2 candidates
+                _sl_key = None
+                if _sl_patch_cache is not None and prefix_stats.get(label_prefix, {}).get("n_loras", 0) <= 1:
+                    _sl_key = (label_prefix, auto_strength)
+                    cached = _sl_patch_cache.get(_sl_key)
+                    if cached is not None:
+                        _collect_merge_result(cached)
+                        _sl_cache_hits += 1
+                        continue
+
                 if _diff_cache is not None and idx + 1 < len(group_items):
                     next_group = group_items[idx + 1][1]
                     prefetch_keys = [
@@ -6936,18 +6971,38 @@ class LoRAOptimizer(_LoRAMergeBase):
                         for i in range(n_loras)
                     ]
                     _diff_cache.prefetch(prefetch_keys)
-                _collect_merge_result(_merge_one_group(label_prefix, target_group))
+                result = _merge_one_group(label_prefix, target_group)
+                if _sl_key is not None:
+                    _sl_patch_cache[_sl_key] = result
+                _collect_merge_result(result)
         else:
             max_workers = min(4, max(1, len(target_groups)))
+            # Separate cached single-LoRA results from groups that need computation
+            compute_items = []
+            for label_prefix, target_group in target_groups.items():
+                if _sl_patch_cache is not None and prefix_stats.get(label_prefix, {}).get("n_loras", 0) <= 1:
+                    cached = _sl_patch_cache.get((label_prefix, auto_strength))
+                    if cached is not None:
+                        _collect_merge_result(cached)
+                        _sl_cache_hits += 1
+                        continue
+                compute_items.append((label_prefix, target_group))
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(_merge_one_group, label_prefix, target_group): label_prefix
-                    for label_prefix, target_group in target_groups.items()
+                    executor.submit(_merge_one_group, lp, tg): lp
+                    for lp, tg in compute_items
                 }
                 for future in concurrent.futures.as_completed(futures):
-                    _collect_merge_result(future.result())
+                    result = future.result()
+                    lp = futures[future]
+                    if _sl_patch_cache is not None and prefix_stats.get(lp, {}).get("n_loras", 0) <= 1:
+                        _sl_patch_cache[(lp, auto_strength)] = result
+                    _collect_merge_result(result)
 
         fullrank_count = processed_keys - lowrank_count
+        if _sl_cache_hits > 0:
+            logging.info(f"[LoRA Optimizer]   Single-LoRA patch cache: {_sl_cache_hits} hits")
         if _overwrite_count > 0:
             logging.info(f"[LoRA Optimizer] {_overwrite_count} target-key collisions resolved "
                          f"(different LoRA key formats targeting the same model weight — diffs accumulated)")
@@ -9234,6 +9289,20 @@ class LoRAAutoTuner(LoRAOptimizer):
         best_config = None
         logging.info(f"[LoRA AutoTuner] Phase 2: Merging and measuring top {len(top_candidates)} candidates...")
 
+        # Pre-identify single-LoRA target keys for scoring cache.
+        # Single-LoRA patches are identical across candidates (merge strategies
+        # don't apply — early return at _merge_diffs line 2868). Score once, reuse.
+        single_lora_keys = set()
+        for pfx, info in all_key_targets.items():
+            if prefix_stats.get(pfx, {}).get("n_loras", 0) <= 1:
+                single_lora_keys.add(info[0])  # info is (target_key, is_clip)
+        _cached_sl_baseline = None
+
+        # Single-LoRA merge result cache: reuse actual patches across candidates.
+        # Keyed by (label_prefix, auto_strength) since auto_scale is the only
+        # candidate-dependent factor for single-LoRA prefixes.
+        _sl_patch_cache = {} if len(single_lora_keys) > 0 else None
+
         for rank_idx, (h_score, config) in enumerate(top_candidates):
             logging.info(f"[LoRA AutoTuner]   Candidate {rank_idx + 1}/{len(top_candidates)}: "
                          f"{config['merge_mode']}, {config['merge_refinement']}"
@@ -9271,6 +9340,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 _diff_cache=_diff_cache,
                 _skip_report=True,
                 _skip_qkv_refusion=_is_sub_merge,
+                _sl_patch_cache=_sl_patch_cache,
             )
 
             # Measure output quality (single-LoRA prefixes may still produce
@@ -9288,11 +9358,36 @@ class LoRAAutoTuner(LoRAOptimizer):
             score_dev = torch.device("cuda") if scoring_device == "gpu" and torch.cuda.is_available() else None
             t_score = time.time()
             score_arch = tuner_arch_preset if scoring_formula == "v2" else None
-            measured = _score_merge_result(
-                m_patches, c_patches, compute_svd=compute_svd,
-                score_device=score_dev, arch_preset=score_arch,
-                lora_svd=compute_lora_svd
-            )
+
+            if single_lora_keys:
+                m_multi = {k: v for k, v in m_patches.items()
+                           if k not in single_lora_keys}
+                c_multi = {k: v for k, v in c_patches.items()
+                           if k not in single_lora_keys}
+
+                if _cached_sl_baseline is None:
+                    # First candidate: score single-LoRA patches, cache raw lists
+                    m_single = {k: v for k, v in m_patches.items()
+                                if k in single_lora_keys}
+                    c_single = {k: v for k, v in c_patches.items()
+                                if k in single_lora_keys}
+                    sl_measured = _score_merge_result(
+                        m_single, c_single, compute_svd=compute_svd,
+                        score_device=score_dev, arch_preset=score_arch,
+                        lora_svd=compute_lora_svd, _return_raw=True)
+                    _cached_sl_baseline = sl_measured.get("_raw")
+                    del m_single, c_single, sl_measured
+
+                measured = _score_merge_result(
+                    m_multi, c_multi, compute_svd=compute_svd,
+                    score_device=score_dev, arch_preset=score_arch,
+                    lora_svd=compute_lora_svd,
+                    _baseline=_cached_sl_baseline)
+            else:
+                measured = _score_merge_result(
+                    m_patches, c_patches, compute_svd=compute_svd,
+                    score_device=score_dev, arch_preset=score_arch,
+                    lora_svd=compute_lora_svd)
             t_score_elapsed = time.time() - t_score
             # --- Post-scoring adjustments ---
             if scoring_formula == "v1":
@@ -9425,19 +9520,18 @@ class LoRAAutoTuner(LoRAOptimizer):
                 best_score = final_score
                 best_config = config
             del m_patches, c_patches  # Drop patch-dict references so tensors can free
-            gc.collect()
-            if use_gpu:
-                torch.cuda.empty_cache()
-            # Log memory usage to help diagnose leaks on large models
-            try:
-                import psutil
-                proc = psutil.Process()
-                rss_gb = proc.memory_info().rss / (1024**3)
-                dc_mb = _diff_cache.size_mb() if _diff_cache else 0
-                logging.info(f"[LoRA AutoTuner]   Memory: process={rss_gb:.1f}GB"
-                             f"{f', diff_cache={dc_mb:.0f}MB' if dc_mb > 0 else ''}")
-            except ImportError:
-                pass
+            gc.collect(0)  # gen-0 only: ~10x faster, catches fresh cycles from ModelPatcher
+            # Log memory usage on first/last iteration to diagnose leaks
+            if rank_idx == 0 or rank_idx == len(top_candidates) - 1:
+                try:
+                    import psutil
+                    proc = psutil.Process()
+                    rss_gb = proc.memory_info().rss / (1024**3)
+                    dc_mb = _diff_cache.size_mb() if _diff_cache else 0
+                    logging.info(f"[LoRA AutoTuner]   Memory: process={rss_gb:.1f}GB"
+                                 f"{f', diff_cache={dc_mb:.0f}MB' if dc_mb > 0 else ''}")
+                except ImportError:
+                    pass
 
             results.append({
                 "rank": rank_idx + 1,
@@ -9507,6 +9601,9 @@ class LoRAAutoTuner(LoRAOptimizer):
             del _diff_cache
         del all_magnitude_samples
         del _analysis_cache
+        if _sl_patch_cache is not None:
+            _sl_patch_cache.clear()
+            del _sl_patch_cache
         self.loaded_loras.clear()
         gc.collect()
         if use_gpu:
