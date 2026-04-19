@@ -12038,12 +12038,20 @@ class LoRACombinationGenerator:
 
     @staticmethod
     def _generate_combos(lora_names, combo_size):
-        """Return a sorted list of tuples of *combo_size* from *lora_names*.
+        """Return a sorted list of tuples from *lora_names*.
+
+        *combo_size* is a string: ``"2"``, ``"3"``, or ``"2_and_3"``
+        (ComfyUI dropdowns pass strings).  ``"2_and_3"`` returns pairs
+        followed by triples in a single list.
 
         Names are sorted before generating combinations so output is
         deterministic regardless of input order.
         """
-        return list(itertools.combinations(sorted(lora_names), combo_size))
+        sorted_names = sorted(lora_names)
+        if combo_size == "2_and_3":
+            return (list(itertools.combinations(sorted_names, 2))
+                    + list(itertools.combinations(sorted_names, 3)))
+        return list(itertools.combinations(sorted_names, int(combo_size)))
 
     @staticmethod
     def _shuffle_combos(combos, seed):
@@ -12080,7 +12088,7 @@ class LoRACombinationGenerator:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
             return set(), 0
-        seed_key = str(seed)
+        seed_key = f"seed_{seed}"
         entry = data.get(seed_key)
         if entry is None:
             return set(), 0
@@ -12096,7 +12104,7 @@ class LoRACombinationGenerator:
                     data = json.load(f)
             except (json.JSONDecodeError, OSError):
                 data = {}
-        seed_key = str(seed)
+        seed_key = f"seed_{seed}"
         data[seed_key] = {
             "completed": sorted(completed),
             "total": total,

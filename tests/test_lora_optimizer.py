@@ -2526,7 +2526,7 @@ class TestLoRACombinationGenerator(unittest.TestCase):
 
     def test_generates_all_pairs_from_lora_list(self):
         combos = lora_optimizer.LoRACombinationGenerator._generate_combos(
-            self.lora_names, combo_size=2,
+            self.lora_names, combo_size="2",
         )
         self.assertEqual(len(combos), 6)  # C(4,2)
         for c in combos:
@@ -2534,27 +2534,23 @@ class TestLoRACombinationGenerator(unittest.TestCase):
 
     def test_generates_all_triples_from_lora_list(self):
         combos = lora_optimizer.LoRACombinationGenerator._generate_combos(
-            self.lora_names, combo_size=3,
+            self.lora_names, combo_size="3",
         )
         self.assertEqual(len(combos), 4)  # C(4,3)
         for c in combos:
             self.assertEqual(len(c), 3)
 
     def test_generates_both_pairs_and_triples(self):
-        pairs = lora_optimizer.LoRACombinationGenerator._generate_combos(
-            self.lora_names, combo_size=2,
+        all_combos = lora_optimizer.LoRACombinationGenerator._generate_combos(
+            self.lora_names, combo_size="2_and_3",
         )
-        triples = lora_optimizer.LoRACombinationGenerator._generate_combos(
-            self.lora_names, combo_size=3,
-        )
-        all_combos = pairs + triples
         self.assertEqual(len(all_combos), 10)  # C(4,2)+C(4,3) = 6+4
 
     # -- deterministic shuffle --
 
     def test_shuffle_is_deterministic_with_seed(self):
         combos = lora_optimizer.LoRACombinationGenerator._generate_combos(
-            self.lora_names, combo_size=2,
+            self.lora_names, combo_size="2",
         )
         a = lora_optimizer.LoRACombinationGenerator._shuffle_combos(combos, seed=42)
         b = lora_optimizer.LoRACombinationGenerator._shuffle_combos(combos, seed=42)
@@ -2562,7 +2558,7 @@ class TestLoRACombinationGenerator(unittest.TestCase):
 
     def test_different_seeds_produce_different_order(self):
         combos = lora_optimizer.LoRACombinationGenerator._generate_combos(
-            self.lora_names, combo_size=2,
+            self.lora_names, combo_size="2",
         )
         a = lora_optimizer.LoRACombinationGenerator._shuffle_combos(combos, seed=42)
         b = lora_optimizer.LoRACombinationGenerator._shuffle_combos(combos, seed=99)
