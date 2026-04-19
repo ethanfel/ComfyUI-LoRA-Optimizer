@@ -12143,7 +12143,8 @@ class LoRACombinationGenerator:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
+                "shuffle_order": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1,
+                                  "tooltip": "Seed for shuffle order. Same value = same deterministic sequence."}),
                 "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05,
                              "tooltip": "Default strength applied to all LoRAs in each combination."}),
                 "combo_size": (["2", "3", "2_and_3"], {
@@ -12162,10 +12163,10 @@ class LoRACombinationGenerator:
     DESCRIPTION = ("Generates all LoRA combinations for AutoTuner dataset "
                    "collection. Tracks progress to avoid duplicates.")
     @classmethod
-    def IS_CHANGED(cls, seed, strength, combo_size, folder_filter=""):
+    def IS_CHANGED(cls, shuffle_order, strength, combo_size, folder_filter=""):
         return float("nan")
 
-    def get_next_combo(self, seed, strength, combo_size, folder_filter=""):
+    def get_next_combo(self, shuffle_order, strength, combo_size, folder_filter=""):
         lora_names = folder_paths.get_filename_list("loras")
         if not folder_filter:
             raise ValueError("folder_filter is required — specify one or more "
@@ -12177,12 +12178,12 @@ class LoRACombinationGenerator:
                              f"found {len(lora_names)}: {lora_names}")
 
         combos = self._generate_combos(lora_names, combo_size)
-        shuffled = self._shuffle_combos(combos, seed)
-        completed, _ = self._load_progress(self._progress_path, seed)
+        shuffled = self._shuffle_combos(combos, shuffle_order)
+        completed, _ = self._load_progress(self._progress_path)
         total = len(shuffled)
-        logging.info("[LoRA Combo] seed=%d, pool=%d LoRAs, %d combos, "
+        logging.info("[LoRA Combo] shuffle_order=%d, pool=%d LoRAs, %d combos, "
                      "%d already completed, progress file: %s",
-                     seed, len(lora_names), total, len(completed),
+                     shuffle_order, len(lora_names), total, len(completed),
                      self._progress_path)
 
         combo = self._find_next(shuffled, completed)
@@ -12213,13 +12214,13 @@ class LoRACombinationGenerator:
             combo = self._find_next(shuffled, completed)
 
         if combo is None:
-            self._save_progress(self._progress_path, seed, completed, total)
-            logging.info("LoRACombinationGenerator: All %d combinations "
-                         "completed for seed %d.", total, seed)
+            self._save_progress(self._progress_path, completed, total)
+            logging.info("LoRACombinationGenerator: All %d combinations completed.",
+                         total)
             raise comfy.model_management.InterruptProcessingException()
 
         completed.add(self._combo_hash(combo))
-        self._save_progress(self._progress_path, seed, completed, total)
+        self._save_progress(self._progress_path, completed, total)
 
         done = len(completed)
         info = (f"Combo {done}/{total} | "
@@ -12268,11 +12269,10 @@ class LoRACombinationGenerator:
         return None
 
     @staticmethod
-    def _load_progress(path, seed):
-        """Load progress JSON for *seed*.  Returns (completed_set, total).
+    def _load_progress(path):
+        """Load completed set from progress JSON.  Returns (completed_set, total).
 
-        Returns ``(set(), 0)`` if the file is missing or the seed doesn't
-        match any stored entry.
+        Returns ``(set(), 0)`` if the file is missing or unreadable.
         """
         if not os.path.exists(path):
             return set(), 0
@@ -12281,24 +12281,12 @@ class LoRACombinationGenerator:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
             return set(), 0
-        seed_key = f"seed_{seed}"
-        entry = data.get(seed_key)
-        if entry is None:
-            return set(), 0
-        return set(entry.get("completed", [])), entry.get("total", 0)
+        return set(data.get("completed", [])), data.get("total", 0)
 
     @staticmethod
-    def _save_progress(path, seed, completed, total):
-        """Save/update progress JSON for *seed*."""
-        data = {}
-        if os.path.exists(path):
-            try:
-                with open(path, "r") as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                data = {}
-        seed_key = f"seed_{seed}"
-        data[seed_key] = {
+    def _save_progress(path, completed, total):
+        """Save completed set to progress JSON."""
+        data = {
             "completed": sorted(completed),
             "total": total,
         }

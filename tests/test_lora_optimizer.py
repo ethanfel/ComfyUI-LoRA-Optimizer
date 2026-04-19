@@ -2707,40 +2707,41 @@ class TestLoRACombinationGenerator(unittest.TestCase):
             path = os.path.join(d, "progress.json")
             completed = {"abc123", "def456"}
             lora_optimizer.LoRACombinationGenerator._save_progress(
-                path, seed=42, completed=completed, total=10,
+                path, completed=completed, total=10,
             )
             loaded_completed, loaded_total = (
-                lora_optimizer.LoRACombinationGenerator._load_progress(path, seed=42)
+                lora_optimizer.LoRACombinationGenerator._load_progress(path)
             )
             self.assertEqual(loaded_completed, completed)
             self.assertEqual(loaded_total, 10)
 
     def test_progress_load_missing_file_returns_empty(self):
         completed, total = lora_optimizer.LoRACombinationGenerator._load_progress(
-            "/tmp/nonexistent_combo_progress_xyz.json", seed=42,
+            "/tmp/nonexistent_combo_progress_xyz.json",
         )
         self.assertEqual(completed, set())
         self.assertEqual(total, 0)
 
-    def test_progress_load_different_seed_returns_empty(self):
+    def test_progress_persists_across_different_shuffle_orders(self):
+        """Completed combos are tracked regardless of shuffle_order."""
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "progress.json")
             lora_optimizer.LoRACombinationGenerator._save_progress(
-                path, seed=42, completed={"abc123"}, total=5,
+                path, completed={"abc123"}, total=5,
             )
-            # Load with a different seed -- should return empty
+            # Loading should return the same completed set regardless
             completed, total = (
-                lora_optimizer.LoRACombinationGenerator._load_progress(path, seed=99)
+                lora_optimizer.LoRACombinationGenerator._load_progress(path)
             )
-            self.assertEqual(completed, set())
-            self.assertEqual(total, 0)
+            self.assertEqual(completed, {"abc123"})
+            self.assertEqual(total, 5)
 
     # -- node interface --
 
     def test_input_types_has_required_fields(self):
         inputs = lora_optimizer.LoRACombinationGenerator.INPUT_TYPES()
         req = inputs["required"]
-        self.assertIn("seed", req)
+        self.assertIn("shuffle_order", req)
         self.assertIn("strength", req)
         self.assertIn("combo_size", req)
         self.assertIn("folder_filter", req)
@@ -2777,7 +2778,7 @@ class TestLoRACombinationGenerator(unittest.TestCase):
 
     def test_is_changed_returns_nan(self):
         result = lora_optimizer.LoRACombinationGenerator.IS_CHANGED(
-            seed=0, strength=1.0, combo_size="2",
+            shuffle_order=0, strength=1.0, combo_size="2",
         )
         self.assertTrue(math.isnan(result))
 
