@@ -2639,16 +2639,28 @@ class TestLoRACombinationGenerator(unittest.TestCase):
         self.assertIn("folder_filter", req)
 
     def test_folder_filter_narrows_pool(self):
-        """Filtering by prefix should reduce the combo pool."""
+        """Filtering by single prefix should reduce the combo pool."""
         all_loras = [
-            "zimage/style1.safetensors", "zimage/style2.safetensors",
-            "zimage/style3.safetensors", "sdxl/char1.safetensors",
+            "zit/style1.safetensors", "zit/style2.safetensors",
+            "zit/style3.safetensors", "sdxl/char1.safetensors",
         ]
-        filtered = [n for n in all_loras if n.startswith("zimage/")]
+        filtered = [n for n in all_loras if n.startswith("zit/")]
         combos_all = lora_optimizer.LoRACombinationGenerator._generate_combos(all_loras, "2")
         combos_filtered = lora_optimizer.LoRACombinationGenerator._generate_combos(filtered, "2")
         self.assertEqual(len(combos_all), 6)   # C(4,2)
         self.assertEqual(len(combos_filtered), 3)  # C(3,2)
+
+    def test_folder_filter_multiple_prefixes(self):
+        """Comma-separated prefixes should include LoRAs from all matching folders."""
+        all_loras = [
+            "zit/style1.safetensors", "zit/style2.safetensors",
+            "zib/base1.safetensors", "sdxl/char1.safetensors",
+        ]
+        prefixes = tuple(p.strip() for p in "zit/,zib/".split(",") if p.strip())
+        filtered = [n for n in all_loras if n.startswith(prefixes)]
+        combos = lora_optimizer.LoRACombinationGenerator._generate_combos(filtered, "2")
+        self.assertEqual(len(filtered), 3)  # 2 zit + 1 zib
+        self.assertEqual(len(combos), 3)    # C(3,2)
 
     def test_return_types(self):
         self.assertEqual(

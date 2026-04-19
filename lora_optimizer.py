@@ -12054,7 +12054,7 @@ class LoRACombinationGenerator:
                     "tooltip": "Generate pairs (2), triples (3), or both (2_and_3)."}),
                 "folder_filter": ("STRING", {
                     "default": "",
-                    "tooltip": "Only include LoRAs whose path starts with this prefix (e.g. 'zimage/' or 'sdxl/'). Empty = all LoRAs."}),
+                    "tooltip": "Comma-separated prefixes to filter LoRAs (e.g. 'zit/,zib/' or 'sdxl/'). Empty = all LoRAs."}),
             },
         }
 
@@ -12070,8 +12070,11 @@ class LoRACombinationGenerator:
 
     def get_next_combo(self, seed, strength, combo_size, folder_filter=""):
         lora_names = folder_paths.get_filename_list("loras")
-        if folder_filter:
-            lora_names = [n for n in lora_names if n.startswith(folder_filter)]
+        if not folder_filter:
+            raise ValueError("folder_filter is required — specify one or more "
+                             "comma-separated prefixes (e.g. 'zit/,zib/').")
+        prefixes = tuple(p.strip() for p in folder_filter.split(",") if p.strip())
+        lora_names = [n for n in lora_names if n.startswith(prefixes)]
         if len(lora_names) < 2:
             raise ValueError("Need at least 2 LoRAs to generate combinations.")
 
