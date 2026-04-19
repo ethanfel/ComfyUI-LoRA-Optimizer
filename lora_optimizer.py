@@ -12060,8 +12060,6 @@ class LoRACombinationGenerator:
     CATEGORY = "LoRA Optimizer"
     DESCRIPTION = ("Generates all LoRA combinations for AutoTuner dataset "
                    "collection. Tracks progress to avoid duplicates.")
-    OUTPUT_NODE = False
-
     @classmethod
     def IS_CHANGED(cls, seed, strength, combo_size):
         return float("nan")
@@ -12077,37 +12075,40 @@ class LoRACombinationGenerator:
         total = len(shuffled)
 
         combo = self._find_next(shuffled, completed)
+
+        while combo is not None:
+            lora_list = []
+            skip = False
+            for name in combo:
+                lora_path = folder_paths.get_full_path("loras", name)
+                if lora_path is None:
+                    completed.add(self._combo_hash(combo))
+                    skip = True
+                    break
+                lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                lora_list.append({
+                    "name": name,
+                    "lora": lora,
+                    "strength": strength,
+                    "conflict_mode": "all",
+                    "key_filter": "all",
+                    "metadata": _read_safetensors_metadata(lora_path),
+                })
+
+            if not skip:
+                break
+            combo = self._find_next(shuffled, completed)
+
         if combo is None:
-            raise RuntimeError(
-                f"All {total} combinations completed for seed {seed}."
-            )
+            self._save_progress(self._progress_path, seed, completed, total)
+            raise RuntimeError(f"All {total} combinations completed for seed {seed}.")
 
-        # Load LoRAs into stack format
-        lora_list = []
-        for name in combo:
-            lora_path = folder_paths.get_full_path("loras", name)
-            if lora_path is None:
-                # LoRA was deleted — skip this combo, mark done, try next
-                completed.add(self._combo_hash(combo))
-                self._save_progress(self._progress_path, seed, completed, total)
-                return self.get_next_combo(seed, strength, combo_size)
-            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-            lora_list.append({
-                "name": name,
-                "lora": lora,
-                "strength": strength,
-                "conflict_mode": "all",
-                "key_filter": "all",
-                "metadata": _read_safetensors_metadata(lora_path),
-            })
-
-        # Mark completed and save
         completed.add(self._combo_hash(combo))
         self._save_progress(self._progress_path, seed, completed, total)
 
         done = len(completed)
         info = (f"Combo {done}/{total} | "
-                f"{' + '.join(name for name in combo)} | "
+                f"{' + '.join(combo)} | "
                 f"Remaining: {total - done}")
 
         return (lora_list, info)
