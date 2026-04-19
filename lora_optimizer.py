@@ -23,6 +23,7 @@ import folder_paths
 import comfy.utils
 import comfy.sd
 import comfy.lora
+import comfy.model_management
 from comfy.weight_adapter.lora import LoRAAdapter
 try:
     from comfy.weight_adapter.lokr import LoKrAdapter
@@ -12101,7 +12102,9 @@ class LoRACombinationGenerator:
 
         if combo is None:
             self._save_progress(self._progress_path, seed, completed, total)
-            raise RuntimeError(f"All {total} combinations completed for seed {seed}.")
+            logging.info("LoRACombinationGenerator: All %d combinations "
+                         "completed for seed %d.", total, seed)
+            raise comfy.model_management.InterruptProcessingException()
 
         completed.add(self._combo_hash(combo))
         self._save_progress(self._progress_path, seed, completed, total)
