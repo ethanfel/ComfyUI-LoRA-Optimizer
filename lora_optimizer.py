@@ -8103,7 +8103,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             with open(tmp_path, "w") as f:
                 json.dump(entry, f)
             os.replace(tmp_path, path)
-            logging.info(f"[AutoTuner Analysis Partial] Saved: {path}")
+            logging.debug(f"[AutoTuner Analysis Partial] Saved: {path}")
         except Exception as e:
             logging.warning(f"[AutoTuner Analysis Partial] Failed to save: {e}")
             try:
