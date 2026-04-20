@@ -98,6 +98,13 @@ COMMUNITY_CACHE_BASE_URL = (
 
 
 
+def _json_to_tuples(obj):
+    """Recursively convert JSON lists back to tuples (for cache round-trips)."""
+    if isinstance(obj, list):
+        return tuple(_json_to_tuples(x) for x in obj)
+    return obj
+
+
 def _read_safetensors_metadata(filepath):
     """Read metadata header from a safetensors file without loading tensors."""
     try:
@@ -4972,7 +4979,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             magnitude_samples.append(t)
 
         tk = cached_prefix["target_key"]
-        target_key = tuple(tk) if isinstance(tk, list) else tk
+        target_key = _json_to_tuples(tk)
 
         per_lora_norm_sq = {int(k): float(v) for k, v in per_lora_norm_sq_raw.items()}
 
@@ -5053,7 +5060,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         # Get prefix-level metadata from any participating LoRA's entry
         first = lora_entries[min(participating)]
         tk = first["target_key"]
-        target_key = tuple(tk) if isinstance(tk, list) else tk
+        target_key = _json_to_tuples(tk)
 
         return (
             prefix,
