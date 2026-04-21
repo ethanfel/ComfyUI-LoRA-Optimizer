@@ -10093,6 +10093,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             clip_strength_multiplier=clip_strength_multiplier,
             merge_refinement="none",
             decision_smoothing=decision_smoothing,
+            track_new_entries=True,
             lora_caches=lora_caches,
             pair_caches=pair_caches,
             lora_hashes=lora_hashes,

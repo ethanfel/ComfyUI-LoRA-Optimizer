@@ -169,5 +169,37 @@ class TestEstimatorNodeEstimate(unittest.TestCase):
         self.assertIn("No neighbors", report)
 
 
+class TestRunPhase1ForEstimator(unittest.TestCase):
+    """Guard the internal Phase-1 wrapper against silently losing fresh per-prefix stats."""
+
+    def test_tracks_new_entries(self):
+        """_run_phase1_for_estimator must ask _run_group_analysis to surface new entries.
+
+        Without track_new_entries=True, prefixes not already in the community cache
+        would drop out of pair_stats / lora_stats, giving the feature extractor an
+        all-zero vector for first-time combos.
+        """
+        tuner = lora_optimizer.LoRAAutoTuner()
+        # Minimal normalized stack so _normalize_stack returns something active.
+        with mock.patch.object(tuner, "_normalize_stack",
+                               return_value=[{"name": "a", "strength": 1.0, "lora": {}},
+                                             {"name": "b", "strength": 1.0, "lora": {}}]), \
+             mock.patch.object(tuner, "_get_model_keys", return_value={"k": None}), \
+             mock.patch.object(tuner, "_collect_lora_prefixes", return_value=[]), \
+             mock.patch.object(tuner, "_build_target_groups", return_value={"prefix.0": object()}), \
+             mock.patch.object(tuner, "_lora_identity_hash", side_effect=lambda l: "h"), \
+             mock.patch.object(tuner, "_lora_cache_load", return_value=None), \
+             mock.patch.object(tuner, "_pair_cache_load", return_value=None), \
+             mock.patch.object(tuner, "_get_compute_device", return_value=mock.Mock(type="cpu")), \
+             mock.patch.object(tuner, "_run_group_analysis",
+                               return_value={"new_lora_entries": {}, "new_pair_entries": {},
+                                             "prefix_count": 1}) as run_analysis:
+            tuner._run_phase1_for_estimator(model=mock.Mock(), clip=None,
+                                             lora_stack=[{"name": "a", "strength": 1.0},
+                                                         {"name": "b", "strength": 1.0}])
+        self.assertTrue(run_analysis.call_args.kwargs.get("track_new_entries"),
+                        "must pass track_new_entries=True so fresh prefixes surface")
+
+
 if __name__ == "__main__":
     unittest.main()
