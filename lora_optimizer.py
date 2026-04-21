@@ -8336,7 +8336,8 @@ class LoRAAutoTuner(LoRAOptimizer):
 
     @staticmethod
     def _community_upload_results(new_lora_entries, new_pair_entries, content_hashes,
-                                   lora_hashes, tuner_data, arch_preset, token):
+                                   lora_hashes, tuner_data, arch_preset, token,
+                                   base_model_family=None):
         """Upload newly computed lora/pair caches and (if best) a winning config."""
         logging.info("[AutoTuner Community] Uploading results...")
         n_lora_uploaded = 0
@@ -8407,6 +8408,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 {
                     "algo_version": AUTOTUNER_ALGO_VERSION,
                     "arch_preset": arch_preset,
+                    "base_model_family": base_model_family or "unknown",
                     "lora_content_hashes": sorted_hashes,
                     "score": local_score,
                     "config": best["config"],
@@ -9047,7 +9049,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                         if _hf_token:
                             self._community_upload_results(
                                 {}, {}, content_hashes, lora_hashes,
-                                cached_tuner_data, _arch_key_for_community, _hf_token)
+                                cached_tuner_data, _arch_key_for_community, _hf_token,
+                                base_model_family=getattr(self, '_detected_arch', None))
                         else:
                             logging.warning("[AutoTuner Community] No HF token found. "
                                             "Run 'huggingface-cli login' or set HF_TOKEN to enable uploads.")
@@ -9684,7 +9687,8 @@ class LoRAAutoTuner(LoRAOptimizer):
             else:
                 self._community_upload_results(
                     new_lora_entries, new_pair_entries,
-                    content_hashes, lora_hashes, tuner_data, _arch_key_for_community, _hf_token)
+                    content_hashes, lora_hashes, tuner_data, _arch_key_for_community, _hf_token,
+                    base_model_family=getattr(self, '_detected_arch', None))
 
         # Clamp selection to available results
         sel_idx = min(selection, len(results)) - 1
