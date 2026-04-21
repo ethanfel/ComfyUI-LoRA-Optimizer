@@ -10,7 +10,9 @@
 
 **Prerequisite:** Phase A of the estimator plan (`docs/plans/2026-04-21-estimator-prenode.md`) must land first — the rerun only has value once `per_prefix_decisions` is being captured.
 
-**Scope boundary:** No HF-aware "skip if already enriched" logic. A separate local progress file is enough: interrupted reruns resume from their own progress, and the original `combo_progress.json` is untouched.
+**Scope:** Two tasks.
+1. Toggle + separate progress file.
+2. HF-aware skip: in rerun mode, before processing a combo, check HF for a matching enriched config (any candidate carries `per_prefix_decisions`); if found, mark the combo complete and move on.
 
 ---
 
@@ -148,6 +150,225 @@ order is unchanged. Intended to be reverted once the rerun completes."
 
 ---
 
+## Task 2: HF-enrichment skip check (rerun mode only)
+
+**Files:**
+- Modify: `lora_optimizer.py` (`LoRACombinationGenerator.__init__`, `get_next_combo`, new helpers)
+- Modify: `tests/test_lora_optimizer.py` (`TestLoRACombinationGenerator`)
+
+**Design:**
+- `__init__` gains two per-instance caches: `_enrichment_cache` (joined_hashes → bool) and `_hf_files_cache` (list[str] | None) so we pay the HF file-list round-trip at most once per combinator instance.
+- `_list_hf_config_files()` uses `huggingface_hub.HfApi().list_repo_files` against `COMMUNITY_CACHE_REPO` (dataset), returns the cached `config/*.config.json` subset; on failure returns `[]` and logs a warning (rerun proceeds without the skip).
+- `_combo_already_enriched(combo)` computes each member's content hash via `LoRAAutoTuner._lora_content_hash({"name": name})` (reuses the existing file-mtime cache), builds `prefix = f"config/{joined}_"`, filters the cached HF file list, downloads matching files via `LoRAAutoTuner._community_download`, and returns `True` iff any `candidates[*].per_prefix_decisions` is non-empty.
+- In `get_next_combo`, when `rerun_mode=True` and the combo passed the existing skip checks, call `_combo_already_enriched(combo)`; if True, mark the combo hash in `completed`, persist the rerun progress file, and loop to the next combo via the existing skip pattern.
+
+**Step 1: Write the failing tests**
+
+Append to `TestLoRACombinationGenerator`:
+
+```python
+    # -- rerun HF-enrichment skip --
+
+    def test_hf_file_list_is_memoized(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        call_count = {"n": 0}
+
+        def fake_list(*args, **kwargs):
+            call_count["n"] += 1
+            return ["config/aaa_bbb_dit.config.json", "lora/aaa.lora.json"]
+
+        with unittest.mock.patch(
+            "lora_optimizer.HfApi",
+            create=True,
+            return_value=unittest.mock.MagicMock(list_repo_files=fake_list),
+        ):
+            first = gen._list_hf_config_files()
+            second = gen._list_hf_config_files()
+        self.assertEqual(first, ["config/aaa_bbb_dit.config.json"])
+        self.assertEqual(second, first)
+        self.assertEqual(call_count["n"], 1)
+
+    def test_combo_already_enriched_true_when_any_candidate_has_decisions(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        gen._hf_files_cache = ["config/aaa_bbb_dit.config.json"]
+        enriched = {
+            "candidates": [
+                {"per_prefix_decisions": {}},
+                {"per_prefix_decisions": {"layer.0": "ties"}},
+            ],
+        }
+        with unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_lora_content_hash",
+            side_effect=lambda item: {"a": "aaa", "b": "bbb"}[item["name"]],
+        ), unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_community_download",
+            return_value=enriched,
+        ):
+            self.assertTrue(gen._combo_already_enriched(("a", "b")))
+
+    def test_combo_already_enriched_false_when_candidates_lack_decisions(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        gen._hf_files_cache = ["config/aaa_bbb_dit.config.json"]
+        not_enriched = {"candidates": [{"per_prefix_decisions": {}}]}
+        with unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_lora_content_hash",
+            side_effect=lambda item: {"a": "aaa", "b": "bbb"}[item["name"]],
+        ), unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_community_download",
+            return_value=not_enriched,
+        ):
+            self.assertFalse(gen._combo_already_enriched(("a", "b")))
+
+    def test_combo_already_enriched_false_when_no_matching_hf_config(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        gen._hf_files_cache = ["config/zzz_yyy_dit.config.json"]
+        with unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_lora_content_hash",
+            side_effect=lambda item: {"a": "aaa", "b": "bbb"}[item["name"]],
+        ):
+            self.assertFalse(gen._combo_already_enriched(("a", "b")))
+
+    def test_combo_already_enriched_memoizes_result(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        gen._hf_files_cache = ["config/aaa_bbb_dit.config.json"]
+        download_calls = {"n": 0}
+
+        def fake_download(path):
+            download_calls["n"] += 1
+            return {"candidates": [{"per_prefix_decisions": {"l": "ties"}}]}
+
+        with unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_lora_content_hash",
+            side_effect=lambda item: {"a": "aaa", "b": "bbb"}[item["name"]],
+        ), unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_community_download",
+            side_effect=fake_download,
+        ):
+            self.assertTrue(gen._combo_already_enriched(("a", "b")))
+            self.assertTrue(gen._combo_already_enriched(("a", "b")))
+        self.assertEqual(download_calls["n"], 1)
+
+    def test_combo_already_enriched_handles_missing_content_hash(self):
+        """If any LoRA hash cannot be computed, fall back to 'not enriched'
+        so the combo still runs."""
+        gen = lora_optimizer.LoRACombinationGenerator()
+        gen._hf_files_cache = []
+        with unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_lora_content_hash",
+            return_value=None,
+        ):
+            self.assertFalse(gen._combo_already_enriched(("a", "b")))
+```
+
+Make sure `import unittest.mock` is in scope (add at top of the test file if missing).
+
+**Step 2: Run the tests to verify they fail**
+
+Run: `pytest tests/test_lora_optimizer.py::TestLoRACombinationGenerator -v -k "hf_file_list or combo_already_enriched"`
+
+Expected: 6 failures — `_list_hf_config_files` and `_combo_already_enriched` not defined; `_hf_files_cache` / `_enrichment_cache` attributes missing.
+
+**Step 3: Implement**
+
+In `lora_optimizer.py`:
+
+Update `__init__`:
+
+```python
+    def __init__(self):
+        self._progress_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "combo_progress.json"
+        )
+        self._enrichment_cache = {}
+        self._hf_files_cache = None
+```
+
+Add helpers on the class:
+
+```python
+    def _list_hf_config_files(self):
+        if self._hf_files_cache is not None:
+            return self._hf_files_cache
+        try:
+            from huggingface_hub import HfApi
+            files = HfApi().list_repo_files(
+                repo_id=COMMUNITY_CACHE_REPO, repo_type="dataset",
+            )
+            self._hf_files_cache = [f for f in files if f.startswith("config/")]
+        except Exception as exc:
+            logging.warning("[LoRA Combo] HF file list failed (%s) — "
+                            "skip check disabled for this session.", exc)
+            self._hf_files_cache = []
+        return self._hf_files_cache
+
+    def _combo_already_enriched(self, combo):
+        content_hashes = []
+        for name in combo:
+            ch = LoRAAutoTuner._lora_content_hash({"name": name})
+            if ch is None:
+                return False
+            content_hashes.append(ch)
+        joined = "_".join(sorted(content_hashes))
+        if joined in self._enrichment_cache:
+            return self._enrichment_cache[joined]
+        prefix = f"config/{joined}_"
+        matching = [f for f in self._list_hf_config_files()
+                    if f.startswith(prefix)]
+        enriched = False
+        for path in matching:
+            data = LoRAAutoTuner._community_download(path)
+            if not data:
+                continue
+            for cand in data.get("candidates", []):
+                if cand.get("per_prefix_decisions"):
+                    enriched = True
+                    break
+            if enriched:
+                break
+        self._enrichment_cache[joined] = enriched
+        return enriched
+```
+
+Extend the skip loop in `get_next_combo` (inside `while combo is not None:`, after the LoRA-loading block that sets `skip`):
+
+```python
+            if not skip and rerun_mode:
+                if self._combo_already_enriched(combo):
+                    logging.info("[LoRA Combo] Already enriched on HF — "
+                                 "skipping: %s", " + ".join(combo))
+                    completed.add(self._combo_hash(combo))
+                    self._save_progress(progress_path, completed, total)
+                    skip = True
+
+            if not skip:
+                break
+            combo = self._find_next(shuffled, completed)
+```
+
+**Step 4: Run the tests to verify they pass**
+
+```
+pytest tests/test_lora_optimizer.py::TestLoRACombinationGenerator -v
+pytest tests/test_lora_optimizer.py -v
+```
+
+Expected: all green. Existing tests still pass because the enrichment check is gated on `rerun_mode=True`.
+
+**Step 5: Commit**
+
+```bash
+git add lora_optimizer.py tests/test_lora_optimizer.py
+git commit -m "feat(combinator): skip combos already enriched on HF during rerun
+
+When rerun_mode is on, before running a combo the combinator checks the
+HF community cache for a matching config whose candidates carry
+per_prefix_decisions. Enriched combos are marked complete in the rerun
+progress file and skipped. HF file list and per-combo results are cached
+per-instance so the extra traffic is bounded."
+```
+
+---
+
 ## Usage (after Phase A lands)
 
 1. Delete the side file if it exists: `rm -f combo_progress_rerun.json`.
@@ -158,5 +379,5 @@ order is unchanged. Intended to be reverted once the rerun completes."
 
 ## Out of scope
 
-- HF-aware skip logic (checking each combo's current HF state before running). A separate progress file plus the same seed is sufficient.
 - Adapting the default workflow JSONs. The new input has a default of `False`, so existing saved workflows are unaffected.
+- Cross-architecture family filtering during the enrichment check. The `config/{joined}_*.config.json` wildcard covers every arch the same content-hash set could have been uploaded under, which is the intended behavior.
