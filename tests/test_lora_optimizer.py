@@ -2782,6 +2782,34 @@ class TestLoRACombinationGenerator(unittest.TestCase):
         )
         self.assertTrue(math.isnan(result))
 
+    # -- rerun mode --
+
+    def test_input_types_has_rerun_mode(self):
+        inputs = lora_optimizer.LoRACombinationGenerator.INPUT_TYPES()
+        req = inputs["required"]
+        self.assertIn("rerun_mode", req)
+        spec = req["rerun_mode"]
+        self.assertEqual(spec[0], "BOOLEAN")
+        self.assertEqual(spec[1]["default"], False)
+
+    def test_resolve_progress_path_default(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        path = gen._resolve_progress_path(rerun_mode=False)
+        self.assertTrue(path.endswith("combo_progress.json"))
+        self.assertFalse(path.endswith("combo_progress_rerun.json"))
+
+    def test_resolve_progress_path_rerun(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        path = gen._resolve_progress_path(rerun_mode=True)
+        self.assertTrue(path.endswith("combo_progress_rerun.json"))
+
+    def test_resolve_progress_path_rerun_same_dir_as_default(self):
+        """Rerun progress file lives next to the default one."""
+        gen = lora_optimizer.LoRACombinationGenerator()
+        default_dir = os.path.dirname(gen._resolve_progress_path(rerun_mode=False))
+        rerun_dir = os.path.dirname(gen._resolve_progress_path(rerun_mode=True))
+        self.assertEqual(default_dir, rerun_dir)
+
 
 if __name__ == "__main__":
     unittest.main()

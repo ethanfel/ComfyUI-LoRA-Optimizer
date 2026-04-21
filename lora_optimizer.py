@@ -12398,6 +12398,12 @@ class LoRACombinationGenerator:
                 "folder_filter": ("STRING", {
                     "default": "",
                     "tooltip": "Comma-separated prefixes to filter LoRAs (e.g. 'zit/,zib/' or 'sdxl/'). Empty = all LoRAs."}),
+                "rerun_mode": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "TEMPORARY: re-run all combos into a separate "
+                               "progress file (combo_progress_rerun.json). "
+                               "Use once to backfill per-prefix decisions, "
+                               "then disable and delete the side file."}),
             },
         }
 
@@ -12408,10 +12414,20 @@ class LoRACombinationGenerator:
     DESCRIPTION = ("Generates all LoRA combinations for AutoTuner dataset "
                    "collection. Tracks progress to avoid duplicates.")
     @classmethod
-    def IS_CHANGED(cls, shuffle_order, strength, combo_size, folder_filter=""):
+    def IS_CHANGED(cls, shuffle_order, strength, combo_size,
+                   folder_filter="", rerun_mode=False):
         return float("nan")
 
-    def get_next_combo(self, shuffle_order, strength, combo_size, folder_filter=""):
+    def _resolve_progress_path(self, rerun_mode):
+        if rerun_mode:
+            return os.path.join(
+                os.path.dirname(self._progress_path),
+                "combo_progress_rerun.json",
+            )
+        return self._progress_path
+
+    def get_next_combo(self, shuffle_order, strength, combo_size,
+                        folder_filter="", rerun_mode=False):
         lora_names = folder_paths.get_filename_list("loras")
         if not folder_filter:
             raise ValueError("folder_filter is required — specify one or more "
@@ -12422,14 +12438,15 @@ class LoRACombinationGenerator:
             raise ValueError(f"Need at least 2 LoRAs matching filter '{folder_filter}', "
                              f"found {len(lora_names)}: {lora_names}")
 
+        progress_path = self._resolve_progress_path(rerun_mode)
         combos = self._generate_combos(lora_names, combo_size)
         shuffled = self._shuffle_combos(combos, shuffle_order)
-        completed, _ = self._load_progress(self._progress_path)
+        completed, _ = self._load_progress(progress_path)
         total = len(shuffled)
         logging.info("[LoRA Combo] shuffle_order=%d, pool=%d LoRAs, %d combos, "
-                     "%d already completed, progress file: %s",
+                     "%d already completed, rerun_mode=%s, progress file: %s",
                      shuffle_order, len(lora_names), total, len(completed),
-                     self._progress_path)
+                     rerun_mode, progress_path)
 
         combo = self._find_next(shuffled, completed)
 
@@ -12459,13 +12476,13 @@ class LoRACombinationGenerator:
             combo = self._find_next(shuffled, completed)
 
         if combo is None:
-            self._save_progress(self._progress_path, completed, total)
+            self._save_progress(progress_path, completed, total)
             logging.info("LoRACombinationGenerator: All %d combinations completed.",
                          total)
             raise comfy.model_management.InterruptProcessingException()
 
         completed.add(self._combo_hash(combo))
-        self._save_progress(self._progress_path, completed, total)
+        self._save_progress(progress_path, completed, total)
 
         done = len(completed)
         info = (f"Combo {done}/{total} | "
