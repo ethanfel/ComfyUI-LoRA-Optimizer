@@ -89,6 +89,7 @@ Restart ComfyUI. Nodes appear under the `loaders` category.
 | **LoRA Optimizer** | Analyze + merge your stack automatically. Just connect and go |
 | **Settings Nodes** | Optional fine-tuning: sparsification, compression, smoothing, etc. |
 | **LoRA AutoTuner** | Sweep 2000+ parameter combos, rank the best configs |
+| **LoRA Merge Estimator** | Predict the best config via k-NN over the community cache — skip the sweep |
 | **Merge Selector** | Try alternative ranked configs from AutoTuner results |
 | **Compatibility Analyzer** | Check which LoRAs work well together before merging |
 | **Save Merged LoRA** | Export the merge as a standalone `.safetensors` file |
@@ -562,6 +563,37 @@ Results are keyed by **content hash** (SHA256 of file contents, not filename), s
 Results are stored in the public dataset [`ethanfel/lora-optimizer-community-cache`](https://huggingface.co/datasets/ethanfel/lora-optimizer-community-cache).
 
 </details>
+
+---
+
+## LoRA Merge Estimator
+
+Skip the AutoTuner sweep when your stack is similar to combos already in the community cache. The Estimator analyzes your LoRAs once (Phase 1 only), then retrieves the k nearest combos from a prebuilt index of cached configs and emits `TUNER_DATA` with the aggregated top-N predicted configs. Feed that directly into the **LoRA Optimizer** (`settings_source=from_tuner_data`) to apply the predicted merge.
+
+**Workflow:**
+```
+LoRA Stack (Dynamic) ──► LoRA Merge Estimator ──► TUNER_DATA ──► LoRA Optimizer
+                              ▲                                   (settings_source
+Load Checkpoint ──► MODEL ────┘                                    =from_tuner_data)
+```
+
+The first run downloads the community cache and builds a local k-NN index under `ComfyUI/models/estimator/` (~30–60s). Subsequent runs reuse the index and complete in seconds — no Phase 2 sweep, no merge quality pass.
+
+| Input | Default | Effect |
+|------|---------|--------|
+| `model` / `lora_stack` | — | Same as optimizer/AutoTuner |
+| `clip` (optional) | — | Only used by Phase 1 analysis |
+| `k` | 5 | How many nearest neighbors to retrieve (1–20) |
+| `rebuild_index` | auto | `auto` rebuilds when the HF dataset or index schema changes; `force` always rebuilds; `skip` never rebuilds (errors if missing) |
+| `top_n_output` | 3 | How many aggregated candidates to emit in `TUNER_DATA` |
+
+Outputs `TUNER_DATA` (consumable by the optimizer or **Merge Selector**) and a human-readable `estimator_report` listing predicted configs with their aggregated scores and retrieved neighbor distances.
+
+**When to use Estimator vs AutoTuner:**
+- **Estimator** — fast prediction (seconds after the first run). Best when your stack resembles combos others have already tuned, or when you want a quick starting point before reaching for the full sweep.
+- **AutoTuner** — authoritative grid search with measured quality scoring. Best for novel combos, uncommon architectures, or when accuracy matters more than speed.
+
+The two are complementary: try the Estimator first, and fall back to AutoTuner if the predicted configs underperform or no close neighbors exist (the report will say `No neighbors` when the index has no matching family+combo-size rows).
 
 ---
 
