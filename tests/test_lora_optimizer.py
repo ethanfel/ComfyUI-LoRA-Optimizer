@@ -2901,6 +2901,39 @@ class TestLoRACombinationGenerator(unittest.TestCase):
         ):
             self.assertFalse(gen._combo_already_enriched(("a", "b")))
 
+    # -- rerun source filter --
+
+    def test_input_types_has_rerun_source(self):
+        inputs = lora_optimizer.LoRACombinationGenerator.INPUT_TYPES()
+        req = inputs["required"]
+        self.assertIn("rerun_source", req)
+        spec = req["rerun_source"]
+        self.assertEqual(spec[0], ["shuffle", "original_progress"])
+        self.assertEqual(spec[1]["default"], "shuffle")
+
+    def test_filter_shuffled_by_original_progress_keeps_only_completed(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        shuffled = [("a", "b"), ("c", "d"), ("e", "f")]
+        ab_hash = gen._combo_hash(("a", "b"))
+        ef_hash = gen._combo_hash(("e", "f"))
+        filtered = gen._filter_by_original_progress(
+            shuffled, original_completed={ab_hash, ef_hash},
+        )
+        self.assertEqual(filtered, [("a", "b"), ("e", "f")])
+
+    def test_filter_shuffled_by_original_progress_preserves_order(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        shuffled = [("c", "d"), ("a", "b"), ("e", "f")]
+        completed = {gen._combo_hash(c) for c in shuffled}
+        filtered = gen._filter_by_original_progress(shuffled, completed)
+        self.assertEqual(filtered, shuffled)
+
+    def test_filter_shuffled_by_original_progress_empty_original(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        shuffled = [("a", "b"), ("c", "d")]
+        filtered = gen._filter_by_original_progress(shuffled, original_completed=set())
+        self.assertEqual(filtered, [])
+
 
 class TestCommunityCacheUploadOnly(unittest.TestCase):
     """Tests for the community_cache='upload_only' mode."""

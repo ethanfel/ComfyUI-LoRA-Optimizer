@@ -12413,6 +12413,13 @@ class LoRACombinationGenerator:
                                "progress file (combo_progress_rerun.json). "
                                "Use once to backfill per-prefix decisions, "
                                "then disable and delete the side file."}),
+                "rerun_source": (["shuffle", "original_progress"], {
+                    "default": "shuffle",
+                    "tooltip": "Only meaningful when rerun_mode=True. "
+                               "'shuffle' iterates all combos in shuffle order. "
+                               "'original_progress' restricts iteration to combos "
+                               "present in the original combo_progress.json (replay "
+                               "exactly what was previously processed)."}),
             },
         }
 
@@ -12424,8 +12431,15 @@ class LoRACombinationGenerator:
                    "collection. Tracks progress to avoid duplicates.")
     @classmethod
     def IS_CHANGED(cls, shuffle_order, strength, combo_size,
-                   folder_filter="", rerun_mode=False):
+                   folder_filter="", rerun_mode=False, rerun_source="shuffle"):
         return float("nan")
+
+    @staticmethod
+    def _filter_by_original_progress(shuffled, original_completed):
+        """Return *shuffled* with order preserved, keeping only combos whose
+        hash is in *original_completed*."""
+        return [c for c in shuffled
+                if LoRACombinationGenerator._combo_hash(c) in original_completed]
 
     def _resolve_progress_path(self, rerun_mode):
         if rerun_mode:
@@ -12477,7 +12491,8 @@ class LoRACombinationGenerator:
         return enriched
 
     def get_next_combo(self, shuffle_order, strength, combo_size,
-                        folder_filter="", rerun_mode=False):
+                        folder_filter="", rerun_mode=False,
+                        rerun_source="shuffle"):
         lora_names = folder_paths.get_filename_list("loras")
         if not folder_filter:
             raise ValueError("folder_filter is required — specify one or more "
@@ -12491,12 +12506,23 @@ class LoRACombinationGenerator:
         progress_path = self._resolve_progress_path(rerun_mode)
         combos = self._generate_combos(lora_names, combo_size)
         shuffled = self._shuffle_combos(combos, shuffle_order)
+
+        if rerun_mode and rerun_source == "original_progress":
+            original_completed, _ = self._load_progress(self._progress_path)
+            pre_filter_count = len(shuffled)
+            shuffled = self._filter_by_original_progress(
+                shuffled, original_completed)
+            logging.info("[LoRA Combo] rerun_source=original_progress — "
+                         "filtered %d combos down to %d (present in %s).",
+                         pre_filter_count, len(shuffled), self._progress_path)
+
         completed, _ = self._load_progress(progress_path)
         total = len(shuffled)
         logging.info("[LoRA Combo] shuffle_order=%d, pool=%d LoRAs, %d combos, "
-                     "%d already completed, rerun_mode=%s, progress file: %s",
+                     "%d already completed, rerun_mode=%s, rerun_source=%s, "
+                     "progress file: %s",
                      shuffle_order, len(lora_names), total, len(completed),
-                     rerun_mode, progress_path)
+                     rerun_mode, rerun_source, progress_path)
 
         combo = self._find_next(shuffled, completed)
 
