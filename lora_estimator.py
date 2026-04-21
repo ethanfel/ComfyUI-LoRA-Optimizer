@@ -6,10 +6,17 @@ conflict / magnitude / subspace stats.
 """
 from __future__ import annotations
 
+import json
+import logging
+from pathlib import Path
+from typing import Callable, Union
+
 import numpy as np
 
 ESTIMATOR_INDEX_VERSION = "1.0.0"
 HF_REPO_ID = "ethanfel/lora-optimizer-community-cache"
+
+_log = logging.getLogger(__name__)
 
 
 class EstimatorFeatureExtractor:
@@ -127,3 +134,51 @@ class EstimatorFeatureExtractor:
     def family_slice(self, vec: np.ndarray) -> np.ndarray:
         start = self.PAIR_DIM + self.LORA_DIM + self.WORST_DIM + self.SIZE_DIM
         return vec[start:start + self.FAM_DIM]
+
+
+def _fetch_hf_head_sha(repo_id: str = HF_REPO_ID) -> str:
+    """Return the current HEAD commit SHA of the dataset repo. Raises on network failure."""
+    from huggingface_hub import HfApi
+    return HfApi().dataset_info(repo_id).sha
+
+
+def ensure_index_fresh(
+    index_dir: Union[str, Path],
+    rebuild_fn: Callable[[], None],
+    mode: str = "auto",
+    repo_id: str = HF_REPO_ID,
+) -> None:
+    """Rebuild the index if stale.
+
+    mode:
+      - "auto":  compare cached hf_commit_sha to HF HEAD; rebuild on mismatch.
+                 On network failure, fall back to cached index with a warning.
+      - "force": always call rebuild_fn().
+      - "skip":  never call rebuild_fn().
+    """
+    index_dir = Path(index_dir)
+    if mode == "skip":
+        return
+    if mode == "force":
+        rebuild_fn()
+        return
+    if mode != "auto":
+        raise ValueError(f"unknown freshness mode: {mode!r}")
+
+    meta_path = index_dir / "meta.json"
+    if not meta_path.exists():
+        rebuild_fn()
+        return
+    try:
+        current_sha = _fetch_hf_head_sha(repo_id)
+    except Exception as e:
+        _log.warning("[LoRA Estimator] HF SHA check failed — using cached index: %s", e)
+        return
+    cached = json.loads(meta_path.read_text())
+    cached_sha = cached.get("hf_commit_sha")
+    if cached_sha != current_sha:
+        _log.info(
+            "[LoRA Estimator] Dataset updated (%s → %s), rebuilding index…",
+            (cached_sha or "?")[:8], (current_sha or "?")[:8],
+        )
+        rebuild_fn()
