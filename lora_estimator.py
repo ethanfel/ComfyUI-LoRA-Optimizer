@@ -170,11 +170,25 @@ def ensure_index_fresh(
         rebuild_fn()
         return
     try:
+        cached = json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        _log.warning("[LoRA Estimator] meta.json unreadable (%s) — rebuilding", e)
+        rebuild_fn()
+        return
+    # Schema-version mismatch trumps SHA: a new feature layout can't read an old pickle.
+    cached_version = cached.get("estimator_index_version")
+    if cached_version != ESTIMATOR_INDEX_VERSION:
+        _log.info(
+            "[LoRA Estimator] Index schema changed (%s → %s), rebuilding…",
+            cached_version or "?", ESTIMATOR_INDEX_VERSION,
+        )
+        rebuild_fn()
+        return
+    try:
         current_sha = _fetch_hf_head_sha(repo_id)
     except Exception as e:
         _log.warning("[LoRA Estimator] HF SHA check failed — using cached index: %s", e)
         return
-    cached = json.loads(meta_path.read_text())
     cached_sha = cached.get("hf_commit_sha")
     if cached_sha != current_sha:
         _log.info(

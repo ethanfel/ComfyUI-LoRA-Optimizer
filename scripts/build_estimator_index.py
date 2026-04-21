@@ -64,7 +64,7 @@ def load_phase1_for_config(dataset_dir: Path, sorted_hashes) -> tuple[dict, dict
         if lora_path.exists():
             raw = _load_json(lora_path)
             # The cache format stores stats under `per_prefix`.
-            lora_stats[i] = {"per_prefix": raw.get("per_prefix", raw)}
+            lora_stats[i] = {"per_prefix": raw.get("per_prefix", {})}
     for i, ha in enumerate(sorted_hashes):
         for j, hb in enumerate(sorted_hashes):
             if i >= j:
@@ -73,7 +73,7 @@ def load_phase1_for_config(dataset_dir: Path, sorted_hashes) -> tuple[dict, dict
             pair_path = dataset_dir / "pair" / f"{key_a}_{key_b}.pair.json"
             if pair_path.exists():
                 raw = _load_json(pair_path)
-                pair_stats[(i, j)] = {"per_prefix": raw.get("per_prefix", raw)}
+                pair_stats[(i, j)] = {"per_prefix": raw.get("per_prefix", {})}
     return pair_stats, lora_stats
 
 
