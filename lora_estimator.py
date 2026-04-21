@@ -6,10 +6,12 @@ conflict / magnitude / subspace stats.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import pickle
 from pathlib import Path
-from typing import Callable, Union
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 
@@ -196,3 +198,140 @@ def ensure_index_fresh(
             (cached_sha or "?")[:8], (current_sha or "?")[:8],
         )
         rebuild_fn()
+
+
+def _config_key(config: dict) -> str:
+    """Stable hash for a merge config dict — used to dedupe across neighbors."""
+    return hashlib.sha1(json.dumps(config, sort_keys=True).encode()).hexdigest()
+
+
+class LoRAEstimator:
+    """Retrieve k-NN combos, aggregate their candidates, emit a tuner_data dict."""
+
+    def __init__(self, features: np.ndarray, labels: list,
+                 zscore: tuple[np.ndarray, np.ndarray]):
+        self.features = np.asarray(features, dtype=np.float32)
+        self.labels = labels
+        mean, std = zscore
+        self.zscore_mean = np.asarray(mean, dtype=np.float32)
+        # Guard against constant dims (std==0) so downstream divides never NaN.
+        std_arr = np.asarray(std, dtype=np.float32)
+        self.zscore_std = np.where(std_arr < 1e-8, 1.0, std_arr)
+
+    @classmethod
+    def from_disk(cls, index_path: Union[str, Path]) -> "LoRAEstimator":
+        with open(index_path, "rb") as f:
+            data = pickle.load(f)
+        return cls(
+            features=data["features"],
+            labels=data["labels"],
+            zscore=data["zscore"],
+        )
+
+    @classmethod
+    def from_memory(cls, features, labels, zscore) -> "LoRAEstimator":
+        """Test helper — normalise features the same way from_disk does."""
+        features = np.asarray(features, dtype=np.float32)
+        mean, std = zscore
+        std_arr = np.asarray(std, dtype=np.float32)
+        safe_std = np.where(std_arr < 1e-8, 1.0, std_arr)
+        X_norm = (features - np.asarray(mean, dtype=np.float32)) / safe_std
+        return cls(features=X_norm, labels=labels, zscore=(mean, std))
+
+    def retrieve(self, feature_vec: np.ndarray, base_model_family: str,
+                 combo_size: int, k: int = 5) -> list[dict]:
+        """Return up to k nearest neighbors matching the family+size filter."""
+        from sklearn.neighbors import NearestNeighbors
+
+        mask = np.array([
+            lbl.get("base_model_family") == base_model_family
+            and lbl.get("combo_size") == combo_size
+            for lbl in self.labels
+        ])
+        if not mask.any():
+            return []
+        subset_features = self.features[mask]
+        subset_labels = [lbl for lbl, keep in zip(self.labels, mask) if keep]
+
+        q = (np.asarray(feature_vec, dtype=np.float32) - self.zscore_mean) / self.zscore_std
+        q = q.reshape(1, -1)
+
+        n_neighbors = min(k, len(subset_features))
+        sub_nn = NearestNeighbors(metric="cosine", n_neighbors=n_neighbors)
+        sub_nn.fit(subset_features)
+        distances, indices = sub_nn.kneighbors(q)
+        return [
+            {"distance": float(d), "label": subset_labels[int(i)]}
+            for d, i in zip(distances[0], indices[0])
+        ]
+
+    @staticmethod
+    def aggregate_candidates(neighbors: list[dict], top_n: int = 3) -> list[dict]:
+        """Inverse-distance-weighted pooling of candidate scores across neighbors."""
+        if not neighbors:
+            return []
+        pool: dict[str, dict[str, Any]] = {}
+        for n in neighbors:
+            w = 1.0 / (1.0 + float(n.get("distance", 0.0)))
+            for cand in n.get("label", {}).get("candidates", []):
+                cfg = cand.get("config")
+                if not cfg:
+                    continue
+                key = _config_key(cfg)
+                entry = pool.setdefault(key, {
+                    "config": cfg,
+                    "score_final": 0.0,
+                    "score_heuristic": 0.0,
+                    "score_measured": 0.0,
+                    "weight_sum": 0.0,
+                })
+                entry["score_final"] += w * float(cand.get("score_final", 0.0))
+                entry["score_heuristic"] += w * float(cand.get("score_heuristic", 0.0))
+                entry["score_measured"] += w * float(cand.get("score_measured", 0.0))
+                entry["weight_sum"] += w
+        # Normalise into weighted averages so scores stay on the [0, 1] source scale.
+        normalised = []
+        for e in pool.values():
+            w = e["weight_sum"] if e["weight_sum"] > 0 else 1.0
+            normalised.append({
+                "config": e["config"],
+                "score_final": e["score_final"] / w,
+                "score_heuristic": e["score_heuristic"] / w,
+                "score_measured": e["score_measured"] / w,
+            })
+        ranked = sorted(normalised, key=lambda e: e["score_final"], reverse=True)
+        out = []
+        for rank, e in enumerate(ranked[:top_n], start=1):
+            out.append({
+                "rank": rank,
+                "config": e["config"],
+                "score_final": e["score_final"],
+                "score_heuristic": e["score_heuristic"],
+                "score_measured": e["score_measured"],
+                "score_external": None,
+                "metrics": {},
+                "external_details": None,
+            })
+        return out
+
+    @staticmethod
+    def emit_tuner_data(top_n: list[dict], source_loras: list[dict],
+                        analysis_summary: dict,
+                        normalize_keys: str = "disabled",
+                        architecture_preset: str = "auto",
+                        auto_strength_floor: float = -1.0,
+                        decision_smoothing: float = 0.25,
+                        lora_hash: Optional[str] = None) -> dict:
+        """Produce a tuner_data dict for settings_source=from_tuner_data."""
+        return {
+            "version": 1,
+            "lora_hash": lora_hash or "estimator",
+            "source_loras": source_loras,
+            "normalize_keys": normalize_keys,
+            "architecture_preset": architecture_preset,
+            "auto_strength_floor": auto_strength_floor,
+            "decision_smoothing": decision_smoothing,
+            "analysis_summary": analysis_summary,
+            "top_n": top_n,
+            "_estimator": True,
+        }
