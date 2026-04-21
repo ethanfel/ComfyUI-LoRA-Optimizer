@@ -10051,6 +10051,82 @@ class LoRAAutoTuner(LoRAOptimizer):
                 auto_strength_floor, decision_smoothing, evaluator_hash, memory_mode,
                 selection)
 
+    def _run_phase1_for_estimator(self, model, clip, lora_stack,
+                                  normalize_keys="disabled",
+                                  clip_strength_multiplier=1.0,
+                                  decision_smoothing=0.25):
+        """Phase-1-only analysis pass for the Estimator pre-node.
+
+        Produces the same per-prefix shape the HF cache stores so the feature
+        extractor sees identical structure in online and offline contexts.
+
+        Returns None if the stack is empty or has no compatible target keys.
+        """
+        normalized_stack = self._normalize_stack(lora_stack, normalize_keys=normalize_keys)
+        active_loras = [item for item in normalized_stack if item["strength"] != 0]
+        if not active_loras:
+            return None
+
+        model_keys = self._get_model_keys(model)
+        clip_keys = {}
+        if clip is not None:
+            clip_keys = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, {})
+
+        all_lora_prefixes = self._collect_lora_prefixes(active_loras)
+        target_groups = self._build_target_groups(all_lora_prefixes, model_keys, clip_keys)
+        if not target_groups:
+            return None
+
+        pairs_for_cache = [(i, j)
+                           for i in range(len(active_loras))
+                           for j in range(i + 1, len(active_loras))]
+        lora_hashes = {i: self._lora_identity_hash(lora)
+                       for i, lora in enumerate(active_loras)}
+        lora_caches = {i: self._lora_cache_load(h) or {}
+                       for i, h in lora_hashes.items()}
+        pair_caches = {(i, j): self._pair_cache_load(lora_hashes[i], lora_hashes[j]) or {}
+                       for i, j in pairs_for_cache}
+
+        compute_device = self._get_compute_device()
+        analysis_data = self._run_group_analysis(
+            target_groups, active_loras, model, clip, compute_device,
+            clip_strength_multiplier=clip_strength_multiplier,
+            merge_refinement="none",
+            decision_smoothing=decision_smoothing,
+            lora_caches=lora_caches,
+            pair_caches=pair_caches,
+            lora_hashes=lora_hashes,
+        )
+
+        # Combine cached + freshly-computed per-prefix entries. The on-disk
+        # cache format and the estimator builder both key by prefix, so this
+        # matches load_phase1_for_config in scripts/build_estimator_index.py.
+        new_lora_entries = analysis_data.get("new_lora_entries", {})
+        new_pair_entries = analysis_data.get("new_pair_entries", {})
+
+        lora_stats = {}
+        for i in range(len(active_loras)):
+            combined = dict(lora_caches.get(i, {}))
+            for pfx, entry in new_lora_entries.get(i, {}).items():
+                if entry is not None:
+                    combined[pfx] = entry
+            lora_stats[i] = {"per_prefix": combined}
+
+        pair_stats = {}
+        for key in pairs_for_cache:
+            combined = dict(pair_caches.get(key, {}))
+            combined.update(new_pair_entries.get(key, {}))
+            pair_stats[key] = {"per_prefix": combined}
+
+        return {
+            "pair_stats": pair_stats,
+            "lora_stats": lora_stats,
+            "combo_size": len(active_loras),
+            "base_model_family": getattr(self, "_detected_arch", None) or "unknown",
+            "active_loras": active_loras,
+            "n_prefixes": analysis_data.get("prefix_count", len(target_groups)),
+        }
+
 
 class LoRAMergeSelector(LoRAOptimizer):
     """
@@ -12156,6 +12232,148 @@ class LoRAExtractFromModel:
         return (lora_stack, lora_data)
 
 
+class LoRAEstimatorNode:
+    """Predict a merge config via k-NN retrieval over the HF community cache.
+
+    Runs Phase 1 (shared with AutoTuner) to build a combo feature vector,
+    retrieves similar past merges, aggregates their winning configs, and
+    emits a ``tuner_data`` struct the LoRA Optimizer consumes via
+    ``settings_source=from_tuner_data`` — skipping Phase 2 grid search.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "lora_stack": ("LORA_STACK",),
+                "k": ("INT", {"default": 5, "min": 1, "max": 20}),
+                "rebuild_index": (["auto", "force", "skip"], {"default": "auto"}),
+                "top_n_output": ("INT", {"default": 3, "min": 1, "max": 10}),
+            },
+            "optional": {
+                "clip": ("CLIP",),
+            },
+        }
+
+    RETURN_TYPES = ("TUNER_DATA", "STRING")
+    RETURN_NAMES = ("tuner_data", "estimator_report")
+    FUNCTION = "estimate"
+    CATEGORY = "LoRA/Optimization"
+
+    def _resolve_index_dir(self):
+        """Return the on-disk directory for index.pkl + meta.json (override in tests)."""
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+        try:
+            base = _Path(folder_paths.models_dir) / "estimator"
+        except Exception:
+            base = _Path(_tempfile.gettempdir()) / "lora_estimator"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    @staticmethod
+    def _rebuild_index(index_dir):
+        """Snapshot-download the HF dataset and rebuild the index in place."""
+        from scripts.build_estimator_index import build_index
+        from huggingface_hub import HfApi, snapshot_download
+        import lora_estimator
+
+        info = HfApi().dataset_info(lora_estimator.HF_REPO_ID)
+        ds_dir = snapshot_download(
+            repo_id=lora_estimator.HF_REPO_ID,
+            repo_type="dataset",
+            allow_patterns=["config/*", "pair/*", "lora/*"],
+        )
+        build_index(ds_dir, index_dir, info.sha)
+
+    def estimate(self, model, lora_stack, k, rebuild_index, top_n_output, clip=None):
+        import lora_estimator
+        from lora_estimator import (
+            EstimatorFeatureExtractor, LoRAEstimator, ensure_index_fresh,
+        )
+
+        tuner = LoRAAutoTuner()
+        phase1 = tuner._run_phase1_for_estimator(model, clip, lora_stack)
+        if phase1 is None:
+            return (None, "[Estimator] No active LoRAs / no compatible targets. "
+                          "Fall back to AutoTuner or check your stack.")
+
+        index_dir = self._resolve_index_dir()
+        rebuild_callable = lambda: self._rebuild_index(index_dir)
+
+        if not (index_dir / "index.pkl").exists():
+            # First run — must build regardless of the requested mode (except skip).
+            if rebuild_index == "skip":
+                return (None, "[Estimator] No cached index found and rebuild_index=skip. "
+                              "Re-run with rebuild_index=auto or force.")
+            rebuild_callable()
+        else:
+            ensure_index_fresh(index_dir, rebuild_callable, mode=rebuild_index)
+
+        extractor = EstimatorFeatureExtractor()
+        feature_vec = extractor.featurize(phase1)
+
+        estimator = LoRAEstimator.from_disk(index_dir / "index.pkl")
+        neighbors = estimator.retrieve(
+            feature_vec,
+            base_model_family=phase1["base_model_family"],
+            combo_size=phase1["combo_size"],
+            k=int(k),
+        )
+        if not neighbors:
+            return (None, self._empty_report(phase1))
+
+        top_n = LoRAEstimator.aggregate_candidates(neighbors, top_n=int(top_n_output))
+        tuner_data = LoRAEstimator.emit_tuner_data(
+            top_n=top_n,
+            source_loras=[
+                {"name": item.get("name", ""), "strength": float(item.get("strength", 1.0))}
+                for item in phase1.get("active_loras", [])
+            ],
+            analysis_summary={
+                "n_prefixes": phase1.get("n_prefixes", len(phase1["pair_stats"])),
+                "combo_size": phase1["combo_size"],
+                "base_model_family": phase1["base_model_family"],
+                "mean_neighbor_distance": float(
+                    sum(n["distance"] for n in neighbors) / len(neighbors)
+                ),
+                "n_neighbors": len(neighbors),
+            },
+        )
+        return (tuner_data, self._report(phase1, neighbors, top_n))
+
+    @staticmethod
+    def _empty_report(phase1):
+        return (
+            "[Estimator] No neighbors matched "
+            f"(family={phase1['base_model_family']}, "
+            f"combo_size={phase1['combo_size']}). "
+            "This combo has no precedent in the community cache — fall back to AutoTuner."
+        )
+
+    @staticmethod
+    def _report(phase1, neighbors, top_n):
+        lines = ["[Estimator] === LoRA Merge Estimator Report ==="]
+        lines.append(
+            f"Combo: family={phase1['base_model_family']}, size={phase1['combo_size']}, "
+            f"prefixes={phase1.get('n_prefixes', '?')}"
+        )
+        lines.append(f"Retrieved {len(neighbors)} neighbor(s):")
+        for i, n in enumerate(neighbors, 1):
+            score = n["label"].get("score_final", 0.0)
+            lines.append(f"  #{i}: dist={n['distance']:.3f}  cached_score={score:.3f}")
+        lines.append(f"Predicted top {len(top_n)} config(s):")
+        for e in top_n:
+            cfg = e.get("config", {})
+            lines.append(
+                f"  rank {e['rank']}: {cfg.get('merge_mode', '?')}"
+                f" / {cfg.get('sparsification', '?')}"
+                f"  pred_score={e['score_final']:.3f}"
+            )
+        return "\n".join(lines)
+
+
 class LoRACombinationGenerator:
     """Generate all 2-way and/or 3-way LoRA combinations for AutoTuner
     dataset collection, with deterministic shuffling and progress tracking."""
@@ -12350,6 +12568,7 @@ NODE_CLASS_MAPPINGS = {
     "LoRAMergeFormula": LoRAMergeFormula,
     "LoRAExtractFromModel": LoRAExtractFromModel,
     "LoRACombinationGenerator": LoRACombinationGenerator,
+    "LoRAEstimator": LoRAEstimatorNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -12375,4 +12594,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoRAMergeFormula": "LoRA Merge Formula",
     "LoRAExtractFromModel": "LoRA Extract from Model",
     "LoRACombinationGenerator": "LoRA Combination Generator",
+    "LoRAEstimator": "LoRA Merge Estimator",
 }
