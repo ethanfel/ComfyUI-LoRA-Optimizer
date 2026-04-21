@@ -90,5 +90,65 @@ class TestPerPrefixCaptureInLoraData(unittest.TestCase):
             self.assertIn(strat, valid_modes)
 
 
+@unittest.skipIf(torch is None, "torch not installed")
+class TestUploadPayloadIncludesPerPrefixDecisions(unittest.TestCase):
+    """A2: the HF upload payload must include per_prefix_decisions on each candidate."""
+
+    def test_upload_payload_includes_per_prefix_decisions(self):
+        """_community_upload_results must copy per_prefix_decisions into each candidate dict."""
+        tuner_data = {
+            "top_n": [
+                {
+                    "rank": 1,
+                    "score_heuristic": 0.8,
+                    "score_measured": 0.9,
+                    "score_final": 0.88,
+                    "config": {"merge_mode": "ties"},
+                    "per_prefix_decisions": {"layer.0.attn": "ties", "layer.1.attn": "weighted_average"},
+                },
+                {
+                    "rank": 2,
+                    "score_heuristic": 0.7,
+                    "score_measured": 0.75,
+                    "score_final": 0.73,
+                    "config": {"merge_mode": "weighted_average"},
+                    "per_prefix_decisions": {"layer.0.attn": "weighted_average"},
+                },
+            ],
+        }
+        captured_uploads = []
+
+        def fake_upload(path_in_repo, data, token):
+            captured_uploads.append((path_in_repo, data))
+            return True
+
+        with mock.patch.object(lora_optimizer.LoRAAutoTuner, "_community_download",
+                               return_value=None):
+            with mock.patch.object(lora_optimizer.LoRAAutoTuner, "_community_upload",
+                                   side_effect=fake_upload):
+                lora_optimizer.LoRAAutoTuner._community_upload_results(
+                    new_lora_entries={},
+                    new_pair_entries={},
+                    content_hashes={0: "aaaa", 1: "bbbb"},
+                    lora_hashes={0: "hash_a", 1: "hash_b"},
+                    tuner_data=tuner_data,
+                    arch_preset="dit",
+                    token="fake_token",
+                    base_model_family="zimage",
+                )
+
+        config_uploads = [(p, d) for p, d in captured_uploads if p.startswith("config/")]
+        self.assertEqual(len(config_uploads), 1, "expected exactly one config upload")
+        _, payload = config_uploads[0]
+        self.assertIn("candidates", payload)
+        self.assertEqual(len(payload["candidates"]), 2)
+        for cand in payload["candidates"]:
+            self.assertIn("per_prefix_decisions", cand)
+            self.assertIsInstance(cand["per_prefix_decisions"], dict)
+        # First candidate retained its full decisions map.
+        self.assertEqual(payload["candidates"][0]["per_prefix_decisions"],
+                         {"layer.0.attn": "ties", "layer.1.attn": "weighted_average"})
+
+
 if __name__ == "__main__":
     unittest.main()

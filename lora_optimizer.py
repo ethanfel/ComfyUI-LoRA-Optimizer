@@ -8407,6 +8407,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "score_heuristic": entry.get("score_heuristic", 0.0),
                     "score_measured": entry.get("score_measured", 0.0),
                     "score_final": entry.get("score_final", 0.0),
+                    "per_prefix_decisions": entry.get("per_prefix_decisions", {}),
                 }
                 for idx, entry in enumerate(tuner_data["top_n"])
                 if "config" in entry
@@ -9365,6 +9366,10 @@ class LoRAAutoTuner(LoRAOptimizer):
             # LoRAAdapter patches; _score_merge_result handles both formats)
             m_patches = lora_data["model_patches"] if lora_data else {}
             c_patches = lora_data["clip_patches"] if lora_data else {}
+            # Snapshot per-prefix decisions now — lora_data may be freed below.
+            cand_per_prefix_decisions = (
+                dict(lora_data.get("per_prefix_decisions", {})) if lora_data else {}
+            )
             is_ortho_score = (
                 abs(avg_cos_sim) < tuner_arch_preset["orthogonal_cos_sim_max"]
                 and avg_subspace_overlap < 0.35
@@ -9558,6 +9563,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "score_external": external_score,
                 "score_final": final_score,
                 "config": config,
+                "per_prefix_decisions": cand_per_prefix_decisions,
                 "metrics": {
                     "norm_preservation": measured.get("norm_mean", 0.0),
                     "effective_rank_mean": measured.get("effective_rank_mean", 0.0),
@@ -9656,6 +9662,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "config": r["config"],
                 "metrics": r["metrics"],
                 "external_details": r.get("external_details"),
+                "per_prefix_decisions": r.get("per_prefix_decisions", {}),
             } for r in results],
         }
 
