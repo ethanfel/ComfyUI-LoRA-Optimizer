@@ -2952,6 +2952,21 @@ class TestCommunityCacheUploadOnly(unittest.TestCase):
         self.assertIn("upload_and_download", choices)
         self.assertIn("disabled", choices)
 
+    def test_upload_only_defines_arch_key_without_download(self):
+        """Regression: _arch_key_for_community must be assigned in upload_only
+        mode (previously only set inside the upload_and_download branch,
+        leading to UnboundLocalError at upload time)."""
+        import inspect
+        src = inspect.getsource(lora_optimizer.LoRAAutoTuner.auto_tune)
+        # The arch-key assignment must not be gated on the download-only
+        # community_cache value — otherwise upload_only uploads crash.
+        self.assertNotIn(
+            'if _all_hashed and community_cache == "upload_and_download":',
+            src,
+            "arch-key assignment is gated on upload_and_download only — "
+            "upload_only will hit UnboundLocalError at upload time.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

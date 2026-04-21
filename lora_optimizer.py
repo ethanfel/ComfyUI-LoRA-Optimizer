@@ -8887,13 +8887,14 @@ class LoRAAutoTuner(LoRAOptimizer):
                         f"[AutoTuner Community] Could not hash '{_lora['name']}', disabling community cache")
                     _all_hashed = False
                     break
-            if _all_hashed and community_cache == "upload_and_download":
+            if _all_hashed:
                 _arch_key_for_community, _ = _resolve_arch_preset(
                     architecture_preset, getattr(self, '_detected_arch', None) or 'unknown')
-                _community_tuner_data = self._community_download_caches(
-                    active_loras, content_hashes, lora_caches, pair_caches,
-                    arch_preset=_arch_key_for_community, top_n=top_n)
-            elif not _all_hashed:
+                if community_cache == "upload_and_download":
+                    _community_tuner_data = self._community_download_caches(
+                        active_loras, content_hashes, lora_caches, pair_caches,
+                        arch_preset=_arch_key_for_community, top_n=top_n)
+            else:
                 content_hashes = {}
 
         if _community_tuner_data is not None and not _is_sub_merge:
