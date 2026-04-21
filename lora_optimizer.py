@@ -95,6 +95,11 @@ COMMUNITY_CACHE_BASE_URL = (
     f"https://huggingface.co/datasets/{COMMUNITY_CACHE_REPO}/resolve/main"
 )
 
+try:
+    from huggingface_hub import HfApi
+except Exception:
+    HfApi = None
+
 
 
 
@@ -12383,6 +12388,8 @@ class LoRACombinationGenerator:
         self._progress_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "combo_progress.json"
         )
+        self._enrichment_cache = {}
+        self._hf_files_cache = None
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -12425,6 +12432,47 @@ class LoRACombinationGenerator:
                 "combo_progress_rerun.json",
             )
         return self._progress_path
+
+    def _list_hf_config_files(self):
+        if self._hf_files_cache is not None:
+            return self._hf_files_cache
+        try:
+            files = HfApi().list_repo_files(
+                repo_id=COMMUNITY_CACHE_REPO, repo_type="dataset",
+            )
+            self._hf_files_cache = [f for f in files if f.startswith("config/")]
+        except Exception as exc:
+            logging.warning("[LoRA Combo] HF file list failed (%s) — "
+                            "skip check disabled for this session.", exc)
+            self._hf_files_cache = []
+        return self._hf_files_cache
+
+    def _combo_already_enriched(self, combo):
+        content_hashes = []
+        for name in combo:
+            ch = LoRAAutoTuner._lora_content_hash({"name": name})
+            if ch is None:
+                return False
+            content_hashes.append(ch)
+        joined = "_".join(sorted(content_hashes))
+        if joined in self._enrichment_cache:
+            return self._enrichment_cache[joined]
+        prefix = f"config/{joined}_"
+        matching = [f for f in self._list_hf_config_files()
+                    if f.startswith(prefix)]
+        enriched = False
+        for path in matching:
+            data = LoRAAutoTuner._community_download(path)
+            if not data:
+                continue
+            for cand in data.get("candidates", []):
+                if cand.get("per_prefix_decisions"):
+                    enriched = True
+                    break
+            if enriched:
+                break
+        self._enrichment_cache[joined] = enriched
+        return enriched
 
     def get_next_combo(self, shuffle_order, strength, combo_size,
                         folder_filter="", rerun_mode=False):
@@ -12470,6 +12518,14 @@ class LoRACombinationGenerator:
                     "key_filter": "all",
                     "metadata": _read_safetensors_metadata(lora_path),
                 })
+
+            if not skip and rerun_mode:
+                if self._combo_already_enriched(combo):
+                    logging.info("[LoRA Combo] Already enriched on HF — "
+                                 "skipping: %s", " + ".join(combo))
+                    completed.add(self._combo_hash(combo))
+                    self._save_progress(progress_path, completed, total)
+                    skip = True
 
             if not skip:
                 break

@@ -2810,6 +2810,97 @@ class TestLoRACombinationGenerator(unittest.TestCase):
         rerun_dir = os.path.dirname(gen._resolve_progress_path(rerun_mode=True))
         self.assertEqual(default_dir, rerun_dir)
 
+    # -- rerun HF-enrichment skip --
+
+    def test_hf_file_list_is_memoized(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        call_count = {"n": 0}
+
+        def fake_list(*args, **kwargs):
+            call_count["n"] += 1
+            return ["config/aaa_bbb_dit.config.json", "lora/aaa.lora.json"]
+
+        with unittest.mock.patch.object(
+            lora_optimizer, "HfApi", create=True,
+            return_value=unittest.mock.MagicMock(list_repo_files=fake_list),
+        ):
+            first = gen._list_hf_config_files()
+            second = gen._list_hf_config_files()
+        self.assertEqual(first, ["config/aaa_bbb_dit.config.json"])
+        self.assertEqual(second, first)
+        self.assertEqual(call_count["n"], 1)
+
+    def test_combo_already_enriched_true_when_any_candidate_has_decisions(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        gen._hf_files_cache = ["config/aaa_bbb_dit.config.json"]
+        enriched = {
+            "candidates": [
+                {"per_prefix_decisions": {}},
+                {"per_prefix_decisions": {"layer.0": "ties"}},
+            ],
+        }
+        with unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_lora_content_hash",
+            side_effect=lambda item: {"a": "aaa", "b": "bbb"}[item["name"]],
+        ), unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_community_download",
+            return_value=enriched,
+        ):
+            self.assertTrue(gen._combo_already_enriched(("a", "b")))
+
+    def test_combo_already_enriched_false_when_candidates_lack_decisions(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        gen._hf_files_cache = ["config/aaa_bbb_dit.config.json"]
+        not_enriched = {"candidates": [{"per_prefix_decisions": {}}]}
+        with unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_lora_content_hash",
+            side_effect=lambda item: {"a": "aaa", "b": "bbb"}[item["name"]],
+        ), unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_community_download",
+            return_value=not_enriched,
+        ):
+            self.assertFalse(gen._combo_already_enriched(("a", "b")))
+
+    def test_combo_already_enriched_false_when_no_matching_hf_config(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        gen._hf_files_cache = ["config/zzz_yyy_dit.config.json"]
+        with unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_lora_content_hash",
+            side_effect=lambda item: {"a": "aaa", "b": "bbb"}[item["name"]],
+        ):
+            self.assertFalse(gen._combo_already_enriched(("a", "b")))
+
+    def test_combo_already_enriched_memoizes_result(self):
+        gen = lora_optimizer.LoRACombinationGenerator()
+        gen._hf_files_cache = ["config/aaa_bbb_dit.config.json"]
+        download_calls = {"n": 0}
+
+        def fake_download(path):
+            download_calls["n"] += 1
+            return {"candidates": [{"per_prefix_decisions": {"l": "ties"}}]}
+
+        with unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_lora_content_hash",
+            side_effect=lambda item: {"a": "aaa", "b": "bbb"}[item["name"]],
+        ), unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_community_download",
+            side_effect=fake_download,
+        ):
+            self.assertTrue(gen._combo_already_enriched(("a", "b")))
+            self.assertTrue(gen._combo_already_enriched(("a", "b")))
+        self.assertEqual(download_calls["n"], 1)
+
+    def test_combo_already_enriched_handles_missing_content_hash(self):
+        """If any LoRA hash cannot be computed, fall back to 'not enriched'
+        so the combo still runs."""
+        gen = lora_optimizer.LoRACombinationGenerator()
+        gen._hf_files_cache = []
+        with unittest.mock.patch.object(
+            lora_optimizer.LoRAAutoTuner, "_lora_content_hash",
+            return_value=None,
+        ):
+            self.assertFalse(gen._combo_already_enriched(("a", "b")))
+
 
 if __name__ == "__main__":
     unittest.main()
