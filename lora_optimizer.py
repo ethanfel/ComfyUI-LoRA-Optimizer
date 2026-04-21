@@ -7148,6 +7148,13 @@ class LoRAOptimizer(_LoRAMergeBase):
             architecture_preset=preset_key,
         )
 
+        # Derive per-prefix decision map from the decision log (last-wins if a
+        # prefix somehow appears twice — shouldn't, but defensive).
+        per_prefix_decisions = {
+            prefix: mode
+            for prefix, mode, _conflict, _n in prefix_decisions
+        }
+
         # Bundle LORA_DATA for optional downstream saving
         lora_data = {
             "model_patches": model_patches,
@@ -7157,6 +7164,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             "clip_strength": clip_strength_out,
             "suggested_max_strength": suggested_max_strength,
             "sum_rank": compress_rank if compress_rank > 0 else 128,
+            "per_prefix_decisions": per_prefix_decisions,
             "merge_metadata": {
                 "source_loras": [{"name": item["name"], "strength": item["strength"]} for item in active_loras],
                 "mode": mode,
