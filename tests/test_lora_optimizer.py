@@ -2902,5 +2902,23 @@ class TestLoRACombinationGenerator(unittest.TestCase):
             self.assertFalse(gen._combo_already_enriched(("a", "b")))
 
 
+class TestCommunityCacheUploadOnly(unittest.TestCase):
+    """Tests for the community_cache='upload_only' mode."""
+
+    def test_autotuner_settings_enum_includes_upload_only(self):
+        inputs = lora_optimizer.LoRAAutoTunerSettings.INPUT_TYPES()
+        choices = inputs["required"]["community_cache"][0]
+        self.assertIn("upload_only", choices)
+        self.assertIn("upload_and_download", choices)
+        self.assertIn("disabled", choices)
+
+    def test_autotuner_node_enum_includes_upload_only(self):
+        inputs = lora_optimizer.LoRAAutoTuner.INPUT_TYPES()
+        choices = inputs["optional"]["community_cache"][0]
+        self.assertIn("upload_only", choices)
+        self.assertIn("upload_and_download", choices)
+        self.assertIn("disabled", choices)
+
+
 if __name__ == "__main__":
     unittest.main()

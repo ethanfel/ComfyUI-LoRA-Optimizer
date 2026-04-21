@@ -7590,11 +7590,11 @@ class LoRAAutoTunerSettings:
                     "default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05,
                     "tooltip": "How much of your free RAM the diff cache can use (in 'auto' mode). 0.5 = up to half your available RAM."
                 }),
-                "community_cache": (["disabled", "upload_and_download"], {
+                "community_cache": (["disabled", "upload_only", "upload_and_download"], {
                     "default": "disabled",
                     "tooltip": "Community cache: share and reuse LoRA analysis results via Hugging Face.\n"
-                               "download_only: anonymously download cached results before analysis — no account needed.\n"
-                               "upload_and_download: also upload your results after tuning. Requires HF_TOKEN environment variable."
+                               "upload_only: run locally and upload results; do NOT replay HF cache hits. Useful for backfilling enriched configs.\n"
+                               "upload_and_download: download cached results before analysis and upload new ones after. Requires HF_TOKEN environment variable."
                 }),
                 "memory_mode": (["disabled", "auto", "auto_ignore_strength", "read_only", "clear_and_run"], {
                     "default": "auto",
@@ -7922,9 +7922,11 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "evaluator": ("AUTOTUNER_EVALUATOR", {
                     "tooltip": "Optional external evaluator spec. Use this to blend prompt/reference scoring from your own generation code with the built-in merge metrics."
                 }),
-                "community_cache": (["disabled", "upload_and_download"], {
+                "community_cache": (["disabled", "upload_only", "upload_and_download"], {
                     "default": "disabled",
-                    "tooltip": "Community-backed cache on Hugging Face. Download precomputed results and contribute yours back. Requires huggingface-cli login or HF_TOKEN env var."
+                    "tooltip": "Community-backed cache on Hugging Face.\n"
+                               "upload_only: run locally and upload results; do NOT replay HF cache hits (useful for backfill reruns).\n"
+                               "upload_and_download: download precomputed results and contribute yours back. Requires huggingface-cli login or HF_TOKEN env var."
                 }),
                 "cache_patches": (["enabled", "disabled"], {
                     "default": "enabled",
@@ -8869,10 +8871,10 @@ class LoRAAutoTuner(LoRAOptimizer):
         pair_caches = {(i, j): self._pair_cache_load(lora_hashes[i], lora_hashes[j]) or {}
                        for i, j in pairs_for_cache}
 
-        # --- Community cache download ---
+        # --- Community cache: hash computation + optional download ---
         _community_tuner_data = None
         content_hashes = {}
-        if community_cache == "upload_and_download" and not _is_sub_merge:
+        if community_cache in ("upload_and_download", "upload_only") and not _is_sub_merge:
             logging.info(f"[AutoTuner Community] Mode: {community_cache} — computing content hashes "
                          f"for {len(active_loras)} LoRA(s)...")
             _all_hashed = True
@@ -8885,13 +8887,13 @@ class LoRAAutoTuner(LoRAOptimizer):
                         f"[AutoTuner Community] Could not hash '{_lora['name']}', disabling community cache")
                     _all_hashed = False
                     break
-            if _all_hashed:
+            if _all_hashed and community_cache == "upload_and_download":
                 _arch_key_for_community, _ = _resolve_arch_preset(
                     architecture_preset, getattr(self, '_detected_arch', None) or 'unknown')
                 _community_tuner_data = self._community_download_caches(
                     active_loras, content_hashes, lora_caches, pair_caches,
                     arch_preset=_arch_key_for_community, top_n=top_n)
-            else:
+            elif not _all_hashed:
                 content_hashes = {}
 
         if _community_tuner_data is not None and not _is_sub_merge:
@@ -9050,7 +9052,7 @@ class LoRAAutoTuner(LoRAOptimizer):
 
                     # Upload config from memory hit — lora/pair entries not available here
                     # but the winning config + score can still be contributed
-                    if (community_cache == "upload_and_download"
+                    if (community_cache in ("upload_and_download", "upload_only")
                             and len(content_hashes) == len(active_loras)):
                         _hf_token = (os.environ.get("HF_TOKEN")
                                      or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
@@ -9692,7 +9694,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                               memory_settings, active_loras, tuner_data)
 
         # --- Community cache upload ---
-        if (community_cache == "upload_and_download" and not _is_sub_merge
+        if (community_cache in ("upload_and_download", "upload_only") and not _is_sub_merge
                 and len(content_hashes) == len(active_loras)):
             _hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
             if not _hf_token:
