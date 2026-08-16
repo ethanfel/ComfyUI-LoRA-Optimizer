@@ -141,7 +141,7 @@ TUNER_DATA_DIR = os.path.join(folder_paths.models_dir, "tuner_data")
 os.makedirs(TUNER_DATA_DIR, exist_ok=True)
 folder_paths.add_model_folder_path("tuner_data", TUNER_DATA_DIR)
 
-# Same pattern _refuse_zimage_patches matches on patch keys — used to detect
+# Same Z-Image component pattern the fused-QKV refusion path recognizes — used to detect
 # QKV component patches whose scoring stats must wait for the fused tensor
 _ZIMAGE_QKV_KEY_RE = re.compile(r'(layers\.\d+\.attention)\.to_(q|k|v)(?:\.|$)')
 
@@ -349,7 +349,7 @@ _ARCH_PRESETS = {
         # upgrade is suppressed (SLERP washes out the dominant LoRA on imbalanced
         # orthogonal pairs). Orthogonal pairs above this route to additive instead.
         "slerp_imbalance_ratio": 2.0,
-        "display_name": "DiT (Flux/WAN/Z-Image/LTX/Ideogram-4/Krea-2/HunyuanVideo)",
+        "display_name": "DiT (Flux/WAN/Z-Image/LTX/MiniMax-H3/Ideogram-4/Krea-2/HunyuanVideo)",
         "full_rank": {
             "rank_threshold": 512,
             "disable_slerp_upgrade": True,
@@ -413,12 +413,14 @@ _ARCH_PRESETS = {
     },
 }
 
-_VIDEO_ARCH_ORTHOGONAL_FLOOR = {"wan": 1.0, "ltx": 1.0, "acestep": 1.0}
+_VIDEO_ARCH_ORTHOGONAL_FLOOR = {
+    "wan": 1.0, "ltx": 1.0, "minimax_h3": 1.0, "acestep": 1.0,
+}
 
 _ARCH_TO_PRESET = {
     "sdxl": "sd_unet", "sd15": "sd_unet", "unknown": "sd_unet",
     "flux": "dit", "wan": "dit", "zimage": "dit", "ltx": "dit",
-    "ideogram4": "dit", "anima": "dit", "krea2": "dit",
+    "minimax_h3": "dit", "ideogram4": "dit", "anima": "dit", "krea2": "dit",
     "acestep": "acestep_dit",
     "qwen_image": "llm",
 }
@@ -443,6 +445,7 @@ _MODEL_CLASS_TO_ARCH = {
     "ACEStep15": "acestep",
     "LTXV": "ltx",
     "LTXAV": "ltx",
+    "MiniMaxH3": "minimax_h3",
     "Flux": "flux",
     "WAN21": "wan",
     "Lumina2": "zimage",
@@ -579,7 +582,7 @@ class LoRAStack:
                                "'all': contribute all keys (default). "
                                "'shared_only': only keys present in 2+ LoRAs. "
                                "'unique_only': only keys present in exactly 1 LoRA. "
-                               "'audio_only': only audio layers (LTX-2 / ACE-Step audio modules). "
+                               "'audio_only': only audio layers (LTX-2 / MiniMax H3 / ACE-Step audio modules). "
                                "'no_audio': only non-audio (video) layers. "
                                "e.g. merge two LTX LoRAs but keep one's sound: set the other to 'no_audio'."
                 }),
@@ -690,7 +693,7 @@ class LoRAStackDynamic:
                            f"'all': contribute all keys (default). "
                            f"'shared_only': only keys present in 2+ LoRAs. "
                            f"'unique_only': only keys present in exactly 1 LoRA. "
-                           f"'audio_only': only audio layers (LTX-2 / ACE-Step). "
+                           f"'audio_only': only audio layers (LTX-2 / MiniMax H3 / ACE-Step). "
                            f"'no_audio': only non-audio (video) layers."
             })
             inputs["required"][f"preserve_{i}"] = ("BOOLEAN", {
@@ -1084,7 +1087,8 @@ class _LoRAMergeBase:
         """
         Detect model architecture from LoRA key patterns.
         Returns: 'zimage', 'flux', 'wan', 'acestep', 'sdxl', 'sd15', 'ltx',
-        'qwen_image', 'ideogram4', 'anima', 'krea2', or 'unknown'.
+        'minimax_h3', 'qwen_image', 'ideogram4', 'anima', 'krea2', or
+        'unknown'.
         """
         keys = list(lora_sd.keys())
         keys_str = ' '.join(k.lower() for k in keys)
@@ -1127,6 +1131,42 @@ class _LoRAMergeBase:
         # that hijacked LTX-2 LoRAs as krea2 and broke their merge.
         if any(re.search(r'attn[._](?:to_gate|gate|w[qkvo])(?=\.)', k) for k in keys):
             return 'krea2'
+
+        # MiniMax H3: joint video/audio DiT with a fused qkv_proj in the
+        # released checkpoint. Check before ACE-Step: Diffusers H3 adapters use
+        # transformer_blocks.N.attn.to_q/to_k/to_v, which otherwise looks like
+        # ACE-Step v1.0. Native/reference/ai-toolkit forms use blocks.N plus
+        # qkv_proj/out_proj/mlp.fc1/fc2; Musubi flattens those paths under
+        # lora_unet_. Strong H3-only markers cover partial adapters too.
+        if any('video_patch_proj' in k or 'audio_patch_proj' in k
+               or 'final_layer.audio_out' in k for k in keys):
+            return 'minimax_h3'
+        if any(('token_refiner.blocks' in k or 'token_refiner_blocks_' in k
+                or 'token_refiner.refiner_blocks' in k)
+               and ('qkv_proj' in k or '.attn.to_' in k or '_attn_to_' in k
+                    or '.mlp.fc' in k or '.ff.net.' in k)
+               for k in keys):
+            return 'minimax_h3'
+        if any(re.search(r'(?:^|[._])blocks[._]\d+[._]attn[._]qkv_proj(?=[._])', k)
+               for k in keys):
+            return 'minimax_h3'
+        if any(re.search(r'(?:^|[._])blocks[._]\d+[._](?:mlp[._]fc[12]|adaln_proj[._]linear)(?=[._])', k)
+               for k in keys):
+            return 'minimax_h3'
+        _h3_diffusers_blocks = any(
+            re.search(r'transformer_blocks[._]\d+[._](?:ff[._]net[._](?:0[._]proj|2)|adaln_proj[._]linear)', k)
+            for k in keys)
+        if _h3_diffusers_blocks:
+            return 'minimax_h3'
+        # An attention-only Diffusers H3 LoRA has no unique names. Its released
+        # dimensions do: q/k/v project 5376 -> 7168. Only inspect the up/B side
+        # so rank-r down/A tensors cannot accidentally match.
+        for k in keys:
+            if (re.search(r'transformer_blocks[._]\d+[._]attn[._]to_[qkv](?=[._])', k)
+                    and any(s in k for s in ('.lora_B.', '.lora_up.', '.lora.up.'))):
+                shape = getattr(lora_sd.get(k), 'shape', None)
+                if shape is not None and len(shape) >= 1 and shape[0] == 7168:
+                    return 'minimax_h3'
 
         # Z-Image Turbo (Lumina2): layers.N with attention patterns
         # Handles: diffusion_model.layers.N, single_transformer_blocks.N (non-FLUX),
@@ -1994,6 +2034,166 @@ class _LoRAMergeBase:
         return normalized
 
     @classmethod
+    def _normalize_keys_minimax_h3(cls, lora_sd):
+        """Normalize MiniMax H3 LoRAs to ComfyUI's native module layout.
+
+        Supported inputs:
+          - reference / ai-toolkit native keys (bare or ``diffusion_model.``)
+          - PEFT wrappers (``base_model.model.`` / ``transformer.``)
+          - Musubi's flattened ``lora_unet_*`` module names
+          - Diffusers split-QKV names (``transformer_blocks.*``)
+
+        Native fused QKV adapters are split into pseudo ``to_q/to_k/to_v``
+        targets for per-component conflict analysis. ``_get_model_keys`` maps
+        those names onto slices of ComfyUI's fused ``qkv_proj`` weight. The
+        Diffusers SwiGLU ``ff.net.0.proj`` stores its two output halves in the
+        reverse order from the reference ``mlp.fc1``; only the up/B rows need
+        swapping.
+        """
+        # LightX2V/PEFT may insert an adapter-name component. The optimizer's
+        # LoRA parser expects the ordinary suffix; ``default`` carries no
+        # semantic information for a single serialized adapter.
+        suffix_fixed = {}
+        for key, value in lora_sd.items():
+            key = key.replace('.lora_A.default.weight', '.lora_A.weight')
+            key = key.replace('.lora_B.default.weight', '.lora_B.weight')
+            key = key.replace('.lora_down.default.weight', '.lora_down.weight')
+            key = key.replace('.lora_up.default.weight', '.lora_up.weight')
+            suffix_fixed[key] = value
+
+        flattened_modules = [
+            (r"blocks_(\d+)_attn_(qkv|out)_proj", r"blocks.\1.attn.\2_proj"),
+            (r"blocks_(\d+)_mlp_fc([12])", r"blocks.\1.mlp.fc\2"),
+            (r"blocks_(\d+)_adaln_proj_linear", r"blocks.\1.adaln_proj.linear"),
+            (r"token_refiner_blocks_(\d+)_attn_(qkv|out)_proj",
+             r"token_refiner.blocks.\1.attn.\2_proj"),
+            (r"token_refiner_blocks_(\d+)_mlp_fc([12])",
+             r"token_refiner.blocks.\1.mlp.fc\2"),
+            (r"(video|audio)_patch_proj", r"\1_patch_proj"),
+            (r"condition_proj", "condition_proj"),
+            (r"time_embedder_proj_(in|out)", r"time_embedder.proj_\1"),
+            (r"final_layer_adaln_proj_linear", "final_layer.adaln_proj.linear"),
+            (r"final_layer_(video|audio)_out", r"final_layer.\1_out"),
+        ]
+        top_level_map = {
+            "proj_in": "video_patch_proj",
+            "audio_proj_in": "audio_patch_proj",
+            "context_embedder": "condition_proj",
+            "time_embedder.linear_1": "time_embedder.proj_in",
+            "time_embedder.linear_2": "time_embedder.proj_out",
+            "norm_out.linear": "final_layer.adaln_proj.linear",
+            "proj_out": "final_layer.video_out",
+            "audio_proj_out": "final_layer.audio_out",
+        }
+
+        canonical = {}
+        for key, value in suffix_fixed.items():
+            module, suffix = cls._split_lora_suffix(key)
+            if not suffix:
+                canonical[key] = value
+                continue
+
+            # Musubi/Kohya: recover dots by matching the complete H3 module
+            # vocabulary, since names such as qkv_proj contain underscores.
+            if module.startswith('lora_unet_'):
+                flat = module[len('lora_unet_'):]
+                dotted = None
+                for pattern, replacement in flattened_modules:
+                    if re.fullmatch(pattern, flat):
+                        dotted = re.sub(pattern, replacement, flat)
+                        break
+                if dotted is None:
+                    canonical[key] = value
+                    continue
+                module = dotted
+            else:
+                # PEFT/Diffusers wrappers can be nested.
+                changed = True
+                while changed:
+                    changed = False
+                    for wrapper in ('base_model.model.', 'unet.', 'transformer.'):
+                        if module.startswith(wrapper):
+                            module = module[len(wrapper):]
+                            changed = True
+                            break
+
+            from_diffusers_fc1 = False
+            if module.startswith('transformer_blocks.'):
+                module = 'blocks.' + module[len('transformer_blocks.'):]
+            elif module.startswith('token_refiner.refiner_blocks.'):
+                module = ('token_refiner.blocks.'
+                          + module[len('token_refiner.refiner_blocks.'):])
+
+            module = top_level_map.get(module, module)
+            if '.attn.to_out.0' in module:
+                module = module.replace('.attn.to_out.0', '.attn.out_proj')
+            if '.ff.net.0.proj' in module:
+                module = module.replace('.ff.net.0.proj', '.mlp.fc1')
+                from_diffusers_fc1 = True
+            if '.ff.net.2' in module:
+                module = module.replace('.ff.net.2', '.mlp.fc2')
+
+            native_roots = (
+                'blocks.', 'token_refiner.', 'video_patch_proj',
+                'audio_patch_proj', 'condition_proj', 'time_embedder.',
+                'final_layer.',
+            )
+            if module.startswith(native_roots):
+                module = 'diffusion_model.' + module
+
+            # Diffusers SwiGLU is [value; gate], the native H3 fc1 is
+            # [gate; value]. This is an output-row permutation, so A/down is
+            # untouched and B/up alone is swapped.
+            if (from_diffusers_fc1
+                    and suffix in ('.lora_B.weight', '.lora_up.weight', '.lora.up.weight')
+                    and isinstance(value, torch.Tensor) and value.shape[0] % 2 == 0):
+                half = value.shape[0] // 2
+                value = torch.cat([value[half:], value[:half]], dim=0)
+            canonical[module + suffix] = value
+
+        normalized = {}
+        processed = set()
+        attn_bases = set()
+        qkv_re = re.compile(
+            r'^(diffusion_model\.(?:blocks|token_refiner\.blocks)\.\d+\.attn)\.qkv_proj(?:\.|$)')
+        for key in canonical:
+            match = qkv_re.match(key)
+            if match:
+                attn_bases.add(match.group(1))
+
+        # Reference H3 uses one shared A/down and a fused [Q; K; V] B/up.
+        # Splitting avoids a 3x-rank block-diagonal conversion and lets the
+        # optimizer make component-specific conflict decisions.
+        for base in attn_bases:
+            for down_suffix, up_suffix in (
+                    ('.lora_A.weight', '.lora_B.weight'),
+                    ('.lora_down.weight', '.lora_up.weight'),
+                    ('.lora.down.weight', '.lora.up.weight')):
+                down_key = f"{base}.qkv_proj{down_suffix}"
+                up_key = f"{base}.qkv_proj{up_suffix}"
+                if down_key not in canonical or up_key not in canonical:
+                    continue
+                up = canonical[up_key]
+                if not isinstance(up, torch.Tensor) or up.shape[0] % 3:
+                    continue
+                parts = torch.chunk(up, 3, dim=0)
+                for component, part in zip(('to_q', 'to_k', 'to_v'), parts):
+                    normalized[f"{base}.{component}{down_suffix}"] = canonical[down_key]
+                    normalized[f"{base}.{component}{up_suffix}"] = part
+                alpha_key = f"{base}.qkv_proj.alpha"
+                if alpha_key in canonical:
+                    for component in ('to_q', 'to_k', 'to_v'):
+                        normalized[f"{base}.{component}.alpha"] = canonical[alpha_key]
+                    processed.add(alpha_key)
+                processed.update((down_key, up_key))
+                break
+
+        for key, value in canonical.items():
+            if key not in processed:
+                normalized[key] = value
+        return normalized
+
+    @classmethod
     def _normalize_keys(cls, lora_sd, architecture):
         """
         Dispatch to architecture-specific key normalizer.
@@ -2021,137 +2221,171 @@ class _LoRAMergeBase:
             return cls._normalize_keys_anima(lora_sd)
         elif architecture == 'krea2':
             return cls._normalize_keys_krea2(lora_sd)
+        elif architecture == 'minimax_h3':
+            return cls._normalize_keys_minimax_h3(lora_sd)
         return lora_sd  # unknown — pass through unchanged
 
     @staticmethod
-    def _refuse_zimage_patches(patches):
-        """
-        Re-fuse split to_q/to_k/to_v patches back into fused QKV patches
-        for Z-Image Turbo models. Also remaps to_out.0 -> out.
+    def _fuse_qkv_component_patches(component_patches):
+        """Fuse ordered Q/K/V patches without changing their effective diffs."""
+        if len(component_patches) != 3:
+            return None
 
-        Called after merging, before applying patches to the model.
-        Returns a new dict with fused patches.
+        if all(isinstance(p, tuple) and len(p) >= 2 and p[0] == "diff"
+               for p in component_patches):
+            parts = [p[1][0] for p in component_patches]
+            device, store_dtype = parts[0].device, parts[0].dtype
+            parts = [part if part.device == device else part.to(device)
+                     for part in parts]
+            out = torch.cat(parts, dim=0)
+            if store_dtype not in (torch.float32, torch.float64):
+                out = out.to(store_dtype)
+            return ("diff", (out,))
+
+        if all(isinstance(p, LoRAAdapter) for p in component_patches):
+            data = [p.weights for p in component_patches]
+            # Mid/DoRA/reshape adapters need their general expansion semantics.
+            plain = all(len(w) >= 6 and w[3] is None and w[4] is None and w[5] is None
+                        and isinstance(w[0], torch.Tensor)
+                        and isinstance(w[1], torch.Tensor)
+                        and w[0].dim() == 2 and w[1].dim() == 2
+                        for w in data)
+            if plain:
+                device = data[0][0].device
+                downs = [w[1] if w[1].device == device else w[1].to(device)
+                         for w in data]
+                ups = [w[0] if w[0].device == device else w[0].to(device)
+                       for w in data]
+                scales = [
+                    ((float(w[2].item()) if isinstance(w[2], torch.Tensor) else float(w[2]))
+                     / w[1].shape[0]) if w[2] is not None else 1.0
+                    for w in data
+                ]
+                same_down = all(
+                    down.shape == downs[0].shape
+                    and (down is downs[0] or torch.equal(down, downs[0]))
+                    for down in downs[1:])
+                if same_down:
+                    # Common A/down: preserve the original rank. Fold each
+                    # component's alpha/rank into its B/up and emit scale 1.
+                    up = torch.cat([
+                        u.float() * scale for u, scale in zip(ups, scales)
+                    ], dim=0)
+                    down = downs[0].float()
+                    rank = down.shape[0]
+                    return LoRAAdapter(
+                        set(), (up, down, float(rank), None, None, None))
+
+                # Independent A matrices: exact rank-sum representation using
+                # block-diagonal B. This is far smaller than expanding H3's
+                # 21,504 x 5,376 fused dense diff.
+                ranks = [down.shape[0] for down in downs]
+                out_rows = [up.shape[0] for up in ups]
+                total_rank = sum(ranks)
+                fused_up = torch.zeros(
+                    (sum(out_rows), total_rank), device=device, dtype=torch.float32)
+                row = col = 0
+                for up, scale, rows, rank in zip(ups, scales, out_rows, ranks):
+                    fused_up[row:row + rows, col:col + rank] = up.float() * scale
+                    row += rows
+                    col += rank
+                fused_down = torch.cat([down.float() for down in downs], dim=0)
+                return LoRAAdapter(
+                    set(), (fused_up, fused_down, float(total_rank), None, None, None))
+
+        if any(hasattr(p, "weights")
+               or (isinstance(p, tuple) and p and p[0] == "diff")
+               for p in component_patches):
+            parts = [_LoRAMergeBase._expand_patch_to_diff(p)
+                     for p in component_patches]
+            device, store_dtype = parts[0].device, parts[0].dtype
+            parts = [part if part.device == device else part.to(device)
+                     for part in parts]
+            out = torch.cat(parts, dim=0)
+            if store_dtype not in (torch.float32, torch.float64):
+                out = out.to(store_dtype)
+            return ("diff", (out,))
+        return None
+
+    @classmethod
+    def _refuse_fused_qkv_patches(cls, patches):
+        """Re-fuse Z-Image/H3 component patches to native QKV targets.
+
+        Z-Image may surface component names as strings. MiniMax H3 uses
+        Comfy-style ``(target, offset)`` slice keys added by this optimizer.
+        Returning native fused keys keeps both model application and standalone
+        Save Merged LoRA output compatible with stock ComfyUI.
         """
         fused = {}
-        qkv_groups = {}  # base -> {comp: (key, patch)}
+        named_groups = {}   # base -> {q|k|v: (key, patch)}
+        offset_groups = {}  # native target -> {start: (key, patch, length)}
+        native_qkv_re = re.compile(
+            r'(?:layers\.\d+\.attention\.qkv|'
+            r'(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj)$')
 
         for key, patch in patches.items():
-            # Handle both string keys and tuple keys
-            if isinstance(key, tuple):
-                key_str = key[0]
-            else:
-                key_str = key
+            key_str = key[0] if isinstance(key, tuple) else key
 
-            # Detect to_q/to_k/to_v patterns in the key
-            m = re.search(r'(layers\.\d+\.attention)\.to_(q|k|v)(?:\.|$)', key_str)
-            if m:
-                base = m.group(1)
-                comp = m.group(2)
-                if base not in qkv_groups:
-                    qkv_groups[base] = {}
-                qkv_groups[base][comp] = (key, patch)
+            if (isinstance(key, tuple) and len(key) > 1
+                    and isinstance(key[1], tuple) and len(key[1]) >= 3
+                    and isinstance(key_str, str) and native_qkv_re.search(key_str)):
+                offset = key[1]
+                if offset[0] == 0:
+                    offset_groups.setdefault(key_str, {})[offset[1]] = (
+                        key, patch, offset[2])
+                    continue
+
+            match = re.search(
+                r'(layers\.\d+\.attention)\.to_(q|k|v)(?:\.|$)', key_str)
+            if match:
+                named_groups.setdefault(match.group(1), {})[match.group(2)] = (
+                    key, patch)
                 continue
 
-            # Detect to_out.0 -> out remap
-            m_out = re.search(r'(layers\.\d+\.attention)\.to_out\.0(?:\.|$)', key_str)
-            if m_out:
+            match_out = re.search(
+                r'(layers\.\d+\.attention)\.to_out\.0(?:\.|$)', key_str)
+            if match_out:
                 new_key_str = key_str.replace('.to_out.0', '.out')
-                if isinstance(key, tuple):
-                    new_key = (new_key_str,) + key[1:]
-                else:
-                    new_key = new_key_str
+                new_key = ((new_key_str,) + key[1:]
+                           if isinstance(key, tuple) else new_key_str)
                 fused[new_key] = patch
                 continue
-
-            # Not a QKV or out key — pass through
             fused[key] = patch
 
-        # Fuse QKV groups
-        for base, comps in qkv_groups.items():
-            if len(comps) == 3 and 'q' in comps and 'k' in comps and 'v' in comps:
-                # All three components present — fuse
-                q_key, q_patch = comps['q']
-                k_key, k_patch = comps['k']
-                v_key, v_patch = comps['v']
+        for base, components in named_groups.items():
+            if all(component in components for component in ('q', 'k', 'v')):
+                entries = [components[c] for c in ('q', 'k', 'v')]
+                combined = cls._fuse_qkv_component_patches([p for _, p in entries])
+                if combined is not None:
+                    q_key = entries[0][0]
+                    q_key_str = q_key[0] if isinstance(q_key, tuple) else q_key
+                    fused_key_str = re.sub(r'\.to_q(?=\.|$)', '.qkv', q_key_str)
+                    fused_key = ((fused_key_str,) + q_key[1:]
+                                 if isinstance(q_key, tuple) else fused_key_str)
+                    fused[fused_key] = combined
+                    continue
+            for key, patch in components.values():
+                fused[key] = patch
 
-                # Build the fused key name
-                if isinstance(q_key, tuple):
-                    fused_key_str = re.sub(r'\.to_q(?=\.|$)', '.qkv', q_key[0])
-                    fused_key = (fused_key_str,) + q_key[1:]
-                else:
-                    fused_key_str = re.sub(r'\.to_q(?=\.|$)', '.qkv', q_key)
-                    fused_key = fused_key_str
-
-                # Handle different patch formats
-                if all(isinstance(p, tuple) and p[0] == "diff" for p in [q_patch, k_patch, v_patch]):
-                    # Full-rank diff patch: ("diff", (tensor,))
-                    q_diff = q_patch[1][0]
-                    k_diff = k_patch[1][0]
-                    v_diff = v_patch[1][0]
-                    store_dtype = q_diff.dtype
-                    # Components can sit on different devices (GPU-deferred
-                    # score-during-merge patches next to CPU ones) — unify
-                    if k_diff.device != q_diff.device:
-                        k_diff = k_diff.to(q_diff.device)
-                    if v_diff.device != q_diff.device:
-                        v_diff = v_diff.to(q_diff.device)
-                    fused_diff = torch.cat([q_diff, k_diff, v_diff], dim=0)
-                    if store_dtype not in (torch.float32, torch.float64):
-                        fused_diff = fused_diff.to(store_dtype)
-                    fused[fused_key] = ("diff", (fused_diff,))
-                elif all(isinstance(p, LoRAAdapter) for p in [q_patch, k_patch, v_patch]):
-                    q_data = q_patch.weights
-                    k_data = k_patch.weights
-                    v_data = v_patch.weights
-                    # weights = (mat_up, mat_down, alpha, mid, dora_scale, reshape)
-
-                    # Check if down matrices are shared (true for original LoRA,
-                    # false for independently SVD-compressed patches)
-                    if q_data[1] is k_data[1] and k_data[1] is v_data[1]:
-                        # Shared down: concatenate ups, keep one down copy
-                        fused_up = torch.cat([q_data[0], k_data[0], v_data[0]], dim=0)
-                        fused_down = q_data[1]
-                        fused_alpha = q_data[2]
-                        fused_patch = LoRAAdapter(set(), (fused_up, fused_down, fused_alpha, None, None, None))
-                        fused[fused_key] = fused_patch
-                    else:
-                        # Independent decompositions (e.g., SVD-compressed) —
-                        # expand to full-rank diffs, then fuse as a single diff patch
-                        parts = []
-                        store_dtype = q_data[0].dtype
-                        for comp_data in [q_data, k_data, v_data]:
-                            alpha = comp_data[2] if comp_data[2] is not None else float(comp_data[1].shape[0])
-                            rank = comp_data[1].shape[0]
-                            diff = torch.mm(comp_data[0].float(), comp_data[1].float()) * (alpha / rank)
-                            parts.append(diff)
-                        fused_diff = torch.cat(parts, dim=0)
-                        if store_dtype not in (torch.float32, torch.float64):
-                            fused_diff = fused_diff.to(store_dtype)
-                        fused[fused_key] = ("diff", (fused_diff,))
-                elif any(hasattr(p, "weights") for p in [q_patch, k_patch, v_patch]):
-                    store_dtype = torch.float16
-                    for candidate in [q_patch, k_patch, v_patch]:
-                        if hasattr(candidate, "weights") and candidate.weights[0] is not None:
-                            dtype = candidate.weights[0].dtype
-                            if dtype not in (torch.float32, torch.float64):
-                                store_dtype = dtype
-                                break
-                    parts = [_LoRAMergeBase._expand_patch_to_diff(comp_patch) for comp_patch in [q_patch, k_patch, v_patch]]
-                    # Unify devices (GPU-deferred diffs can mix with CPU adapters)
-                    parts = [p if p.device == parts[0].device else p.to(parts[0].device)
-                             for p in parts]
-                    fused_diff = torch.cat(parts, dim=0)
-                    if store_dtype not in (torch.float32, torch.float64):
-                        fused_diff = fused_diff.to(store_dtype)
-                    fused[fused_key] = ("diff", (fused_diff,))
-                else:
-                    # Unknown patch format — pass through unfused
-                    for comp_key, comp_patch in [(q_key, q_patch), (k_key, k_patch), (v_key, v_patch)]:
-                        fused[comp_key] = comp_patch
-            else:
-                # Incomplete QKV group — pass through individual components
-                for comp, (comp_key, comp_patch) in comps.items():
-                    fused[comp_key] = comp_patch
+        for target, pieces in offset_groups.items():
+            ordered = sorted(pieces.items())
+            complete = (len(ordered) == 3 and ordered[0][0] == 0
+                        and all(ordered[i][0] + ordered[i][1][2] == ordered[i + 1][0]
+                                for i in range(2)))
+            combined = (cls._fuse_qkv_component_patches(
+                [entry[1][1] for entry in ordered]) if complete else None)
+            if combined is None:
+                for _start, (key, patch, _length) in ordered:
+                    fused[key] = patch
+                continue
+            if target in fused:
+                # Rare mixed exotic/native case: accumulate both contributions.
+                existing = cls._expand_patch_to_diff(fused[target])
+                addition = cls._expand_patch_to_diff(combined)
+                if addition.device != existing.device:
+                    addition = addition.to(existing.device)
+                combined = ("diff", (existing + addition,))
+            fused[target] = combined
 
         return fused
 
@@ -2170,7 +2404,43 @@ class _LoRAMergeBase:
         """Get LoRA prefix → target key mapping for the model."""
         if model is None:
             return {}
-        return comfy.lora.model_lora_keys_unet(model.model, {})
+        model_keys = comfy.lora.model_lora_keys_unet(model.model, {})
+        # ComfyUI exposes native H3 qkv_proj keys but (unlike Z-Image) does not
+        # currently publish split Diffusers aliases for them. Add tuple-offset
+        # targets so normalized to_q/to_k/to_v components address the correct
+        # rows of the fused weight without materializing a rank-3r block
+        # diagonal adapter.
+        try:
+            state_dict = model.model.state_dict()
+        except Exception:
+            state_dict = {}
+        self._add_minimax_h3_qkv_aliases(model_keys, state_dict)
+        return model_keys
+
+    @staticmethod
+    def _add_minimax_h3_qkv_aliases(model_keys, state_dict):
+        """Add canonical split-QKV aliases for native MiniMax H3 weights.
+
+        Mutates and returns ``model_keys``. Kept as a pure mapping helper so
+        offset correctness can be unit-tested without a live ComfyUI model.
+        """
+        target_re = re.compile(
+            r'^diffusion_model\.(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj$')
+        targets = {
+            target for target in model_keys.values()
+            if isinstance(target, str) and target_re.match(target)
+        }
+        for target in targets:
+            weight = state_dict.get(target)
+            shape = getattr(weight, 'shape', None)
+            if shape is None or len(shape) < 1 or shape[0] % 3:
+                continue
+            rows = shape[0] // 3
+            base = target[:-len('qkv_proj')]
+            for index, component in enumerate(('to_q', 'to_k', 'to_v')):
+                model_keys[base + component] = (
+                    target, (0, index * rows, rows))
+        return model_keys
 
     @staticmethod
     def _payload_rank(payload):
@@ -2576,10 +2846,11 @@ class _LoRAMergeBase:
 
     @staticmethod
     def _target_is_audio(target_group):
-        """True if this target group is an audio layer (LTX-2 / ACE-Step style).
+        """True if this target group is an audio layer (LTX-2 / H3 / ACE-Step style).
 
         Heuristic: the substring 'audio' appears in the LoRA prefix or the resolved
-        model key. Covers LTX-2's audio_embeddings_connector, audio_adaln_single,
+        model key. Covers LTX-2/MiniMax-H3's audio projections and LTX-2's
+        audio_embeddings_connector, audio_adaln_single,
         audio_patchify_proj, audio_proj_out, av_ca_audio_* and the per-block audio
         sublayers. Used by the `audio_only` / `no_audio` key_filter modes.
         """
@@ -5843,7 +6114,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 "architecture_preset": (["auto", "sd_unet", "dit", "acestep_dit", "llm"], {
                     "default": "auto",
                     "tooltip": "Architecture-aware threshold tuning. 'auto' detects from LoRA keys. "
-                               "'sd_unet': SD/SDXL UNet defaults. 'dit': DiT models (Flux, WAN, Z-Image, LTX, HunyuanVideo) "
+                               "'sd_unet': SD/SDXL UNet defaults. 'dit': DiT models (Flux, WAN, Z-Image, LTX, MiniMax H3, HunyuanVideo) "
                                "with higher density floors and wider strength range. "
                                "'acestep_dit': ACE-Step music DiT — tuned for voice preservation with wider orthogonal band "
                                "and conservative TIES threshold. 'llm': LLM-based models (Qwen, LLaMA)."
@@ -6978,7 +7249,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         keeps the whole group on the dense path (returns False). A group with no
         virtual contributor returns True — the file path is left untouched."""
         target_key = target_group["target_key"]
-        # Offset/sliced targets (e.g. Z-Image QKV refusion) reshape the dense
+        # Offset/sliced targets (e.g. Z-Image/H3 QKV refusion) reshape the dense
         # diff to a slice; the low-rank concat can't reproduce that. Keep dense.
         if isinstance(target_key, tuple):
             return False
@@ -7422,6 +7693,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     'sdxl': 'SDXL',
                     'sd15': 'SD 1.5',
                     'ltx': 'LTX Video',
+                    'minimax_h3': 'MiniMax H3',
                     'qwen_image': 'Qwen-Image',
                     'anima': 'Anima (Cosmos-Predict2 DiT)',
                     'krea2': 'Krea 2',
@@ -7438,6 +7710,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 'acestep': 'ACE-Step',
                 'sdxl': 'SDXL',
                 'ltx': 'LTX Video',
+                'minimax_h3': 'MiniMax H3',
                 'qwen_image': 'Qwen-Image',
                 'anima': 'Anima (Cosmos-Predict2 DiT)',
             }
@@ -7914,15 +8187,15 @@ class LoRAOptimizer(_LoRAMergeBase):
         # Single LoRA: skip analysis, apply directly via ComfyUI's standard
         # additive LoRA application (faster than diff-based pipeline).
         # auto_strength is a no-op with a single LoRA (scale would be 1.0).
-        # Skip fast path for Z-Image: normalized keys (to_q/to_k/to_v) won't
-        # match the model's fused qkv keys — need full pipeline + re-fusion.
+        # Skip fast path for fused-QKV architectures: normalized
+        # to_q/to_k/to_v keys need the optimizer's slice-target mapping.
         # Skip for virtual items (_precomputed_diffs): their lora dict maps
         # MODEL-TARGET keys to adapters/diffs, not trainer-format keys, so
         # comfy.sd.load_lora_for_models would resolve nothing and silently
         # apply NO LoRA at all (fatal for the inline node, which has already
         # stripped the originals off the model).
         if (len(active_loras) == 1
-                and getattr(self, '_detected_arch', None) != 'zimage'
+                and getattr(self, '_detected_arch', None) not in ('zimage', 'minimax_h3')
                 and not active_loras[0].get("_precomputed_diffs")):
             item = active_loras[0]
             lora_dict = item["lora"]
@@ -8959,13 +9232,16 @@ class LoRAOptimizer(_LoRAMergeBase):
             # sweep instead.
             torch.cuda.empty_cache()
 
-        # Re-fuse Z-Image QKV patches if architecture normalization was used
-        # Skip in sub-merges: virtual LoRA patches must stay unfused so the
-        # outer merge can pair them with other LoRAs' unfused keys.
-        if getattr(self, '_detected_arch', None) == 'zimage' and not _skip_qkv_refusion:
+        # Re-fuse sliced QKV patches if architecture normalization was used.
+        # Skip in sub-merges: virtual LoRA patches must stay split so the outer
+        # merge can pair them with other LoRAs' component keys.
+        if (getattr(self, '_detected_arch', None) in ('zimage', 'minimax_h3')
+                and not _skip_qkv_refusion):
             if len(model_patches) > 0:
-                model_patches = self._refuse_zimage_patches(model_patches)
-                logging.info(f"[LoRA Optimizer] Re-fused Z-Image QKV patches ({len(model_patches)} model patches)")
+                model_patches = self._refuse_fused_qkv_patches(model_patches)
+                logging.info(
+                    f"[LoRA Optimizer] Re-fused {self._detected_arch} QKV patches "
+                    f"({len(model_patches)} model patches)")
 
         # Score-during-merge: deferred QKV components were fused on the GPU —
         # measure the fused tensors there, then move them off-GPU. Patches the
@@ -8998,6 +9274,19 @@ class LoRAOptimizer(_LoRAMergeBase):
             }
             reverse_key_map[target_key] = entry
             reverse_key_map[tkey] = entry
+        # QKV slice groups were re-fused above. Override the base-target
+        # fallback with the native module name so Save Merged LoRA emits a
+        # stock-Comfy-loadable qkv/qkv_proj adapter rather than whichever
+        # component happened to populate the fallback last.
+        native_qkv_re = re.compile(
+            r'(?:layers\.\d+\.attention\.qkv|'
+            r'(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj)$')
+        for target_key in model_patches:
+            if isinstance(target_key, str) and native_qkv_re.search(target_key):
+                reverse_key_map[target_key] = {
+                    "canonical_prefix": target_key,
+                    "aliases": [target_key],
+                }
 
         # Apply patches
         new_model = model
@@ -9145,7 +9434,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         # Final merge: restore original cache_patches setting (sub-merges use "disabled")
         final_kwargs = dict(kwargs)
         final_kwargs["cache_patches"] = _orig_cache_patches
-        final_kwargs["_skip_qkv_refusion"] = False  # final merge must re-fuse QKV for Z-Image
+        final_kwargs["_skip_qkv_refusion"] = False  # final merge must re-fuse sliced QKV
         result = self.optimize_merge(model, final_stack, output_strength, clip=clip, **final_kwargs)
 
         # Prepend sub-reports to the final report
@@ -9881,7 +10170,7 @@ class LoRAInlineChainOptions:
                            f"'all': contribute all keys (default). "
                            f"'shared_only': only keys present in 2+ LoRAs. "
                            f"'unique_only': only keys present in exactly 1 LoRA. "
-                           f"'audio_only': only audio layers (LTX-2 / ACE-Step). "
+                           f"'audio_only': only audio layers (LTX-2 / MiniMax H3 / ACE-Step). "
                            f"'no_audio': only non-audio (video) layers."
             })
             inputs["required"][f"preserve_{i}"] = ("BOOLEAN", {

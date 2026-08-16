@@ -124,10 +124,10 @@ Different LoRA trainers name their weights differently. Kohya uses underscores (
 
 Key normalization solves this by:
 
-1. **Detecting the model architecture** from LoRA key patterns (FLUX, SDXL, Wan, Z-Image, LTX, Qwen)
+1. **Detecting the model architecture** from LoRA key patterns (FLUX, SDXL, Wan, Z-Image, MiniMax H3, LTX, Qwen, and others)
 2. **Remapping all keys** to a canonical format so LoRAs from any trainer can be compared
 
-### Special Case: Z-Image QKV Fusion
+### Special Case: Fused QKV (Z-Image and MiniMax H3)
 
 Z-Image LoRAs often fuse Q, K, and V projections into a single `attention.qkv` weight. The normalizer:
 1. Detects fused QKV (lora_up shape = `[3×out_features, rank]`)
@@ -136,6 +136,8 @@ Z-Image LoRAs often fuse Q, K, and V projections into a single `attention.qkv` w
 4. **Re-fuses** back to native `attention.qkv` format after merging
 
 This splitting is critical — Q, K, and V weights serve different purposes. Two LoRAs might agree on Q weights but conflict on V weights. Without splitting, the optimizer would average their conflicts and get a suboptimal result for both.
+
+MiniMax H3 uses the same fused-QKV idea under `blocks.N.attn.qkv_proj`, including its text-token refiner. Native/reference and ai-toolkit adapters are split for analysis, while Diffusers/PEFT split-QKV adapters normalize to the same component names. The merged components target exact row slices of ComfyUI's fused weight. H3 normalization also corrects the reversed Diffusers/native SwiGLU halves in `ff.net.0.proj` / `mlp.fc1`.
 
 ### Special Case: WanVideo `_orig_mod` Keys
 
@@ -288,7 +290,7 @@ Different model architectures have different numerical characteristics. The arch
 | Preset | Architectures | Density Range | Noise Floor | Max Strength Cap |
 |--------|--------------|---------------|-------------|-----------------|
 | `sd_unet` | SD 1.5, SDXL | 0.1 – 0.9 | 10% | 3.0 |
-| `dit` | Flux, Wan, Z-Image, LTX, Ideogram 4, Anima, HunyuanVideo | 0.4 – 0.95 | 5% | 5.0 |
+| `dit` | Flux, Wan, Z-Image, LTX, MiniMax H3, Ideogram 4, Anima, HunyuanVideo | 0.4 – 0.95 | 5% | 5.0 |
 | `acestep_dit` | ACE-Step (music DiT) | 0.4 – 0.95 | 5% | 5.0 |
 | `llm` | Qwen, LLaMA | 0.1 – 0.8 | 15% | 3.0 |
 | `auto` (default) | Auto-detected from LoRA keys | Selected automatically | — | — |
@@ -922,6 +924,7 @@ Bridges `LORA_DATA` to a `WANVIDEOMODEL`. Handles the `_orig_mod.` key mismatch 
 | **SD 1.5** | `lora_te_`, `input_blocks`/`down_blocks` | Text encoder + UNet unified |
 | **SDXL** | `lora_te1_`, `input_blocks` | Text encoder + UNet unified |
 | **Z-Image** (Lumina2) | `diffusion_model.layers.N.attention` | Fused QKV split/re-fuse, Musubi Tuner format |
+| **MiniMax H3** | `blocks.N.attn.qkv_proj`, `token_refiner.blocks`, Diffusers `transformer_blocks` | Native/reference, ai-toolkit, PEFT, Diffusers/LightX2V, and Musubi unified; fused QKV slice routing; SwiGLU row correction; joint audio keys |
 | **Ideogram 4** (NextDiT) | `layers.N.attention.qkv`/`attention.o`, fal `conditional_transformer.` prefix | ai-toolkit / fal / PEFT prefixes unified; qkv stays fused (detected **before** Z-Image) |
 | **Wan** 2.1/2.2 | `blocks.N` with `self_attn`/`ffn` | LyCORIS / diffusers / Musubi / Fun LoRA / finetrainer unified, RS-LoRA alpha fix |
 | **ACE-Step** v1.0/v1.5 | `layers.N` with `self_attn`/`cross_attn` + `q_proj`/`k_proj`/`v_proj` | Attention key unification, music-DiT preset |

@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-lora-optimizer"
 description = "Auto-optimizer node for combining multiple LoRAs via diff-based merging with TIES conflict resolution"
-version = "1.8.2"
+version = "1.8.3"
 license = { text = "GPL-3.0-only" }
 dependencies = [
     "scikit-learn>=1.3",

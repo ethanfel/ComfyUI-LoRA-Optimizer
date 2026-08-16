@@ -3278,6 +3278,183 @@ class TestIdeogram4Support(unittest.TestCase):
 
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
+class TestMiniMaxH3Support(unittest.TestCase):
+    """MiniMax H3 detection, multi-trainer normalization, and fused-QKV
+    slice routing for native ComfyUI models."""
+
+    @staticmethod
+    def _detect(sd):
+        return lora_optimizer._LoRAMergeBase._detect_architecture(sd)
+
+    @staticmethod
+    def _zeros(keys):
+        return {key: torch.zeros(1) for key in keys}
+
+    def test_native_reference_qkv_detected(self):
+        sd = self._zeros([
+            "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight",
+            "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight",
+        ])
+        self.assertEqual(self._detect(sd), "minimax_h3")
+
+    def test_bare_turbo_and_musubi_formats_detected(self):
+        bare = self._zeros([
+            "blocks.12.mlp.fc1.lora_A.weight",
+            "blocks.12.mlp.fc1.lora_B.weight",
+        ])
+        musubi = self._zeros([
+            "lora_unet_blocks_4_attn_qkv_proj.lora_down.weight",
+            "lora_unet_blocks_4_attn_qkv_proj.lora_up.weight",
+        ])
+        self.assertEqual(self._detect(bare), "minimax_h3")
+        self.assertEqual(self._detect(musubi), "minimax_h3")
+
+    def test_diffusers_and_refiner_formats_detected_before_acestep(self):
+        diffusers = self._zeros([
+            "transformer.transformer_blocks.3.attn.to_q.lora_A.weight",
+            "transformer.transformer_blocks.3.ff.net.0.proj.lora_B.weight",
+        ])
+        refiner = self._zeros([
+            "base_model.model.token_refiner.refiner_blocks.1.attn.to_v.lora_A.weight",
+        ])
+        self.assertEqual(self._detect(diffusers), "minimax_h3")
+        self.assertEqual(self._detect(refiner), "minimax_h3")
+
+    def test_attention_only_diffusers_uses_h3_dimensions(self):
+        h3 = {
+            "transformer_blocks.0.attn.to_q.lora_A.weight": torch.zeros(2, 5376),
+            "transformer_blocks.0.attn.to_q.lora_B.weight": torch.zeros(7168, 2),
+        }
+        ace = {
+            "transformer_blocks.0.attn.to_q.lora_A.weight": torch.zeros(2, 64),
+            "transformer_blocks.0.attn.to_q.lora_B.weight": torch.zeros(64, 2),
+        }
+        self.assertEqual(self._detect(h3), "minimax_h3")
+        self.assertEqual(self._detect(ace), "acestep")
+
+    def test_ltx2_audio_output_is_not_claimed_as_h3(self):
+        ltx = self._zeros([
+            "diffusion_model.audio_proj_out.lora_A.weight",
+            "diffusion_model.transformer_blocks.0.audio_adaln_single.lora_B.weight",
+        ])
+        self.assertEqual(self._detect(ltx), "ltx")
+
+    def test_native_fused_qkv_splits_without_rank_inflation(self):
+        down = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        up = torch.arange(36, dtype=torch.float32).reshape(18, 2)
+        alpha = torch.tensor(2.0)
+        sd = {
+            "blocks.0.attn.qkv_proj.lora_A.weight": down,
+            "blocks.0.attn.qkv_proj.lora_B.weight": up,
+            "blocks.0.attn.qkv_proj.alpha": alpha,
+        }
+        out = lora_optimizer._LoRAMergeBase._normalize_keys_minimax_h3(sd)
+        for index, component in enumerate(("to_q", "to_k", "to_v")):
+            base = f"diffusion_model.blocks.0.attn.{component}"
+            self.assertIs(out[f"{base}.lora_A.weight"], down)
+            self.assertTrue(torch.equal(
+                out[f"{base}.lora_B.weight"], up[index * 6:(index + 1) * 6]))
+            self.assertIs(out[f"{base}.alpha"], alpha)
+        self.assertNotIn("diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight", out)
+
+    def test_musubi_unflattens_compound_module_names(self):
+        sd = self._zeros([
+            "lora_unet_blocks_12_attn_out_proj.lora_down.weight",
+            "lora_unet_blocks_12_mlp_fc2.lora_up.weight",
+            "lora_unet_token_refiner_blocks_1_mlp_fc1.alpha",
+            "lora_unet_final_layer_audio_out.lora_A.weight",
+        ])
+        out = lora_optimizer._LoRAMergeBase._normalize_keys_minimax_h3(sd)
+        self.assertIn("diffusion_model.blocks.12.attn.out_proj.lora_down.weight", out)
+        self.assertIn("diffusion_model.blocks.12.mlp.fc2.lora_up.weight", out)
+        self.assertIn("diffusion_model.token_refiner.blocks.1.mlp.fc1.alpha", out)
+        self.assertIn("diffusion_model.final_layer.audio_out.lora_A.weight", out)
+
+    def test_diffusers_names_map_to_native_and_swap_swiglu_up_rows(self):
+        fc1_down = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        fc1_up = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+        sd = {
+            "base_model.model.transformer_blocks.2.attn.to_out.0.lora_A.weight": torch.zeros(2, 4),
+            "base_model.model.transformer_blocks.2.ff.net.0.proj.lora_A.weight": fc1_down,
+            "base_model.model.transformer_blocks.2.ff.net.0.proj.lora_B.weight": fc1_up,
+            "transformer.token_refiner.refiner_blocks.1.attn.to_q.lora_A.default.weight": torch.zeros(2, 4),
+            "transformer.audio_proj_in.lora_B.weight": torch.zeros(4, 2),
+            "transformer.norm_out.linear.lora_A.weight": torch.zeros(2, 4),
+        }
+        out = lora_optimizer._LoRAMergeBase._normalize_keys_minimax_h3(sd)
+        self.assertIn("diffusion_model.blocks.2.attn.out_proj.lora_A.weight", out)
+        self.assertIs(out["diffusion_model.blocks.2.mlp.fc1.lora_A.weight"], fc1_down)
+        self.assertTrue(torch.equal(
+            out["diffusion_model.blocks.2.mlp.fc1.lora_B.weight"],
+            torch.cat([fc1_up[4:], fc1_up[:4]], dim=0)))
+        self.assertIn("diffusion_model.token_refiner.blocks.1.attn.to_q.lora_A.weight", out)
+        self.assertIn("diffusion_model.audio_patch_proj.lora_B.weight", out)
+        self.assertIn("diffusion_model.final_layer.adaln_proj.linear.lora_A.weight", out)
+
+    def test_native_qkv_aliases_target_exact_fused_slices(self):
+        target = "diffusion_model.blocks.0.attn.qkv_proj"
+        model_keys = {target: target}
+        state_dict = {target: torch.zeros(21, 5)}
+        out = lora_optimizer._LoRAMergeBase._add_minimax_h3_qkv_aliases(
+            model_keys, state_dict)
+        self.assertEqual(out["diffusion_model.blocks.0.attn.to_q"],
+                         (target, (0, 0, 7)))
+        self.assertEqual(out["diffusion_model.blocks.0.attn.to_k"],
+                         (target, (0, 7, 7)))
+        self.assertEqual(out["diffusion_model.blocks.0.attn.to_v"],
+                         (target, (0, 14, 7)))
+
+    def test_offset_qkv_patches_refuse_to_stock_comfy_native_key(self):
+        target = "diffusion_model.blocks.0.attn.qkv_proj"
+        down = torch.randn(2, 5)
+        ups = [torch.randn(7, 2) for _ in range(3)]
+        patches = {
+            (target, (0, index * 7, 7)): lora_optimizer.LoRAAdapter(
+                set(), (up, down.clone(), 2.0, None, None, None))
+            for index, up in enumerate(ups)
+        }
+        out = lora_optimizer._LoRAMergeBase._refuse_fused_qkv_patches(patches)
+        self.assertEqual(set(out), {target})
+        fused_diff = lora_optimizer._LoRAMergeBase._expand_patch_to_diff(out[target])
+        expected = torch.cat([up @ down for up in ups], dim=0)
+        self.assertTrue(torch.allclose(fused_diff, expected, atol=1e-6))
+
+    def test_independent_component_factors_refuse_exactly_at_rank_sum(self):
+        target = "diffusion_model.token_refiner.blocks.1.attn.qkv_proj"
+        downs = [torch.randn(2, 5) for _ in range(3)]
+        ups = [torch.randn(7, 2) for _ in range(3)]
+        patches = {
+            (target, (0, index * 7, 7)): lora_optimizer.LoRAAdapter(
+                set(), (ups[index], downs[index], 1.0 + index, None, None, None))
+            for index in range(3)
+        }
+        out = lora_optimizer._LoRAMergeBase._refuse_fused_qkv_patches(patches)
+        fused = out[target]
+        self.assertIsInstance(fused, lora_optimizer.LoRAAdapter)
+        self.assertEqual(fused.weights[1].shape[0], 6)
+        fused_diff = lora_optimizer._LoRAMergeBase._expand_patch_to_diff(fused)
+        expected = torch.cat([
+            ups[i] @ downs[i] * ((1.0 + i) / 2.0) for i in range(3)
+        ], dim=0)
+        self.assertTrue(torch.allclose(fused_diff, expected, atol=1e-6))
+
+    def test_dispatch_preset_video_floor_and_model_class_hint(self):
+        sd = {"blocks.0.mlp.fc2.lora_A.weight": torch.zeros(1)}
+        out = lora_optimizer._LoRAMergeBase._normalize_keys(sd, "minimax_h3")
+        self.assertIn("diffusion_model.blocks.0.mlp.fc2.lora_A.weight", out)
+        preset_key, _ = lora_optimizer._resolve_arch_preset("auto", "minimax_h3")
+        self.assertEqual(preset_key, "dit")
+        self.assertEqual(lora_optimizer._VIDEO_ARCH_ORTHOGONAL_FLOOR["minimax_h3"], 1.0)
+
+        MiniMaxH3 = type("MiniMaxH3", (), {})
+        wrapper = type("ModelPatcher", (), {})()
+        wrapper.model = MiniMaxH3()
+        self.assertEqual(
+            lora_optimizer._LoRAMergeBase._model_class_arch(wrapper),
+            "minimax_h3")
+
+
+@unittest.skipIf(torch is None, "torch is not installed in this environment")
 class TestAceStepDetection(unittest.TestCase):
     """Test _detect_architecture for ACE-Step v1.0 and v1.5 key patterns."""
 

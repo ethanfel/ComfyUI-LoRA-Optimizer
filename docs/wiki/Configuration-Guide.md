@@ -55,7 +55,7 @@ Tunes numeric thresholds (density ranges, noise floors, strength caps) to match 
 |-------|--------|--------|
 | `auto` (default) | Auto-detected | Picks the right preset from LoRA key patterns |
 | `sd_unet` | SD 1.5, SDXL | Lower density floor (0.1), 10% noise floor, max strength 3.0 |
-| `dit` | Flux, Wan, Z-Image, LTX, Ideogram 4, HunyuanVideo | Higher density floor (0.4), 5% noise floor, max strength 5.0 |
+| `dit` | Flux, Wan, Z-Image, LTX, MiniMax H3, Ideogram 4, HunyuanVideo | Higher density floor (0.4), 5% noise floor, max strength 5.0 |
 | `acestep_dit` | ACE-Step (music DiT) | DiT thresholds tuned for music LoRAs — wider orthogonal band + higher TIES threshold to preserve voice |
 | `llm` | Qwen, LLaMA | Tight density range (0.1–0.8), 15% noise floor, max strength 3.0 |
 
@@ -204,10 +204,10 @@ Auto-detects model architecture and remaps LoRA keys to a canonical format, enab
 | When to Enable | When to Leave Disabled |
 |---------------|----------------------|
 | Mixing LoRAs from different trainers | All LoRAs from the same trainer |
-| Using Z-Image LoRAs with fused QKV | Single-trainer workflows |
+| Using Z-Image or MiniMax H3 LoRAs with fused QKV | Single-trainer workflows |
 | WanVideo LoRAs (enabled by default on WanVideo Optimizer) | When auto-detection picks the wrong architecture |
 
-Supported architectures: FLUX, SDXL, Z-Image (Lumina2), Wan 2.1/2.2, LTX Video, Qwen-Image.
+Supported architectures include FLUX, SDXL, Z-Image (Lumina2), MiniMax H3, Wan 2.1/2.2, LTX Video, Qwen-Image, ACE-Step, Ideogram 4, Anima, and Krea 2.
 
 ---
 

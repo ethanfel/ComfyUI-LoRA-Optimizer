@@ -208,7 +208,7 @@ All strengths are uniformly scaled: sᵢ' = sᵢ · scale.
 - *Orthogonal* (cos θ ≈ 0): cross-terms near zero, E² ≈ Σ sᵢ² nᵢ, moderate reduction.
 - *Opposing* (cos θ ≈ −1): cross-terms are large and negative, E² shrinks, scale approaches or reaches 1.0 (minimal reduction, capped to prevent amplification).
 
-**Orthogonal floor.** For orthogonal LoRAs, the reduction factor 1/√N can be too aggressive for video generation architectures where each LoRA contributes independent effects. Architecture-specific floors prevent over-attenuation: 0.85 for SD/SDXL and DiT, 0.9 for LLM-based architectures, and 1.0 (no reduction) for video architectures (Wan, LTX).
+**Orthogonal floor.** For orthogonal LoRAs, the reduction factor 1/√N can be too aggressive for video generation architectures where each LoRA contributes independent effects. Architecture-specific floors prevent over-attenuation: 0.85 for SD/SDXL and DiT, 0.9 for LLM-based architectures, and 1.0 (no reduction) for video architectures (Wan, LTX, MiniMax H3).
 
 **Dual-branch computation.** Model and CLIP branches are normalized independently, since their energy profiles can differ substantially (e.g., a style LoRA may have large model updates but small CLIP updates).
 
@@ -353,9 +353,11 @@ Different LoRA training frameworks produce different key naming conventions for 
   <em>Figure 6: Key normalization maps diverse trainer-specific naming conventions to a canonical format, enabling cross-trainer LoRA composition.</em>
 </p>
 
-We auto-detect the model architecture from key patterns and remap all keys to a canonical format. The detection heuristic examines key prefixes and structural markers (e.g., presence of `double_blocks` vs. `input_blocks` vs. `layers.N`) to classify into one of seven architectures, checked in priority order: Z-Image (Lumina2), Qwen-Image (multimodal), FLUX, Wan (video), ACE-Step (audio), LTX (video), and SDXL. The priority ordering matters because some architectures share key patterns (e.g., both Qwen-Image and FLUX use `transformer_blocks`); earlier checks use discriminating markers to resolve ambiguity before later, broader patterns match.
+We auto-detect the model architecture from key patterns and remap all keys to a canonical format. The detection heuristic examines key prefixes and structural markers (e.g., presence of `double_blocks` vs. `input_blocks` vs. `layers.N`) across supported image, video, and audio model families. The priority ordering matters because some architectures share key patterns (e.g., MiniMax H3 and ACE-Step can both use Diffusers `transformer_blocks.N.attn.to_q`, while Qwen-Image and FLUX both use `transformer_blocks`); earlier checks use discriminating markers and tensor dimensions to resolve ambiguity before later, broader patterns match.
 
 **Z-Image special case.** The Z-Image/Lumina2 architecture uses fused QKV projections where query, key, and value weights are stored in a single matrix. For conflict analysis, we split the fused QKV weight [3d, r] into three separate [d, r] components (to\_q, to\_k, to\_v), compute per-component conflict metrics independently, and re-fuse after merging. This provides finer-grained conflict resolution than analyzing the fused tensor as a whole.
+
+**MiniMax H3 special case.** H3 likewise stores fused QKV projections in its main DiT and token refiner. Native/reference, ai-toolkit, Diffusers/PEFT, LightX2V, and Musubi names normalize to one component layout; component patches address exact slices of ComfyUI's fused `qkv_proj` weight and are re-fused for standalone export. Diffusers/native SwiGLU output-row order is also corrected.
 
 *Implementation:* `_detect_architecture()` (line 536), `_normalize_keys()` (line 1105).
 
@@ -378,13 +380,13 @@ All numeric thresholds in the system are organized into architecture-specific pr
 | Full-rank auto-strength floor | 1.0 | 1.0 | 1.0 |
 | Suggested max strength cap | 3.0 | 5.0 | 3.0 |
 
-**Table 2:** Architecture preset parameters (line 69). The `sd_unet` preset covers Stable Diffusion and SDXL UNet architectures. The `dit` preset covers Diffusion Transformer variants (FLUX, Wan, Z-Image, LTX, HunyuanVideo, ACE-Step). The `llm` preset covers language-model-based architectures (Qwen-Image).
+**Table 2:** Architecture preset parameters. The `sd_unet` preset covers Stable Diffusion and SDXL UNet architectures. The `dit` preset covers Diffusion Transformer variants (FLUX, Wan, Z-Image, LTX, MiniMax H3, HunyuanVideo, and others). ACE-Step uses its music-DiT specialization, while the `llm` preset covers language-model-based architectures (Qwen-Image).
 
 The key differences between presets are in density ranges: DiT architectures use higher density (less aggressive sparsification) because transformer blocks are more sensitive to parameter removal than UNet convolutions. LLM architectures use the lowest ideal density (most aggressive sparsification) reflecting the redundancy in large language model weight matrices.
 
 Architecture mapping (`_ARCH_TO_PRESET`, line 140): `sdxl`/`unknown` → `sd_unet`; `flux`/`wan`/`zimage`/`ltx`/`acestep` → `dit`; `qwen_image` → `llm`.
 
-Video architectures (Wan, LTX) additionally receive an orthogonal auto-strength floor of 1.0 (`_VIDEO_ARCH_ORTHOGONAL_FLOOR`, line 138), preventing any strength reduction for orthogonal LoRAs in video generation where independent effects should compose additively.
+Video architectures (Wan, LTX, MiniMax H3) additionally receive an orthogonal auto-strength floor of 1.0 (`_VIDEO_ARCH_ORTHOGONAL_FLOOR`), preventing any strength reduction for orthogonal LoRAs in video generation where independent effects should compose additively.
 
 ## 5. Implementation Details
 

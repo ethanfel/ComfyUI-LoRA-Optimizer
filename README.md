@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/badge/SVD_Patch-Compression-64ffda?style=flat-square" alt="SVD">
   <img src="https://img.shields.io/badge/Architecture--Aware-Key_Normalization-22c55e?style=flat-square" alt="Key Normalization">
   <img src="https://img.shields.io/badge/AutoTuner-Parameter_Sweep-e94560?style=flat-square" alt="AutoTuner">
-  <img src="https://img.shields.io/badge/Flux_%7C_SDXL_%7C_Wan_%7C_LTX_%7C_Z--Image_%7C_ACE--Step-Compatible-22c55e?style=flat-square" alt="Compatible">
+  <img src="https://img.shields.io/badge/Flux_%7C_SDXL_%7C_Wan_%7C_LTX_%7C_MiniMax_H3_%7C_Z--Image_%7C_ACE--Step-Compatible-22c55e?style=flat-square" alt="Compatible">
   <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="GPL-3.0">
 </p>
 
@@ -254,10 +254,10 @@ Each LoRA has a per-LoRA `key_filter` setting (available on both **LoRA Stack** 
 | `all` (default) | Contribute to all keys | Normal merging |
 | `shared_only` | Only contribute to keys present in 2+ LoRAs | Strip variant-specific keys (I2V/VACE) from this LoRA |
 | `unique_only` | Only contribute to keys present in exactly 1 LoRA | Extract only the variant-specific adapter keys from this LoRA |
-| `audio_only` | Only contribute audio layers | Take the sound from one LoRA on audio-video models (LTX-2, ACE-Step) |
+| `audio_only` | Only contribute audio layers | Take the sound from one LoRA on audio-video models (LTX-2, MiniMax H3, ACE-Step) |
 | `no_audio` | Only contribute non-audio (video) layers | Merge two LTX-2 LoRAs but keep just one's audio — set the others to `no_audio` |
 
-**Audio split (LTX-2 / ACE-Step):** `audio_only` / `no_audio` classify a layer as "audio" when `audio` appears in its key (covers `audio_embeddings_connector`, `audio_adaln_single`, `audio_patchify_proj`, `audio_proj_out`, `av_ca_audio_*`, and the per-block audio sublayers). So to **merge two action LoRAs but keep only the first one's sound**, set the second LoRA's `key_filter` to `no_audio`. To **combine an audio LoRA with a video LoRA**, set the audio one to `audio_only` and the video one to `no_audio` (or `all`).
+**Audio split (LTX-2 / MiniMax H3 / ACE-Step):** `audio_only` / `no_audio` classify a layer as "audio" when `audio` appears in its key (including H3's `audio_patch_proj` / `final_layer.audio_out`, plus LTX-2's `audio_embeddings_connector`, `audio_adaln_single`, `audio_patchify_proj`, `audio_proj_out`, `av_ca_audio_*`, and per-block audio sublayers). So to **merge two action LoRAs but keep only the first one's sound**, set the second LoRA's `key_filter` to `no_audio`. To **combine an audio LoRA with a video LoRA**, set the audio one to `audio_only` and the video one to `no_audio` (or `all`).
 
 This is especially useful for Wan T2V/I2V/VACE LoRAs, which share ~90% of weights but each variant has unique keys (I2V: `cross_attn.k_img/v_img`, `img_emb`; VACE: `vace_blocks.*`, `vace_patch_embedding`).
 
@@ -293,7 +293,7 @@ When orthogonal LoRAs are effectively independent, the optimizer can clamp the s
 
 | Architecture | Default floor |
 |-------------|---------------|
-| Wan / LTX Video | 1.0 |
+| Wan / LTX Video / MiniMax H3 | 1.0 |
 | SD / SDXL / Flux / Z-Image | 0.85 |
 | LLM-style presets | 0.9 |
 
@@ -347,6 +347,7 @@ Key normalization auto-detects the model architecture from LoRA key patterns and
 | Architecture | Detected From | Normalization |
 |-------------|--------------|---------------|
 | **Z-Image** (Lumina2) | `diffusion_model.layers.N.attention`, `single_transformer_blocks` | Prefix standardization, QKV split for per-component analysis, re-fuse after merge |
+| **MiniMax H3** | `blocks.N.attn.qkv_proj`, `token_refiner.blocks`, Diffusers `transformer_blocks` | Native / ai-toolkit / PEFT / Diffusers / Musubi unified; fused QKV split onto exact model slices; Diffusers SwiGLU row order corrected; joint audio keys supported |
 | **Ideogram 4** | `layers.N.attention.qkv`/`attention.o`, `feed_forward.w1-w3`, fal `conditional_transformer.` prefix | ai-toolkit / fal / PEFT prefixes unified; qkv stays fused (native ComfyUI layout) |
 | **FLUX** | `double_blocks`/`single_blocks`, `transformer.transformer_blocks` | AI-Toolkit / Kohya / diffusers unified to canonical format |
 | **Wan** 2.1/2.2 | `blocks.N` with `self_attn`/`cross_attn`/`ffn` | LyCORIS / diffusers / Musubi Tuner unified, RS-LoRA alpha fix |
@@ -356,11 +357,11 @@ Key normalization auto-detects the model architecture from LoRA key patterns and
 | **Anima** (Cosmos-Predict2 DiT) | `blocks.N.{self_attn,cross_attn}.{q,k,v,output}_proj`, `mlp.layer1/2`, unique `llm_adapter`; Kohya `lora_unet_*` / diffusers `transformer_blocks.attn1/attn2` | Kohya / diffusers / ComfyUI unified to `diffusion_model.blocks.N.*`; split QKV |
 | **Qwen-Image** | `transformer_blocks` with `img_mlp`/`txt_mlp`/`img_mod`/`txt_mod` | Dual-stream key unification |
 
-**Z-Image QKV handling:** Z-Image LoRAs often fuse Q, K, V projections into a single `attention.qkv` weight. The normalizer splits these into separate `to_q`/`to_k`/`to_v` components for per-component conflict analysis, then **re-fuses** them back to the native format after merging.
+**Fused QKV handling:** Z-Image and MiniMax H3 LoRAs often fuse Q, K, V projections into one weight. The normalizer splits them into `to_q`/`to_k`/`to_v` components for per-component conflict analysis. Native H3 adapters split without rank inflation; merged components target exact slices of `qkv_proj` and are re-fused into a stock-Comfy-loadable adapter for export.
 
 | Setting | Default | Effect |
 |---------|---------|--------|
-| `normalize_keys` | enabled | `disabled` or `enabled`. Recommended for mixed-trainer stacks and required for Z-Image QKV fusion. |
+| `normalize_keys` | enabled | `disabled` or `enabled`. Recommended for mixed-trainer stacks and required for Z-Image / MiniMax H3 QKV splitting. |
 
 </details>
 
@@ -372,7 +373,7 @@ All numeric thresholds in the optimizer (density estimation, conflict detection,
 | Preset | Architectures | Key Differences | Orthogonal floor |
 |--------|--------------|-----------------|------------------|
 | `sd_unet` | SD 1.5, SDXL | Density range [0.1, 0.9], noise floor 10%, max strength cap 3.0 | 0.85 |
-| `dit` | Flux, WAN, Z-Image, LTX, Ideogram 4, Anima, HunyuanVideo | Density range [0.4, 0.95], noise floor 5%, max strength cap 5.0 | 0.85 by default, 1.0 for Wan/LTX |
+| `dit` | Flux, WAN, Z-Image, LTX, MiniMax H3, Ideogram 4, Anima, HunyuanVideo | Density range [0.4, 0.95], noise floor 5%, max strength cap 5.0 | 0.85 by default, 1.0 for Wan/LTX/H3 |
 | `acestep_dit` | ACE-Step (music DiT) | DiT thresholds tuned for music LoRAs: wider orthogonal band + higher TIES threshold to preserve voice/timbre | 1.0 |
 | `llm` | Qwen-Image, LLaMA-based | Density range [0.1, 0.8], noise floor 15%, max strength cap 3.0 | 0.9 |
 
@@ -401,7 +402,7 @@ After merging, full-rank diff patches consume ~128x more RAM than standard LoRA 
 
 When dense compression is needed, the compression rank is automatically computed as the sum of all input LoRA ranks. For example, 3 rank-32 LoRAs produce a rank-96 compressed patch — enough to represent the full merge on linear operations when no extra nonlinear processing is involved.
 
-> **Tip:** For video models (LTX, Wan, etc.) with high RAM usage, use `additive` mode + `smart` (or `aggressive`) compression. Every patch gets losslessly compressed with minimal RAM footprint.
+> **Tip:** For video models (LTX, Wan, MiniMax H3, etc.) with high RAM usage, use `additive` mode + `smart` (or `aggressive`) compression. Every patch gets losslessly compressed with minimal RAM footprint.
 
 </details>
 
@@ -921,11 +922,12 @@ WanVideoLoraSelect → WanVideoModelLoader → WANVIDEOMODEL → WanVideo LoRA O
 <details>
 <summary><b>Compatibility</b></summary>
 
-- **Models:** SD 1.5, SDXL, Flux, Z-Image (Lumina2), Ideogram 4, Anima (Cosmos-Predict2), Wan 2.1/2.2, LTX Video, ACE-Step, Qwen-Image, and other architectures supported by ComfyUI
+- **Models:** SD 1.5, SDXL, Flux, Z-Image (Lumina2), MiniMax H3, Ideogram 4, Anima (Cosmos-Predict2), Wan 2.1/2.2, LTX Video, ACE-Step, Qwen-Image, and other architectures supported by ComfyUI
 - **LoRA formats:** Standard LoRA, LoCon, and LoRA/LoCon-style trainer variants whose tensors reduce to up/down(/mid) adapters (including many diffusers/PEFT and LyCORIS naming schemes)
 - **Trainers:** Kohya, AI-Toolkit, LyCORIS, Musubi Tuner, diffusers — auto-normalized when `normalize_keys` is enabled
 - **Flux sliced weights:** Handled correctly (linear1_qkv offsets)
 - **Z-Image fused QKV:** Split for per-component analysis, re-fused after merge
+- **MiniMax H3:** Native/reference, ai-toolkit, PEFT, Diffusers, LightX2V, and Musubi LoRA keys; fused QKV slice routing and joint audio-layer filtering
 - **Stack formats:** Native LoRA Stack dicts, plus standard tuples from Efficiency Nodes / Comfyroll
 
 </details>

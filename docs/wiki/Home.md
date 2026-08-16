@@ -56,7 +56,7 @@ The optimizer handles everything automatically — conflict analysis, strategy s
 | **Compatibility analyzer** | Planning node that groups merge-safe LoRAs, surfaces conflicts, and optionally auto-creates optimized node setups |
 | **Low memory** | Two-pass streaming architecture — peak memory scales with the largest active target group, not the full stack |
 | **Community cache** | Share AutoTuner results via Hugging Face — skip sweeps when the best config is already known |
-| **9 architectures** | SD 1.5, SDXL, FLUX, Z-Image, Ideogram 4, Wan, LTX Video, ACE-Step, Qwen-Image |
+| **Broad architecture support** | SD 1.5, SDXL, FLUX, Z-Image, MiniMax H3, Ideogram 4, Krea 2, Anima, Wan, LTX Video, ACE-Step, Qwen-Image |
 
 ---
 
