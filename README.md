@@ -257,7 +257,7 @@ Each LoRA has a per-LoRA `key_filter` setting (available on both **LoRA Stack** 
 | `audio_only` | Only contribute audio layers | Take the sound from one LoRA on audio-video models (LTX-2, MiniMax H3, ACE-Step) |
 | `no_audio` | Only contribute non-audio (video) layers | Merge two LTX-2 LoRAs but keep just one's audio — set the others to `no_audio` |
 
-**Audio split (LTX-2 / MiniMax H3 / ACE-Step):** `audio_only` / `no_audio` classify a layer as "audio" when `audio` appears in its key (including H3's `audio_patch_proj` / `final_layer.audio_out`, plus LTX-2's `audio_embeddings_connector`, `audio_adaln_single`, `audio_patchify_proj`, `audio_proj_out`, `av_ca_audio_*`, and per-block audio sublayers). So to **merge two action LoRAs but keep only the first one's sound**, set the second LoRA's `key_filter` to `no_audio`. To **combine an audio LoRA with a video LoRA**, set the audio one to `audio_only` and the video one to `no_audio` (or `all`).
+**Audio split (LTX-2 / MiniMax H3 / ACE-Step):** `audio_only` / `no_audio` classify a layer as "audio" when `audio` appears in its key (including H3's `audio_patch_proj` / `final_layer.audio_out`, plus LTX-2's `audio_embeddings_connector`, `audio_adaln_single`, `audio_patchify_proj`, `audio_proj_out`, `av_ca_audio_*`, and per-block audio sublayers). So to **merge two action LoRAs but keep only the first one's sound**, set the second LoRA's `key_filter` to `no_audio`. To **combine an audio LoRA with a video LoRA**, set the audio one to `audio_only` and the video one to `no_audio` (or `all`). H3's transformer blocks process packed audio and video jointly, so these filters isolate only explicitly named audio ingress/egress layers; shared `blocks.*` updates can still affect both modalities.
 
 This is especially useful for Wan T2V/I2V/VACE LoRAs, which share ~90% of weights but each variant has unique keys (I2V: `cross_attn.k_img/v_img`, `img_emb`; VACE: `vace_blocks.*`, `vace_patch_embedding`).
 
@@ -347,7 +347,7 @@ Key normalization auto-detects the model architecture from LoRA key patterns and
 | Architecture | Detected From | Normalization |
 |-------------|--------------|---------------|
 | **Z-Image** (Lumina2) | `diffusion_model.layers.N.attention`, `single_transformer_blocks` | Prefix standardization, QKV split for per-component analysis, re-fuse after merge |
-| **MiniMax H3** | `blocks.N.attn.qkv_proj`, `token_refiner.blocks`, Diffusers `transformer_blocks` | Native / ai-toolkit / PEFT / Diffusers / Musubi unified; fused QKV split onto exact model slices; Diffusers SwiGLU row order corrected; joint audio keys supported |
+| **MiniMax H3** | `blocks.N.attn.qkv_proj`, `token_refiner.blocks`, Diffusers `transformer_blocks` | Native / ai-toolkit / PEFT / Diffusers / DiffSynth / Musubi unified; raw per-head and native QKV layouts corrected; file-level network alpha honored; Diffusers SwiGLU row order corrected; joint audio keys supported |
 | **Ideogram 4** | `layers.N.attention.qkv`/`attention.o`, `feed_forward.w1-w3`, fal `conditional_transformer.` prefix | ai-toolkit / fal / PEFT prefixes unified; qkv stays fused (native ComfyUI layout) |
 | **FLUX** | `double_blocks`/`single_blocks`, `transformer.transformer_blocks` | AI-Toolkit / Kohya / diffusers unified to canonical format |
 | **Wan** 2.1/2.2 | `blocks.N` with `self_attn`/`cross_attn`/`ffn` | LyCORIS / diffusers / Musubi Tuner unified, RS-LoRA alpha fix |
@@ -357,7 +357,9 @@ Key normalization auto-detects the model architecture from LoRA key patterns and
 | **Anima** (Cosmos-Predict2 DiT) | `blocks.N.{self_attn,cross_attn}.{q,k,v,output}_proj`, `mlp.layer1/2`, unique `llm_adapter`; Kohya `lora_unet_*` / diffusers `transformer_blocks.attn1/attn2` | Kohya / diffusers / ComfyUI unified to `diffusion_model.blocks.N.*`; split QKV |
 | **Qwen-Image** | `transformer_blocks` with `img_mlp`/`txt_mlp`/`img_mod`/`txt_mod` | Dual-stream key unification |
 
-**Fused QKV handling:** Z-Image and MiniMax H3 LoRAs often fuse Q, K, V projections into one weight. The normalizer splits them into `to_q`/`to_k`/`to_v` components for per-component conflict analysis. Native H3 adapters split without rank inflation; merged components target exact slices of `qkv_proj` and are re-fused into a stock-Comfy-loadable adapter for export.
+**Fused QKV handling:** Z-Image and MiniMax H3 LoRAs often fuse Q, K, V projections into one weight. The normalizer splits them into `to_q`/`to_k`/`to_v` components for per-component conflict analysis. Native H3 adapters split without rank inflation; DiffSynth's raw per-head `[q,k,v]` ordering is de-interleaved first. Merged components target exact slices of `qkv_proj` and are re-fused into a stock-Comfy-loadable adapter for export. H3 adapters that store a uniform network `alpha` only in the safetensors header (including LightX2V alpha-8 releases) retain the exact `alpha / rank` training scale.
+
+**MiniMax H3 merge rules:** FL2VA/T2VA and Ref2VA use different transformer checkpoints despite having identical module names and shapes. Merge only adapters trained for the same partition, and apply the result to that matching base checkpoint. Turbo/distillation adapters also encode a specific inference schedule: keep their published strength and sampler step range, and prefer `additive` mode (or mark the Turbo adapter `preserve`) when adding concept/style LoRAs so conflict pruning does not rewrite the acceleration delta.
 
 | Setting | Default | Effect |
 |---------|---------|--------|
@@ -927,7 +929,7 @@ WanVideoLoraSelect → WanVideoModelLoader → WANVIDEOMODEL → WanVideo LoRA O
 - **Trainers:** Kohya, AI-Toolkit, LyCORIS, Musubi Tuner, diffusers — auto-normalized when `normalize_keys` is enabled
 - **Flux sliced weights:** Handled correctly (linear1_qkv offsets)
 - **Z-Image fused QKV:** Split for per-component analysis, re-fused after merge
-- **MiniMax H3:** Native/reference, ai-toolkit, PEFT, Diffusers, LightX2V, and Musubi LoRA keys; fused QKV slice routing and joint audio-layer filtering
+- **MiniMax H3:** Native/reference, ai-toolkit, PEFT, Diffusers, DiffSynth, LightX2V, and Musubi LoRA keys; exact alpha/rank scaling; raw/native fused-QKV routing; joint audio-layer filtering
 - **Stack formats:** Native LoRA Stack dicts, plus standard tuples from Efficiency Nodes / Comfyroll
 
 </details>

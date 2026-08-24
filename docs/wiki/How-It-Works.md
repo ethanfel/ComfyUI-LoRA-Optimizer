@@ -137,7 +137,9 @@ Z-Image LoRAs often fuse Q, K, and V projections into a single `attention.qkv` w
 
 This splitting is critical — Q, K, and V weights serve different purposes. Two LoRAs might agree on Q weights but conflict on V weights. Without splitting, the optimizer would average their conflicts and get a suboptimal result for both.
 
-MiniMax H3 uses the same fused-QKV idea under `blocks.N.attn.qkv_proj`, including its text-token refiner. Native/reference and ai-toolkit adapters are split for analysis, while Diffusers/PEFT split-QKV adapters normalize to the same component names. The merged components target exact row slices of ComfyUI's fused weight. H3 normalization also corrects the reversed Diffusers/native SwiGLU halves in `ff.net.0.proj` / `mlp.fc1`.
+MiniMax H3 uses the same fused-QKV idea under `blocks.N.attn.qkv_proj`, including its text-token refiner. Native/reference and ai-toolkit adapters are split for analysis, while Diffusers/PEFT split-QKV adapters normalize to the same component names. DiffSynth is a special case: it trains against the raw checkpoint's per-head-interleaved `[q,k,v]` rows, so those rows are de-interleaved into ComfyUI's in-memory `[q_all;k_all;v_all]` order before splitting. The merged components target exact row slices of ComfyUI's fused weight. H3 normalization also corrects the reversed Diffusers/native SwiGLU halves in `ff.net.0.proj` / `mlp.fc1` and materializes a safetensors-header network alpha when that is the adapter's only alpha source.
+
+H3's FL2VA/T2VA and Ref2VA releases are separate transformer partitions with identical key names and shapes. Shape compatibility therefore cannot prove semantic compatibility: only merge LoRAs trained for the same partition and use the matching base checkpoint. Turbo/distillation LoRAs should retain their published `alpha/rank`, strength, and sampling schedule; use an additive merge or preserve the Turbo adapter when composing it with style/content adapters.
 
 ### Special Case: WanVideo `_orig_mod` Keys
 
@@ -924,7 +926,7 @@ Bridges `LORA_DATA` to a `WANVIDEOMODEL`. Handles the `_orig_mod.` key mismatch 
 | **SD 1.5** | `lora_te_`, `input_blocks`/`down_blocks` | Text encoder + UNet unified |
 | **SDXL** | `lora_te1_`, `input_blocks` | Text encoder + UNet unified |
 | **Z-Image** (Lumina2) | `diffusion_model.layers.N.attention` | Fused QKV split/re-fuse, Musubi Tuner format |
-| **MiniMax H3** | `blocks.N.attn.qkv_proj`, `token_refiner.blocks`, Diffusers `transformer_blocks` | Native/reference, ai-toolkit, PEFT, Diffusers/LightX2V, and Musubi unified; fused QKV slice routing; SwiGLU row correction; joint audio keys |
+| **MiniMax H3** | `blocks.N.attn.qkv_proj`, `token_refiner.blocks`, Diffusers `transformer_blocks` | Native/reference, ai-toolkit, PEFT, Diffusers/LightX2V, DiffSynth, and Musubi unified; network-alpha preservation; raw/native QKV layout correction; SwiGLU row correction; joint audio keys |
 | **Ideogram 4** (NextDiT) | `layers.N.attention.qkv`/`attention.o`, fal `conditional_transformer.` prefix | ai-toolkit / fal / PEFT prefixes unified; qkv stays fused (detected **before** Z-Image) |
 | **Wan** 2.1/2.2 | `blocks.N` with `self_attn`/`ffn` | LyCORIS / diffusers / Musubi / Fun LoRA / finetrainer unified, RS-LoRA alpha fix |
 | **ACE-Step** v1.0/v1.5 | `layers.N` with `self_attn`/`cross_attn` + `q_proj`/`k_proj`/`v_proj` | Attention key unification, music-DiT preset |

@@ -255,7 +255,7 @@ def _warn_stale_tuner_data(tuner_data, context):
             f"[{context}] tuner_data was produced by AutoTuner algo {version} "
             f"(current: {AUTOTUNER_ALGO_VERSION}) — its ranking may be stale. "
             f"Re-run the AutoTuner to refresh it.")
-ANALYSIS_CACHE_VERSION = "1.8.0"   # Bump when per-prefix conflict math changes (lora/pair/analysis caches)
+ANALYSIS_CACHE_VERSION = "1.8.1"   # Bump when per-prefix conflict math changes (lora/pair/analysis caches)
 COMMUNITY_CACHE_REPO = "ethanfel/lora-optimizer-community-cache"
 COMMUNITY_CACHE_BASE_URL = (
     f"https://huggingface.co/datasets/{COMMUNITY_CACHE_REPO}/resolve/main"
@@ -2033,13 +2033,75 @@ class _LoRAMergeBase:
             normalized[_norm_module(module) + matched] = v
         return normalized
 
+    @staticmethod
+    def _apply_minimax_h3_metadata_alpha(lora_sd, metadata, name=None):
+        """Materialize H3's file-level network alpha as per-module tensors.
+
+        Some published Diffusers/LightX2V H3 adapters store one uniform
+        ``alpha`` only in the safetensors ``__metadata__`` header. ComfyUI's
+        tensor loader does not place that value in the state dict, so without
+        this step a rank-128, alpha-8 adapter is incorrectly applied at scale
+        1 instead of 8/128. This mirrors Diffusers' H3 loader contract: the
+        header alpha is used only when the file has no per-module alpha tensors.
+        """
+        if not isinstance(lora_sd, dict) or not isinstance(metadata, dict):
+            return lora_sd
+        if any(isinstance(key, str) and key.endswith('.alpha') for key in lora_sd):
+            return lora_sd
+
+        raw_alpha = metadata.get('alpha')
+        if raw_alpha is None:
+            return lora_sd
+        try:
+            alpha = float(raw_alpha)
+        except (TypeError, ValueError):
+            logging.warning(
+                f"[LoRA Optimizer] MiniMax H3 LoRA {name or '<memory>'!r} has "
+                f"non-numeric safetensors alpha {raw_alpha!r}; using the "
+                "ordinary alpha=rank fallback.")
+            return lora_sd
+        if not math.isfinite(alpha):
+            logging.warning(
+                f"[LoRA Optimizer] MiniMax H3 LoRA {name or '<memory>'!r} has "
+                f"non-finite safetensors alpha {raw_alpha!r}; using the "
+                "ordinary alpha=rank fallback.")
+            return lora_sd
+
+        pair_suffixes = (
+            ('.lora_A.default.weight', '.lora_B.default.weight'),
+            ('.lora_A.weight', '.lora_B.weight'),
+            ('.lora_down.default.weight', '.lora_up.default.weight'),
+            ('.lora_down.weight', '.lora_up.weight'),
+            ('.lora.down.weight', '.lora.up.weight'),
+        )
+        out = dict(lora_sd)
+        injected = 0
+        for key in lora_sd:
+            if not isinstance(key, str):
+                continue
+            for down_suffix, up_suffix in pair_suffixes:
+                if not key.endswith(down_suffix):
+                    continue
+                base = key[:-len(down_suffix)]
+                if base + up_suffix in lora_sd:
+                    out[base + '.alpha'] = torch.tensor(alpha, dtype=torch.float32)
+                    injected += 1
+                break
+        if injected:
+            logging.info(
+                f"[LoRA Optimizer] MiniMax H3: applied safetensors network "
+                f"alpha={alpha:g} to {injected} adapter layer(s) in "
+                f"{name or '<memory>'!r}")
+        return out
+
     @classmethod
     def _normalize_keys_minimax_h3(cls, lora_sd):
         """Normalize MiniMax H3 LoRAs to ComfyUI's native module layout.
 
         Supported inputs:
           - reference / ai-toolkit native keys (bare or ``diffusion_model.``)
-          - PEFT wrappers (``base_model.model.`` / ``transformer.``)
+          - PEFT wrappers (``base_model.model.`` / ``transformer.`` /
+            ``transformer_ref.``)
           - Musubi's flattened ``lora_unet_*`` module names
           - Diffusers split-QKV names (``transformer_blocks.*``)
 
@@ -2050,7 +2112,16 @@ class _LoRAMergeBase:
         reverse order from the reference ``mlp.fc1``; only the up/B rows need
         swapping.
         """
-        # LightX2V/PEFT may insert an adapter-name component. The optimizer's
+        # DiffSynth trains against raw H3 checkpoint tensors, whose fused QKV
+        # rows are per-head interleaved. Its PEFT ``default`` infix over native
+        # qkv_proj names is the published format discriminator. LightX2V also
+        # uses ``default``, but on already-split Diffusers to_q/to_k/to_v keys.
+        is_diffsynth = any(
+            isinstance(key, str)
+            and '.attn.qkv_proj.lora_A.default.weight' in key
+            for key in lora_sd)
+
+        # DiffSynth/LightX2V/PEFT may insert an adapter-name component. The optimizer's
         # LoRA parser expects the ordinary suffix; ``default`` carries no
         # semantic information for a single serialized adapter.
         suffix_fixed = {}
@@ -2111,7 +2182,8 @@ class _LoRAMergeBase:
                 changed = True
                 while changed:
                     changed = False
-                    for wrapper in ('base_model.model.', 'unet.', 'transformer.'):
+                    for wrapper in ('base_model.model.', 'unet.',
+                                    'transformer_ref.', 'transformer.'):
                         if module.startswith(wrapper):
                             module = module[len(wrapper):]
                             changed = True
@@ -2176,7 +2248,25 @@ class _LoRAMergeBase:
                 up = canonical[up_key]
                 if not isinstance(up, torch.Tensor) or up.shape[0] % 3:
                     continue
-                parts = torch.chunk(up, 3, dim=0)
+                if is_diffsynth:
+                    # Raw checkpoint rows are
+                    # [head0:q,k,v; head1:q,k,v; ...], while ComfyUI's model
+                    # state dict is [q_all; k_all; v_all]. H3's released head
+                    # width is 128; this is the same load-time transform used
+                    # by the reference implementation and Diffusers converter.
+                    head_dim = 128
+                    if up.shape[0] % (3 * head_dim):
+                        raise ValueError(
+                            f"MiniMax H3 DiffSynth qkv_proj has {up.shape[0]} "
+                            f"output rows, not a multiple of 3*{head_dim}.")
+                    num_heads = up.shape[0] // (3 * head_dim)
+                    grouped = up.reshape(
+                        num_heads, 3 * head_dim, *up.shape[1:])
+                    parts = tuple(
+                        part.reshape(num_heads * head_dim, *up.shape[1:]).contiguous()
+                        for part in grouped.split(head_dim, dim=1))
+                else:
+                    parts = torch.chunk(up, 3, dim=0)
                 for component, part in zip(('to_q', 'to_k', 'to_v'), parts):
                     normalized[f"{base}.{component}{down_suffix}"] = canonical[down_key]
                     normalized[f"{base}.{component}{up_suffix}"] = part
@@ -5171,6 +5261,58 @@ class _LoRAMergeBase:
                             arch = detected
                             break
             self._detected_arch = arch if arch != "unknown" else None
+
+            # H3 Diffusers/LightX2V files may carry one uniform network alpha
+            # only in the safetensors header. Materialize it before optional
+            # key normalization so both normalized and raw-key merge paths use
+            # the producer's alpha/rank scale instead of silently assuming 1.
+            if arch == "minimax_h3":
+                partition_items = {}
+                for item in normalized:
+                    if not item.get("_precomputed_diffs"):
+                        component_prefixes = set()
+                        for raw_key in item["lora"]:
+                            if not isinstance(raw_key, str):
+                                continue
+                            component_key = raw_key
+                            while component_key.startswith('base_model.model.'):
+                                component_key = component_key[len('base_model.model.'):]
+                            if component_key.startswith('transformer_ref.'):
+                                component_prefixes.add('ref2va')
+                            elif component_key.startswith('transformer.'):
+                                component_prefixes.add('fl2va')
+                        if len(component_prefixes) > 1:
+                            raise ValueError(
+                                f"MiniMax H3 LoRA {item.get('name', '<memory>')!r} "
+                                "contains both transformer and transformer_ref "
+                                "components. A ComfyUI MODEL represents only one H3 "
+                                "partition; split the components and use the matching base.")
+                        if component_prefixes:
+                            partition = next(iter(component_prefixes))
+                            partition_items.setdefault(partition, []).append(
+                                item.get("name", "<memory>"))
+
+                        metadata = item.get("metadata", {})
+                        # Third-party stack nodes sometimes pass an already
+                        # loaded tensor dict but omit the safetensors header.
+                        # Recover it from the named file when possible; H3's
+                        # published LightX2V alpha may exist only there.
+                        if not metadata:
+                            lora_path = folder_paths.get_full_path(
+                                "loras", item.get("name", ""))
+                            if lora_path is not None:
+                                metadata = _read_safetensors_metadata(lora_path)
+                                item["metadata"] = metadata
+                        item["lora"] = self._apply_minimax_h3_metadata_alpha(
+                            item["lora"], metadata, item.get("name"))
+                if len(partition_items) > 1:
+                    raise ValueError(
+                        "MiniMax H3 stack mixes explicit transformer (FL2VA/T2VA) "
+                        "and transformer_ref (Ref2VA) LoRA components. These are "
+                        "different model partitions and cannot be merged together: "
+                        + "; ".join(
+                            f"{partition}={names}"
+                            for partition, names in sorted(partition_items.items())))
 
             # Architecture-aware key normalization (only when enabled)
             if normalize_keys == "enabled":

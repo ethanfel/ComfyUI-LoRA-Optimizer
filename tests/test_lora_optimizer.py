@@ -3357,6 +3357,82 @@ class TestMiniMaxH3Support(unittest.TestCase):
             self.assertIs(out[f"{base}.alpha"], alpha)
         self.assertNotIn("diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight", out)
 
+    def test_diffsynth_fused_qkv_deinterleaves_heads_before_split(self):
+        rank = 2
+        head_dim = 128
+        heads = 2
+        down = torch.arange(rank * 4, dtype=torch.float32).reshape(rank, 4)
+        up = torch.arange(
+            heads * 3 * head_dim * rank, dtype=torch.float32
+        ).reshape(heads * 3 * head_dim, rank)
+        sd = {
+            "blocks.0.attn.qkv_proj.lora_A.default.weight": down,
+            "blocks.0.attn.qkv_proj.lora_B.default.weight": up,
+        }
+
+        out = lora_optimizer._LoRAMergeBase._normalize_keys_minimax_h3(sd)
+        grouped = up.reshape(heads, 3 * head_dim, rank)
+        expected = tuple(
+            part.reshape(heads * head_dim, rank).contiguous()
+            for part in grouped.split(head_dim, dim=1)
+        )
+        for component, expected_up in zip(("to_q", "to_k", "to_v"), expected):
+            base = f"diffusion_model.blocks.0.attn.{component}"
+            self.assertIs(out[f"{base}.lora_A.weight"], down)
+            self.assertTrue(torch.equal(out[f"{base}.lora_B.weight"], expected_up))
+
+    def test_file_level_alpha_is_materialized_for_every_h3_pair(self):
+        sd = {
+            "transformer_blocks.0.attn.to_q.lora_A.default.weight": torch.ones(4, 8),
+            "transformer_blocks.0.attn.to_q.lora_B.default.weight": torch.ones(8, 4),
+            "transformer_blocks.0.ff.net.2.lora_A.default.weight": torch.zeros(4, 8),
+            "transformer_blocks.0.ff.net.2.lora_B.default.weight": torch.zeros(8, 4),
+        }
+        out = lora_optimizer._LoRAMergeBase._apply_minimax_h3_metadata_alpha(
+            sd, {"alpha": "1"}, "lightx.safetensors")
+        self.assertEqual(
+            out["transformer_blocks.0.attn.to_q.alpha"].item(), 1.0)
+        self.assertEqual(
+            out["transformer_blocks.0.ff.net.2.alpha"].item(), 1.0)
+
+        normalized = lora_optimizer._LoRAMergeBase._normalize_keys_minimax_h3(out)
+        prefix = "diffusion_model.blocks.0.attn.to_q"
+        self.assertEqual(normalized[f"{prefix}.alpha"].item(), 1.0)
+        # rank=4, alpha=1 must produce the source training scale 1/4.
+        diff = (normalized[f"{prefix}.lora_B.weight"]
+                @ normalized[f"{prefix}.lora_A.weight"]
+                * (normalized[f"{prefix}.alpha"].item() / 4))
+        self.assertTrue(torch.equal(diff, torch.ones(8, 8)))
+
+    def test_file_level_alpha_does_not_override_tensor_alphas(self):
+        sd = {
+            "blocks.0.mlp.fc1.lora_A.weight": torch.zeros(2, 4),
+            "blocks.0.mlp.fc1.lora_B.weight": torch.zeros(8, 2),
+            "blocks.0.mlp.fc1.alpha": torch.tensor(2.0),
+            "blocks.0.mlp.fc2.lora_A.weight": torch.zeros(2, 4),
+            "blocks.0.mlp.fc2.lora_B.weight": torch.zeros(8, 2),
+        }
+        out = lora_optimizer._LoRAMergeBase._apply_minimax_h3_metadata_alpha(
+            sd, {"alpha": "8"}, "mixed.safetensors")
+        self.assertIs(out, sd)
+        self.assertNotIn("blocks.0.mlp.fc2.alpha", out)
+
+    def test_stack_normalization_applies_header_alpha_before_key_mapping(self):
+        sd = {
+            "transformer_blocks.0.attn.to_q.lora_A.default.weight": torch.ones(4, 8),
+            "transformer_blocks.0.attn.to_q.lora_B.default.weight": torch.ones(7168, 4),
+        }
+        merger = lora_optimizer._LoRAMergeBase()
+        stack = merger._normalize_stack([{
+            "name": "lightx-alpha8.safetensors",
+            "lora": sd,
+            "strength": 1.0,
+            "metadata": {"alpha": "8"},
+        }], normalize_keys="enabled")
+        prefix = "diffusion_model.blocks.0.attn.to_q"
+        self.assertEqual(merger._detected_arch, "minimax_h3")
+        self.assertEqual(stack[0]["lora"][f"{prefix}.alpha"].item(), 8.0)
+
     def test_musubi_unflattens_compound_module_names(self):
         sd = self._zeros([
             "lora_unet_blocks_12_attn_out_proj.lora_down.weight",
@@ -3390,6 +3466,33 @@ class TestMiniMaxH3Support(unittest.TestCase):
         self.assertIn("diffusion_model.token_refiner.blocks.1.attn.to_q.lora_A.weight", out)
         self.assertIn("diffusion_model.audio_patch_proj.lora_B.weight", out)
         self.assertIn("diffusion_model.final_layer.adaln_proj.linear.lora_A.weight", out)
+
+    def test_transformer_ref_component_prefix_maps_to_current_comfy_model(self):
+        sd = {
+            "transformer_ref.transformer_blocks.2.attn.to_q.lora_A.weight": torch.zeros(2, 4),
+            "transformer_ref.transformer_blocks.2.attn.to_q.lora_B.weight": torch.zeros(8, 2),
+        }
+        out = lora_optimizer._LoRAMergeBase._normalize_keys_minimax_h3(sd)
+        self.assertIn(
+            "diffusion_model.blocks.2.attn.to_q.lora_A.weight", out)
+        self.assertIn(
+            "diffusion_model.blocks.2.attn.to_q.lora_B.weight", out)
+
+    def test_stack_rejects_explicit_cross_partition_h3_merge(self):
+        main = {
+            "transformer.transformer_blocks.0.ff.net.2.lora_A.weight": torch.zeros(2, 4),
+            "transformer.transformer_blocks.0.ff.net.2.lora_B.weight": torch.zeros(8, 2),
+        }
+        ref = {
+            "transformer_ref.transformer_blocks.0.ff.net.2.lora_A.weight": torch.zeros(2, 4),
+            "transformer_ref.transformer_blocks.0.ff.net.2.lora_B.weight": torch.zeros(8, 2),
+        }
+        merger = lora_optimizer._LoRAMergeBase()
+        with self.assertRaisesRegex(ValueError, "different model partitions"):
+            merger._normalize_stack([
+                {"name": "main.safetensors", "lora": main, "strength": 1.0},
+                {"name": "ref.safetensors", "lora": ref, "strength": 1.0},
+            ], normalize_keys="enabled")
 
     def test_native_qkv_aliases_target_exact_fused_slices(self):
         target = "diffusion_model.blocks.0.attn.qkv_proj"

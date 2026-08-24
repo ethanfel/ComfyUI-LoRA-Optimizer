@@ -209,6 +209,8 @@ Auto-detects model architecture and remaps LoRA keys to a canonical format, enab
 
 Supported architectures include FLUX, SDXL, Z-Image (Lumina2), MiniMax H3, Wan 2.1/2.2, LTX Video, Qwen-Image, ACE-Step, Ideogram 4, Anima, and Krea 2.
 
+For MiniMax H3, leave normalization enabled. It preserves file-level LightX2V network alpha, converts DiffSynth's raw per-head QKV ordering, and routes Diffusers `transformer_ref` keys. Do not combine FL2VA/T2VA adapters with Ref2VA adapters: the two H3 transformer partitions have matching names and shapes but different learned weights. When combining a Turbo/distillation adapter with a concept or style adapter, prefer `optimization_mode=additive` or mark the Turbo adapter `preserve`, and keep the sampler steps recommended by that Turbo release.
+
 ---
 
 ## AutoTuner-Specific
