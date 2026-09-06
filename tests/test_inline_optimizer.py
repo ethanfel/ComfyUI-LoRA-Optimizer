@@ -375,6 +375,11 @@ class _FakePatcher:
     def clone(self):
         return _FakePatcher({k: v[:] for k, v in self.patches.items()})
 
+    def add_patches(self, patches, strength=1.0):
+        for key, patch in patches.items():
+            self.patches.setdefault(key, []).append((strength, patch, 1.0, None, None))
+        return list(patches)
+
 
 class TestStripCaptured(unittest.TestCase):
     def test_interleaved_noncapturable_entry_blocks_target_and_preserves_order(self):
@@ -1153,9 +1158,8 @@ class TestSingleLoraVirtualPath(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertTrue(applied.get("patches"))
 
-    def test_plain_single_lora_stack_still_takes_fast_path(self):
-        # Regression net for the guard: trainer-format single-LoRA stacks
-        # keep the fast path, and the realistic stub CAN match their keys.
+    def test_plain_single_lora_stack_emits_patch_data(self):
+        # Single files share the filtered/exportable path with multi-LoRA stacks.
         model = _FakePatcher({})
         model.model = types.SimpleNamespace(
             layer=types.SimpleNamespace(weight=torch.zeros(16, 16)))
@@ -1168,9 +1172,12 @@ class TestSingleLoraVirtualPath(unittest.TestCase):
         calls = []
         with mock.patch.object(lora_optimizer.comfy.sd, "load_lora_for_models",
                                _realistic_load_lora_for_models(calls)):
-            node.optimize_merge(model, stack, 1.0)
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0]["matched"])
+            result = node.optimize_merge(model, stack, 1.0)
+        self.assertEqual(calls, [])
+        patch = result[4]["model_patches"]["layer.weight"]
+        torch.testing.assert_close(node._expand_patch_to_diff(patch),
+                                   stack[0]["lora"]["alias_layer.lora_up.weight"] @
+                                   stack[0]["lora"]["alias_layer.lora_down.weight"])
 
 
 class TestVirtualDiffDeviceExpansion(unittest.TestCase):

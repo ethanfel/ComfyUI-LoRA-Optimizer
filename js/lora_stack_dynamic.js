@@ -13,6 +13,7 @@ const SLOT_WIDGET_NAMES = [
     "conflict_mode",
     "key_filter",
     "preserve",
+    "h3_layout",
 ];
 
 // --- Legacy workflow migration ---
@@ -32,10 +33,13 @@ const NEW_PER_SLOT = 9;           // with enabled_{i} (head) + preserve_{i} (tai
 
 function migrateWidgetsValues(wv) {
     if (!Array.isArray(wv)) return wv;
+    // H3 layout widgets are appended AFTER the old base_model_filter, so old
+    // slots never shift. Recognize the new ten-slot schema explicitly.
+    if (wv.length === CONTROL_WIDGET_COUNT + NEW_PER_SLOT * 10 + TRAILING_WIDGET_COUNT + 10) return wv;
     const slotRegion = wv.length - CONTROL_WIDGET_COUNT - TRAILING_WIDGET_COUNT;
     if (slotRegion <= 0) return wv;
     // Current format already carries both enabled + preserve (9/slot) — untouched.
-    if (slotRegion % NEW_PER_SLOT === 0) return wv;
+    if (slotRegion % NEW_PER_SLOT === 0) return [...wv, ...Array(10).fill("auto")];
 
     // Disambiguate 7 vs 8 by preferring an EXACT divisor (both are possible for
     // some lengths; 8/slot is the more recent layout, so test it first).
@@ -57,7 +61,7 @@ function migrateWidgetsValues(wv) {
         `[LoRAStackDynamic] Migrated workflow (${oldPerSlot}/slot -> ${NEW_PER_SLOT}/slot, ` +
         `${wv.length} -> ${out.length} widget values): re-padded slots to restore LoRA names.`
     );
-    return out;
+    return [...out, ...Array(10).fill("auto")];
 }
 
 function toggleWidget(node, widget, show, suffix = "") {
@@ -169,6 +173,7 @@ function updateVisibility(node) {
         toggleWidget(node, findWidget(node, `conflict_mode_${i}`), visible && !isSimple);
         toggleWidget(node, findWidget(node, `key_filter_${i}`), visible && !isSimple);
         toggleWidget(node, findWidget(node, `preserve_${i}`), visible && !isSimple);
+        toggleWidget(node, findWidget(node, `h3_layout_${i}`), visible && !isSimple);
     }
 
     // Hide base_model_filter in text mode (only useful for dropdown combos)
@@ -398,6 +403,8 @@ function clearSlotValues(node, idx) {
         [`clip_strength_${idx}`]: 1.0,
         [`conflict_mode_${idx}`]: "all",
         [`key_filter_${idx}`]: "all",
+        [`preserve_${idx}`]: false,
+        [`h3_layout_${idx}`]: "auto",
     };
     for (const [name, val] of Object.entries(defaults)) {
         const w = findWidget(node, name);

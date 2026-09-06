@@ -347,7 +347,7 @@ Key normalization auto-detects the model architecture from LoRA key patterns and
 | Architecture | Detected From | Normalization |
 |-------------|--------------|---------------|
 | **Z-Image** (Lumina2) | `diffusion_model.layers.N.attention`, `single_transformer_blocks` | Prefix standardization, QKV split for per-component analysis, re-fuse after merge |
-| **MiniMax H3** | `blocks.N.attn.qkv_proj`, `token_refiner.blocks`, Diffusers `transformer_blocks` | Native / ai-toolkit / PEFT / Diffusers / DiffSynth / Musubi unified; raw per-head and native QKV layouts corrected; file-level network alpha honored; Diffusers SwiGLU row order corrected; joint audio keys supported |
+| **MiniMax H3** | `blocks.N.attn.qkv_proj`, `token_refiner.blocks`, distinctive Diffusers shapes | Native / PEFT / Diffusers / Musubi keys; explicit raw-interleaved versus Comfy layout; file-level alpha; dense weight/bias patches; strict target/shape checks. See the format limits below. |
 | **Ideogram 4** | `layers.N.attention.qkv`/`attention.o`, `feed_forward.w1-w3`, fal `conditional_transformer.` prefix | ai-toolkit / fal / PEFT prefixes unified; qkv stays fused (native ComfyUI layout) |
 | **FLUX** | `double_blocks`/`single_blocks`, `transformer.transformer_blocks` | AI-Toolkit / Kohya / diffusers unified to canonical format |
 | **Wan** 2.1/2.2 | `blocks.N` with `self_attn`/`cross_attn`/`ffn` | LyCORIS / diffusers / Musubi Tuner unified, RS-LoRA alpha fix |
@@ -360,6 +360,21 @@ Key normalization auto-detects the model architecture from LoRA key patterns and
 **Fused QKV handling:** Z-Image and MiniMax H3 LoRAs often fuse Q, K, V projections into one weight. The normalizer splits them into `to_q`/`to_k`/`to_v` components for per-component conflict analysis. Native H3 adapters split without rank inflation; DiffSynth's raw per-head `[q,k,v]` ordering is de-interleaved first. Merged components target exact slices of `qkv_proj` and are re-fused into a stock-Comfy-loadable adapter for export. H3 adapters that store a uniform network `alpha` only in the safetensors header (including LightX2V alpha-8 releases) retain the exact `alpha / rank` training scale.
 
 **MiniMax H3 merge rules:** FL2VA/T2VA and Ref2VA use different transformer checkpoints despite having identical module names and shapes. Merge only adapters trained for the same partition, and apply the result to that matching base checkpoint. Turbo/distillation adapters also encode a specific inference schedule: keep their published strength and sampler step range, and prefer `additive` mode (or mark the Turbo adapter `preserve`) when adding concept/style LoRAs so conflict pruning does not rewrite the acceleration delta.
+
+**H3 layout selection:** With key normalization enabled, each Stack entry can select `h3_layout`: `comfy` means contiguous `[Q; K; V]`; `diffsynth` means raw per-head interleaving (128-wide heads). The latter requires normalization. `auto` accepts native/reference and split-QKV formats, but rejects ambiguous fused PEFT `.default` keys: that adapter name does **not** prove which checkpoint layout was used for training. Ask the adapter producer when uncertain. Dynamic Stack exposes the per-slot control in advanced view. Exported H3 files record their contiguous layout.
+
+| Payload / operation | Correctness support and limits |
+|---|---|
+| Ordinary H3 factors, including partial Q/K/V and token-refiner attention | Supported; missing slices are zero-filled on native export. Preserve alpha/rank and use the matching training partition. |
+| `.diff` matrices/norm vectors and `.diff_b` biases | Supported as additive updates, including compatible pruned-native AdaLN deltas. Unfiltered missing targets or shape mismatches are errors. |
+| Full-width adapter on a pruned base | Rejected on shape mismatch. No automatic full-to-pruned AdaLN conversion or basis inference. Equal shapes alone do not establish compatibility. |
+| Known partition or AdaLN-basis conflict | Rejected when explicit profile metadata is available. Missing provenance is reported as **unknown**, not verified. `transformer` / `transformer_ref` wrapper names alone are not training fingerprints. |
+| DoRA / shape-changing adapters | Rejected by ordinary merge/export. Inline leaves non-capturable base-dependent patches on their original loader chain. |
+| PDD heads/schedule bundles | Rejected; require their companion runtime, not an ordinary standalone LoRA merge. |
+| LoCon export | Middle tensors preserved. Dense matrices/vectors stay dense at `save_rank=0`. |
+| AutoTuner with H3 or STAR/taming | Local caches include preprocessing/profile context. Community caches are disabled for these runs until their schema can represent that context safely. |
+
+Single-adapter stacks now use the same filtering and `LORA_DATA` path as multi-adapter stacks. Coverage reports distinguish intentionally filtered targets from missing/shape-mismatched targets. These checks establish patch compatibility, not audiovisual quality: full FL2VA/Ref2VA/pruned/quantized render comparisons remain unverified. See the [Phase 1 validation record](docs/audits/2026-09-06-phase1-validation.md).
 
 | Setting | Default | Effect |
 |---------|---------|--------|
@@ -809,10 +824,12 @@ Connect the `LORA_DATA` output from LoRA Optimizer to this node.
 |--------|---------|--------|
 | `save_folder` | first configured LoRA folder | Choose which configured ComfyUI LoRA directory to save into |
 | `filename` | `merged_lora` | File name relative to `save_folder`. Subdirectories are allowed (e.g. `merged/my_lora`) |
-| `save_rank` | 0 (auto) | 0 = use each layer's existing rank from the merge. Non-zero = force this rank for layers that need compression |
+| `save_rank` | 0 (lossless representation) | Preserve existing factors and dense patches; dense exports can be large. Non-zero opts matrix patches into SVD compression with this maximum rank; reconstruction errors are recorded in metadata. Biases and LoCon middle tensors remain intact. |
 | `bake_strength` | enabled | When on, the saved LoRA reproduces your exact merge at strength 1.0. When off, strengths are not baked in |
 
 **Outputs:** `STRING` (file path)
+
+Exports preserve finite float32 factors rather than silently converting them to float16. Validation and serialization complete before atomic destination replacement; unsupported, duplicate, unresolved-slice, or non-finite payloads fail without overwriting an existing file. “Lossless” refers to the accepted patch representation, not recovery of precision already lost through earlier merging, quantization, or optional compression.
 
 ---
 

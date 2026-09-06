@@ -24,6 +24,7 @@ import importlib.util
 import concurrent.futures
 import threading
 import uuid
+import tempfile
 import folder_paths
 import comfy.utils
 import comfy.sd
@@ -241,7 +242,7 @@ AUTOTUNER_MEMORY_VERSION = 1
 # (weighted_sum), which preserves the dominant LoRA without oversaturating (it defines
 # the auto-strength reference). Changes per-prefix mode selection for imbalanced stacks;
 # bump re-tunes them.
-AUTOTUNER_ALGO_VERSION = "1.12.0"
+AUTOTUNER_ALGO_VERSION = "1.13.0"  # H3 fidelity, dense payloads, preprocessing propagation
 
 
 def _warn_stale_tuner_data(tuner_data, context):
@@ -255,7 +256,7 @@ def _warn_stale_tuner_data(tuner_data, context):
             f"[{context}] tuner_data was produced by AutoTuner algo {version} "
             f"(current: {AUTOTUNER_ALGO_VERSION}) — its ranking may be stale. "
             f"Re-run the AutoTuner to refresh it.")
-ANALYSIS_CACHE_VERSION = "1.8.1"   # Bump when per-prefix conflict math changes (lora/pair/analysis caches)
+ANALYSIS_CACHE_VERSION = "1.9.0"   # Includes layout/payload/preprocessing semantics
 COMMUNITY_CACHE_REPO = "ethanfel/lora-optimizer-community-cache"
 COMMUNITY_CACHE_BASE_URL = (
     f"https://huggingface.co/datasets/{COMMUNITY_CACHE_REPO}/resolve/main"
@@ -598,6 +599,8 @@ class LoRAStack:
             },
             "optional": {
                 "lora_stack": ("LORA_STACK", {"tooltip": "Connect another LoRA Stack node here to chain multiple LoRAs together."}),
+                "h3_layout": (["auto", "comfy", "diffsynth"], {
+                    "default": "auto", "tooltip": "H3 source QKV layout: comfy = contiguous Q/K/V; diffsynth = raw interleaved heads. Select the training layout for ambiguous native PEFT default keys."}),
             }
         }
 
@@ -607,7 +610,7 @@ class LoRAStack:
     CATEGORY = "LoRA Optimizer"
     DESCRIPTION = "Adds a LoRA to the stack for use with LoRA Optimizer"
 
-    def add_to_stack(self, lora_name, strength, conflict_mode="all", key_filter="all", preserve=False, lora_stack=None):
+    def add_to_stack(self, lora_name, strength, conflict_mode="all", key_filter="all", preserve=False, lora_stack=None, h3_layout="auto"):
         lora_list = list(lora_stack) if lora_stack else []
 
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
@@ -621,6 +624,7 @@ class LoRAStack:
             "key_filter": key_filter,
             "preserve": bool(preserve),
             "metadata": _read_safetensors_metadata(lora_path),
+            "h3_layout": h3_layout,
         })
 
         return (lora_list,)
@@ -711,6 +715,9 @@ class LoRAStackDynamic:
                 "tooltip": "Filter LoRA dropdowns by base model type (dropdown mode only). Requires ComfyUI-Lora-Manager installed."
             }),
         }
+        for i in range(1, cls.MAX_LORAS + 1):
+            inputs["optional"][f"h3_layout_{i}"] = (["auto", "comfy", "diffsynth"], {
+                "default": "auto", "tooltip": "Source H3 QKV layout. Choose explicitly for ambiguous native PEFT adapters."})
         return inputs
 
     RETURN_TYPES = ("LORA_STACK",)
@@ -794,6 +801,9 @@ class LoRAStackDynamic:
                 clip_str = kwargs.get(f"clip_strength_{i}", 1.0)
                 preserve = bool(kwargs.get(f"preserve_{i}", False))
                 loras.append((resolved, model_str, clip_str, conflict_mode, kf, preserve))
+            layout = kwargs.get(f"h3_layout_{i}", "auto")
+            if layout != "auto":
+                loras[-1] = loras[-1] + (layout,)
 
         # Chained lora_stack entries
         if lora_stack is not None:
@@ -1013,6 +1023,55 @@ class _LoRAMergeBase:
     def __init__(self):
         self.loaded_loras = {}
         self._lora_format_cache = {}  # id(lora_dict) -> format_index (0-3)
+        self._normalized_loras = {}  # raw revision + layout, never overwrite source dictionaries
+        self._source_revisions = {}
+
+    _tensor_tokens = {}
+
+    @staticmethod
+    def _payload_revision(value):
+        """Session identity including tensor replacements/in-place mutations.
+
+        Weak identity tokens prevent address-reuse collisions. Ordinary tensors
+        use PyTorch's mutation counter (no weight copy); inference tensors have
+        no counter, so hash their bytes. Persistent caches use content hashes.
+        """
+        h = hashlib.sha256()
+
+        def feed(obj):
+            if isinstance(obj, torch.Tensor):
+                identity = id(obj)
+                tokens = _LoRAMergeBase._tensor_tokens
+                existing = tokens.get(identity)
+                if existing is None or existing[0]() is not obj:
+                    token = uuid.uuid4().hex
+                    ref = weakref.ref(obj, lambda ref, key=identity: tokens.pop(key, None)
+                                      if tokens.get(key, (None,))[0] is ref else None)
+                    tokens[identity] = (ref, token)
+                h.update(tokens[identity][1].encode())
+                try:
+                    h.update(str(obj._version).encode())
+                except RuntimeError:
+                    t = obj.detach().contiguous().cpu()
+                    h.update(t.reshape(-1).view(torch.uint8).numpy().tobytes())
+                h.update(str((tuple(obj.shape), str(obj.dtype), str(obj.device))).encode())
+            elif isinstance(obj, dict):
+                for key in sorted(obj, key=str):
+                    feed(key)
+                    feed(obj[key])
+            elif isinstance(obj, (tuple, list)):
+                h.update(b"sequence")
+                for item in obj:
+                    feed(item)
+            elif hasattr(obj, "weights"):
+                feed(type(obj).__name__)
+                feed(obj.weights)
+            else:
+                h.update(repr(obj).encode())
+            h.update(b"\0")
+
+        feed(value)
+        return h.hexdigest()
 
     def _track_model_identity(self, model, clip=None):
         """
@@ -1092,6 +1151,14 @@ class _LoRAMergeBase:
         """
         keys = list(lora_sd.keys())
         keys_str = ' '.join(k.lower() for k in keys)
+        # Text encoder q_proj names are shared with audio/LLM architectures.
+        # Resolve UNet bundles before their text-encoder keys trigger DiT/audio
+        # heuristics. UNet-only ambiguous SD1/SDXL inputs retain the old fallback.
+        unet_body = any(re.search(r'(?:^|[._])(?:down_blocks|up_blocks|mid_block|input_blocks|output_blocks)[._]', k) for k in keys)
+        if unet_body:
+            if 'lora_te1_' in keys_str or 'lora_te2_' in keys_str or any('text_encoder_2.' in k for k in keys):
+                return 'sdxl'
+            return 'sd15'
 
         # Ideogram 4: NextDiT-family single-stream DiT with the same
         # layers.N.attention.qkv pattern as Z-Image (Lumina2) — MUST be
@@ -1153,8 +1220,13 @@ class _LoRAMergeBase:
         if any(re.search(r'(?:^|[._])blocks[._]\d+[._](?:mlp[._]fc[12]|adaln_proj[._]linear)(?=[._])', k)
                for k in keys):
             return 'minimax_h3'
+        # Generic ff.net names also occur in UNets/LTX. Require a top-level
+        # H3 block and its distinctive AdaLN or released projection dimensions.
+        h3_root = r'^(?:(?:base_model\.model|transformer_ref|transformer|diffusion_model)\.)*transformer_blocks\.\d+\.'
         _h3_diffusers_blocks = any(
-            re.search(r'transformer_blocks[._]\d+[._](?:ff[._]net[._](?:0[._]proj|2)|adaln_proj[._]linear)', k)
+            re.search(h3_root + r'adaln_proj\.linear', k)
+            or (re.search(h3_root + r'ff\.net\.(?:0\.proj|2)', k)
+                and any(d in (28672, 14336, 5376) for d in getattr(lora_sd[k], 'shape', ())))
             for k in keys)
         if _h3_diffusers_blocks:
             return 'minimax_h3'
@@ -1608,6 +1680,7 @@ class _LoRAMergeBase:
 
     # LoRA weight suffixes (longest-first to avoid partial matches)
     _LORA_KEY_SUFFIXES = [
+        ".lora_mid.weight", ".dora_scale", ".diff_b", ".diff",
         ".lora_up.weight", ".lora_down.weight",
         "_lora.up.weight", "_lora.down.weight",
         ".lora_B.weight", ".lora_A.weight",
@@ -2055,17 +2128,9 @@ class _LoRAMergeBase:
         try:
             alpha = float(raw_alpha)
         except (TypeError, ValueError):
-            logging.warning(
-                f"[LoRA Optimizer] MiniMax H3 LoRA {name or '<memory>'!r} has "
-                f"non-numeric safetensors alpha {raw_alpha!r}; using the "
-                "ordinary alpha=rank fallback.")
-            return lora_sd
+            raise ValueError(f"MiniMax H3 {name or '<memory>'}: invalid metadata alpha {raw_alpha!r}")
         if not math.isfinite(alpha):
-            logging.warning(
-                f"[LoRA Optimizer] MiniMax H3 LoRA {name or '<memory>'!r} has "
-                f"non-finite safetensors alpha {raw_alpha!r}; using the "
-                "ordinary alpha=rank fallback.")
-            return lora_sd
+            raise ValueError(f"MiniMax H3 {name or '<memory>'}: non-finite metadata alpha {raw_alpha!r}")
 
         pair_suffixes = (
             ('.lora_A.default.weight', '.lora_B.default.weight'),
@@ -2095,7 +2160,7 @@ class _LoRAMergeBase:
         return out
 
     @classmethod
-    def _normalize_keys_minimax_h3(cls, lora_sd):
+    def _normalize_keys_minimax_h3(cls, lora_sd, layout="auto"):
         """Normalize MiniMax H3 LoRAs to ComfyUI's native module layout.
 
         Supported inputs:
@@ -2112,14 +2177,18 @@ class _LoRAMergeBase:
         reverse order from the reference ``mlp.fc1``; only the up/B rows need
         swapping.
         """
-        # DiffSynth trains against raw H3 checkpoint tensors, whose fused QKV
-        # rows are per-head interleaved. Its PEFT ``default`` infix over native
-        # qkv_proj names is the published format discriminator. LightX2V also
-        # uses ``default``, but on already-split Diffusers to_q/to_k/to_v keys.
-        is_diffsynth = any(
+        # PEFT's adapter name is NOT a layout discriminator: DiffSynth trains
+        # against both raw interleaved and contiguous Comfy checkpoints.
+        if layout not in ("auto", "comfy", "diffsynth"):
+            raise ValueError(f"Unknown MiniMax H3 source layout: {layout!r}")
+        ambiguous = any(
             isinstance(key, str)
             and '.attn.qkv_proj.lora_A.default.weight' in key
             for key in lora_sd)
+        if ambiguous and layout == "auto":
+            raise ValueError("Ambiguous MiniMax H3 QKV layout. Set h3_layout to 'comfy' "
+                             "for contiguous Comfy/pruned training or 'diffsynth' for raw interleaved training.")
+        is_diffsynth = layout == "diffsynth"
 
         # DiffSynth/LightX2V/PEFT may insert an adapter-name component. The optimizer's
         # LoRA parser expects the ordinary suffix; ``default`` carries no
@@ -2130,6 +2199,8 @@ class _LoRAMergeBase:
             key = key.replace('.lora_B.default.weight', '.lora_B.weight')
             key = key.replace('.lora_down.default.weight', '.lora_down.weight')
             key = key.replace('.lora_up.default.weight', '.lora_up.weight')
+            if key in suffix_fixed:
+                raise ValueError(f"Duplicate H3 adapter key after suffix normalization: {key}")
             suffix_fixed[key] = value
 
         flattened_modules = [
@@ -2217,10 +2288,12 @@ class _LoRAMergeBase:
             # [gate; value]. This is an output-row permutation, so A/down is
             # untouched and B/up alone is swapped.
             if (from_diffusers_fc1
-                    and suffix in ('.lora_B.weight', '.lora_up.weight', '.lora.up.weight')
-                    and isinstance(value, torch.Tensor) and value.shape[0] % 2 == 0):
+                    and suffix in ('.lora_B.weight', '.lora_up.weight', '.lora.up.weight', '.diff', '.diff_b')
+                    and isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] % 2 == 0):
                 half = value.shape[0] // 2
                 value = torch.cat([value[half:], value[:half]], dim=0)
+            if module + suffix in canonical:
+                raise ValueError(f"Duplicate H3 adapter target after normalization: {module + suffix}")
             canonical[module + suffix] = value
 
         normalized = {}
@@ -2237,6 +2310,21 @@ class _LoRAMergeBase:
         # Splitting avoids a 3x-rank block-diagonal conversion and lets the
         # optimizer make component-specific conflict decisions.
         for base in attn_bases:
+            if f'{base}.qkv_proj.diff' in canonical and any(
+                    f'{base}.qkv_proj{suffix}' in canonical for suffix in
+                    ('.lora_A.weight', '.lora_down.weight', '.lora.down.weight')):
+                raise ValueError(f"Ambiguous dense and factor QKV updates at {base}; stock loader override semantics cannot be merged additively.")
+            # Dense QKV updates use exactly the same output-row permutation.
+            for suffix in ('.diff', '.diff_b'):
+                dense_key = f"{base}.qkv_proj{suffix}"
+                if is_diffsynth and dense_key in canonical:
+                    dense = canonical[dense_key]
+                    if dense.ndim == 0 or dense.shape[0] % 384:
+                        raise ValueError(f"MiniMax H3 interleaved QKV shape is invalid: {dense.shape}")
+                    heads = dense.shape[0] // 384
+                    canonical[dense_key] = torch.cat([
+                        part.reshape(heads * 128, *dense.shape[1:])
+                        for part in dense.reshape(heads, 384, *dense.shape[1:]).split(128, dim=1)], dim=0)
             for down_suffix, up_suffix in (
                     ('.lora_A.weight', '.lora_B.weight'),
                     ('.lora_down.weight', '.lora_up.weight'),
@@ -2280,6 +2368,8 @@ class _LoRAMergeBase:
 
         for key, value in canonical.items():
             if key not in processed:
+                if key in normalized:
+                    raise ValueError(f"Overlapping fused and split H3 payloads: {key}")
                 normalized[key] = value
         return normalized
 
@@ -2324,12 +2414,10 @@ class _LoRAMergeBase:
         if all(isinstance(p, tuple) and len(p) >= 2 and p[0] == "diff"
                for p in component_patches):
             parts = [p[1][0] for p in component_patches]
-            device, store_dtype = parts[0].device, parts[0].dtype
+            device = parts[0].device
             parts = [part if part.device == device else part.to(device)
                      for part in parts]
             out = torch.cat(parts, dim=0)
-            if store_dtype not in (torch.float32, torch.float64):
-                out = out.to(store_dtype)
             return ("diff", (out,))
 
         if all(isinstance(p, LoRAAdapter) for p in component_patches):
@@ -2388,12 +2476,10 @@ class _LoRAMergeBase:
                for p in component_patches):
             parts = [_LoRAMergeBase._expand_patch_to_diff(p)
                      for p in component_patches]
-            device, store_dtype = parts[0].device, parts[0].dtype
+            device = parts[0].device
             parts = [part if part.device == device else part.to(device)
                      for part in parts]
             out = torch.cat(parts, dim=0)
-            if store_dtype not in (torch.float32, torch.float64):
-                out = out.to(store_dtype)
             return ("diff", (out,))
         return None
 
@@ -2411,7 +2497,7 @@ class _LoRAMergeBase:
         offset_groups = {}  # native target -> {start: (key, patch, length)}
         native_qkv_re = re.compile(
             r'(?:layers\.\d+\.attention\.qkv|'
-            r'(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj)$')
+            r'(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj)(?:\.weight)?$')
 
         for key, patch in patches.items():
             key_str = key[0] if isinstance(key, tuple) else key
@@ -2458,6 +2544,23 @@ class _LoRAMergeBase:
                 fused[key] = patch
 
         for target, pieces in offset_groups.items():
+            # Partial H3 adapters still need a full fused target on export.
+            if '.attn.qkv_proj' in target and pieces:
+                lengths = {entry[2] for entry in pieces.values()}
+                if len(lengths) != 1:
+                    raise ValueError(f"Inconsistent H3 QKV slice lengths: {target}")
+                rows = next(iter(lengths))
+                if rows <= 0 or any(start not in (0, rows, 2 * rows) for start in pieces):
+                    raise ValueError(f"Invalid H3 QKV slice offset: {target}")
+                exemplar = next(iter(pieces.values()))[1]
+                for start in (0, rows, 2 * rows):
+                    if start not in pieces:
+                        if isinstance(exemplar, LoRAAdapter) and cls._is_plain_additive_payload(exemplar):
+                            w = exemplar.weights
+                            zero = LoRAAdapter(set(), (torch.zeros_like(w[0]), w[1], w[2], None, None, None))
+                        else:
+                            zero = ("diff", (torch.zeros_like(cls._expand_patch_to_diff(exemplar)),))
+                        pieces[start] = ((target, (0, start, rows)), zero, rows)
             ordered = sorted(pieces.items())
             complete = (len(ordered) == 3 and ordered[0][0] == 0
                         and all(ordered[i][0] + ordered[i][1][2] == ordered[i + 1][0]
@@ -2515,7 +2618,7 @@ class _LoRAMergeBase:
         offset correctness can be unit-tested without a live ComfyUI model.
         """
         target_re = re.compile(
-            r'^diffusion_model\.(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj$')
+            r'^diffusion_model\.(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj(?:\.weight)?$')
         targets = {
             target for target in model_keys.values()
             if isinstance(target, str) and target_re.match(target)
@@ -2526,7 +2629,7 @@ class _LoRAMergeBase:
             if shape is None or len(shape) < 1 or shape[0] % 3:
                 continue
             rows = shape[0] // 3
-            base = target[:-len('qkv_proj')]
+            base = target.removesuffix('.weight')[:-len('qkv_proj')]
             for index, component in enumerate(('to_q', 'to_k', 'to_v')):
                 model_keys[base + component] = (
                     target, (0, index * rows, rows))
@@ -2811,6 +2914,8 @@ class _LoRAMergeBase:
         """Collect all LoRA key prefixes from a stack in deterministic order."""
         all_lora_prefixes = set()
         suffixes = [
+            ".diff",
+            ".lora_mid.weight",
             ".lora_up.weight", ".lora_down.weight",
             "_lora.up.weight", "_lora.down.weight",
             ".lora_B.weight", ".lora_A.weight",
@@ -2832,6 +2937,9 @@ class _LoRAMergeBase:
                     all_lora_prefixes.add(key)
                 continue
             for key in item["lora"].keys():
+                if key.endswith('.diff_b'):
+                    all_lora_prefixes.add(key[:-len('.diff_b')] + '.__bias__')
+                    continue
                 for suffix in suffixes:
                     if key.endswith(suffix):
                         all_lora_prefixes.add(key[:-len(suffix)])
@@ -2841,11 +2949,147 @@ class _LoRAMergeBase:
     @staticmethod
     def _resolve_target_key(lora_prefix, model_keys, clip_keys):
         """Resolve a LoRA prefix to a model/CLIP target key."""
+        if isinstance(lora_prefix, str) and lora_prefix.endswith('.__bias__'):
+            base = lora_prefix[:-len('.__bias__')]
+            target, is_clip = _LoRAMergeBase._resolve_target_key(base, model_keys, clip_keys)
+            if isinstance(target, str) and target.endswith('.weight'):
+                return target[:-len('.weight')] + '.bias', is_clip
+            return None, False
         if lora_prefix in model_keys:
             return (model_keys[lora_prefix], False)
         if lora_prefix in clip_keys:
             return (clip_keys[lora_prefix], True)
         return (None, False)
+
+    @staticmethod
+    def _get_dense_payload(lora_dict, alias):
+        if not isinstance(alias, str):
+            return None
+        if alias.endswith('.__bias__'):
+            return lora_dict.get(alias[:-len('.__bias__')] + '.diff_b')
+        return lora_dict.get(alias + '.diff')
+
+    def _validate_file_payloads(self, active_loras):
+        """Reject base-dependent/unknown bundles before any model mutation."""
+        for item in active_loras:
+            if item.get('_precomputed_diffs'):
+                bad = [str(k) for k, payload in item['lora'].items()
+                       if not isinstance(payload, torch.Tensor) and not self._is_plain_additive_payload(payload)]
+                if bad:
+                    raise ValueError(f"{item['name']}: base-dependent/unsupported virtual payloads at {bad[:5]}; keep DoRA/reshape patches on the original loader.")
+                continue
+            sd = item['lora']
+            meta = item.get('metadata') or {}
+            if (any(str(k).startswith('pdd_') for k in meta)
+                    or any(k in sd and getattr(sd[k], 'ndim', 0) == 3
+                           for k in ('proj_out.weight', 'audio_proj_out.weight'))):
+                raise ValueError(f"{item['name']}: PDD includes runtime prediction heads and a trained schedule; "
+                                 "use its dedicated loader. Ordinary merge/export is unsupported.")
+            bad = [k for k in sd if 'dora_scale' in k or 'lora_magnitude_vector' in k]
+            if bad:
+                raise ValueError(f"{item['name']}: DoRA is base-dependent and cannot be merged/exported as plain LoRA. "
+                                 "Use the stock loader outside the optimizer.")
+            unknown = [k for k in sd if not self._split_lora_suffix(k)[1]]
+            if unknown:
+                raise ValueError(f"{item['name']}: unsupported adapter tensors (nothing applied): {unknown[:5]}. "
+                                 "Check the source format and enable key normalization if required.")
+            for alias in self._collect_lora_prefixes([item]):
+                dense = self._get_dense_payload(sd, alias)
+                info = self._get_lora_key_info(sd, alias)
+                exotic = self._has_lokr_keys(sd, alias) or self._has_loha_keys(sd, alias)
+                if dense is not None:
+                    if info is not None or exotic:
+                        raise ValueError(f"{item['name']}: {alias} contains both dense and factor weight updates; ambiguous loader semantics.")
+                    if not isinstance(dense, torch.Tensor) or dense.ndim < 1 or dense.numel() == 0:
+                        raise ValueError(f"{item['name']}: invalid dense payload {alias}")
+                elif info is None and not exotic:
+                    raise ValueError(f"{item['name']}: incomplete/unsupported adapter factors at {alias}")
+                if info is not None:
+                    up, down, alpha, mid = info
+                    if (up.ndim < 2 or down.ndim < 2 or down.shape[0] <= 0
+                            or up.shape[1] != down.shape[0] or not math.isfinite(float(alpha))):
+                        raise ValueError(f"{item['name']}: invalid LoRA shape/rank/alpha at {alias}")
+                    format_count = sum(alias + suffix in sd for suffix in (
+                        '.lora_A.weight', '.lora_down.weight', '_lora.down.weight', '.lora.down.weight'))
+                    if format_count > 1:
+                        raise ValueError(f"{item['name']}: multiple factor formats at {alias}; split or deduplicate the adapter.")
+
+    def _preflight_coverage(self, active_loras, model, clip, model_keys, clip_keys):
+        """Cheap shape/target accounting before merge, including cached replays."""
+        coverage = []
+        records = []
+        contributors = {}
+        for item in active_loras:
+            prefixes = self._collect_lora_prefixes([item])
+            record = dict(name=item['name'], tensors=len(item['lora']), expected=len(prefixes),
+                          applied=0, filtered=0, missing=[], shape_mismatch=[], compatibility='unknown',
+                          tensor_kinds={kind: sum(str(k).endswith(suffix) for k in item['lora'])
+                                        for kind, suffix in [('dense', '.diff'), ('bias', '.diff_b'),
+                                                             ('alpha', '.alpha'), ('middle', '.lora_mid.weight')]})
+            coverage.append(record)
+            for alias in prefixes:
+                target, is_clip = self._resolve_target_key(alias, model_keys, clip_keys)
+                if target is None and item.get('_precomputed_diffs'):
+                    target = alias
+                    is_clip = alias in set(clip_keys.values())
+                records.append((item, record, alias, target, is_clip))
+                if target is not None:
+                    contributors.setdefault((target, is_clip), set()).add(id(item))
+        for item, record, alias, target, is_clip in records:
+            base_profile = getattr(getattr(model, 'model', None), 'lora_optimizer_h3_profile', {})
+            for field in ('partition', 'basis'):
+                expected = item.get('h3_' + field)
+                actual = base_profile.get(field) if isinstance(base_profile, dict) else None
+                if expected and actual and expected != actual:
+                    raise ValueError(f"{item['name']}: H3 {field} {expected!r} != target {actual!r}.")
+            if isinstance(base_profile, dict) and all(item.get('h3_' + f) and base_profile.get(f) == item.get('h3_' + f)
+                   for f in ('partition', 'basis')):
+                record['compatibility'] = 'explicit profile match (not a content fingerprint)'
+            label = str(alias).lower()
+            kf = item.get('key_filter', 'all')
+            n = len(contributors.get((target, is_clip), ()))
+            if ((kf == 'audio_only' and 'audio' not in label) or (kf == 'no_audio' and 'audio' in label)
+                    or (kf == 'shared_only' and n < 2) or (kf == 'unique_only' and n != 1)):
+                record['filtered'] += 1
+                continue
+            strict = (item.get('_architecture') == 'minimax_h3'
+                      or self._detected_arch == 'minimax_h3'
+                      or self._get_dense_payload(item['lora'], alias) is not None)
+            if target is None:
+                record['missing'].append(str(alias))
+                if strict:
+                    raise ValueError(f"{item['name']}: adapter target {alias} is missing. Refusing partial application.")
+                continue
+            try:
+                shape = tuple(self._resolve_target_shape(target, is_clip, model, clip))
+            except (AttributeError, RuntimeError, IndexError, TypeError, KeyError):
+                record['missing'].append(str(alias))
+                if strict:
+                    raise ValueError(f"{item['name']}: target parameter {target} is unavailable. Refusing partial application.")
+                continue
+            dense = self._get_dense_payload(item['lora'], alias)
+            info = None if item.get('_precomputed_diffs') else self._get_lora_key_info(item['lora'], alias)
+            source_shape = None
+            if dense is not None:
+                source_shape = tuple(dense.shape)
+                matches = source_shape == shape
+            elif info is not None:
+                up, down, alpha, mid = info
+                cols = math.prod(down.shape[1:])
+                if mid is not None:
+                    cols = down.shape[1] * math.prod(mid.shape[2:])
+                source_shape = (up.shape[0], cols)
+                matches = bool(shape) and source_shape == (shape[0], math.prod(shape[1:]))
+            else:
+                matches = True  # exotic/virtual shapes are checked during expansion
+            if not matches:
+                record['shape_mismatch'].append(dict(target=str(target), source=source_shape, model=shape))
+                if strict:
+                    raise ValueError(f"{item['name']}: {target} shape {source_shape} != model {shape}. "
+                                     "Check full/pruned H3 base and AdaLN basis; automatic conversion is not supported.")
+            else:
+                record['applied'] += 1
+        return coverage
 
     @staticmethod
     def _make_target_group_id(target_key, is_clip):
@@ -3098,6 +3342,8 @@ class _LoRAMergeBase:
                     try:
                         diff = diff.reshape(target_shape)
                     except RuntimeError:
+                        if item.get('_architecture') == 'minimax_h3' or self._detected_arch == 'minimax_h3':
+                            raise ValueError(f"{item['name']}: H3 virtual delta shape {tuple(diff.shape)} != target {tuple(target_shape)}")
                         diff = None
                     if diff is not None:
                         raw_contributors.add(i)
@@ -3132,6 +3378,17 @@ class _LoRAMergeBase:
                             storage_dtype = raw.dtype if isinstance(raw, torch.Tensor) else diff.dtype
                         diff_accum = diff
                 if diff_accum is not None:
+                    if _clean_on and not item.get('preserve', False):
+                        if _star_eta < 100.0:
+                            diff_accum = self._star_truncate_rescale(diff_accum, _star_eta)
+                        if _tame > 0:
+                            if not _base_norm_tried:
+                                _base_norm = self._resolve_base_norm(target_key, is_clip, model, clip)
+                                _base_norm_tried = True
+                            if _base_norm:
+                                diff_accum = diff_accum * self._tame_scale(
+                                    diff_accum.float().norm().item(), _base_norm,
+                                    getattr(self, '_tame_threshold', 0.3), _tame)
                     aggregated[i] = diff_accum
                     ranks[i] = rank_sum
                     rank_bounds_known[i] = rank_bound_known
@@ -3183,14 +3440,23 @@ class _LoRAMergeBase:
                         diff_accum = diff if diff_accum is None else diff_accum + diff
                     continue
 
-                if lora_info is not None:
+                dense = self._get_dense_payload(item['lora'], alias)
+                if dense is not None:
+                    rank_bound_known = False
+                    rank_sum += 1
+                    raw_contributors.add(i)
+                    storage_dtype = dense.dtype if storage_dtype is None else torch.promote_types(storage_dtype, dense.dtype)
+                    if tuple(dense.shape) != tuple(target_shape):
+                        raise ValueError(f"{item['name']}: dense {alias} shape {tuple(dense.shape)} != target {tuple(target_shape)}")
+                    diff = dense.to(device=device, dtype=torch.float32) if device is not None else dense.float()
+                elif lora_info is not None:
                     mat_up, mat_down, alpha, mid = lora_info
                     rank_sum += mat_down.shape[0]
                     if not linear_rank_bound:
                         rank_bound_known = False
                     raw_contributors.add(i)
-                    if storage_dtype is None:
-                        storage_dtype = mat_up.dtype
+                    item_dtype = torch.promote_types(mat_up.dtype, mat_down.dtype)
+                    storage_dtype = item_dtype if storage_dtype is None else torch.promote_types(storage_dtype, item_dtype)
                     diff = self._compute_lora_diff(
                         mat_up, mat_down, alpha, mid, target_shape,
                         device=device if use_gpu else None,
@@ -3221,6 +3487,8 @@ class _LoRAMergeBase:
                         try:
                             reshaped = diff.reshape(target_shape)
                         except RuntimeError:
+                            if item.get('_architecture') == 'minimax_h3' or self._detected_arch == 'minimax_h3':
+                                raise ValueError(f"{item['name']}: H3 reconstructed shape {tuple(diff.shape)} != target {tuple(target_shape)}")
                             # LoKr/LoHa reconstructs to a shape that doesn't match
                             # the target model weight (e.g. a narrow block trained
                             # on a different model variant) — this layer is dropped.
@@ -3353,6 +3621,8 @@ class _LoRAMergeBase:
         Extracts LoRA information for the given key.
         Returns (mat_up, mat_down, alpha, mid) or None for standard LoRA.
         """
+        if f"{key_prefix}.dora_scale" in lora_dict:
+            raise ValueError(f"DoRA at {key_prefix} is base-dependent; plain additive conversion is unsupported")
         # LoRA key formats
         formats = [
             ("{}.lora_up.weight", "{}.lora_down.weight"),           # regular
@@ -5162,17 +5432,24 @@ class _LoRAMergeBase:
                 preserve = bool(entry[5]) if len(entry) > 5 else False
 
                 # Load LoRA with caching
+                lora_path = folder_paths.get_full_path("loras", lora_name)
+                try:
+                    stat = os.stat(lora_path) if lora_path else None
+                    revision = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size) if stat else None
+                except OSError:
+                    revision = None
+                if lora_name in self._source_revisions and self._source_revisions[lora_name] != revision:
+                    self.loaded_loras.pop(lora_name, None)
+                self._source_revisions[lora_name] = revision
                 if lora_name in self.loaded_loras:
                     lora_dict = self.loaded_loras[lora_name]
-                    lora_path = None
                 else:
                     try:
                         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
                         lora_dict = comfy.utils.load_torch_file(lora_path, safe_load=True)
                         self.loaded_loras[lora_name] = lora_dict
                     except Exception as e:
-                        logging.warning(f"[LoRA Optimizer] Failed to load LoRA '{lora_name}': {e}")
-                        continue
+                        raise ValueError(f"Failed to load requested LoRA '{lora_name}'; no partial stack will be applied: {e}") from e
 
                 metadata = {}
                 if lora_path is not None:
@@ -5187,6 +5464,7 @@ class _LoRAMergeBase:
                     "key_filter": key_filter,
                     "preserve": preserve,
                     "metadata": metadata,
+                    "h3_layout": entry[6] if len(entry) > 6 else "auto",
                 })
 
             elif isinstance(entry, dict):
@@ -5204,12 +5482,14 @@ class _LoRAMergeBase:
                     "preserve": bool(entry.get("preserve", False)),
                     "metadata": entry.get("metadata", {}),
                     "_precomputed_diffs": entry.get("_precomputed_diffs", False),
+                    "_in_memory_source": entry.get("_in_memory_source", not entry.get("_resolved_file_name")),
+                    "h3_layout": entry.get("h3_layout", "auto"),
                 }
                 # Inline/AutoTuner identity must survive normalization. A
                 # resolved loader filename reconciles captured runs with the
                 # file-based cache; the memoized hash avoids re-hashing large
                 # captured factor dictionaries for every tuner candidate.
-                for identity_key in ("_resolved_file_name", "_content_hash"):
+                for identity_key in ("_resolved_file_name", "_content_hash", "_content_hash_revision", "_analysis_context", "_architecture", "h3_partition", "h3_basis", "h3_source_layout", "h3_components"):
                     if identity_key in entry:
                         normalized_item[identity_key] = entry[identity_key]
                 normalized.append(normalized_item)
@@ -5227,9 +5507,13 @@ class _LoRAMergeBase:
                 if item.get("_precomputed_diffs"):
                     continue  # virtual LoRAs have model-space keys, not LoRA keys
                 detected = self._detect_architecture(item["lora"])
-                if detected != "unknown":
+                if detected == "unknown":
+                    detected = item.get("_architecture", "unknown")
+                    if detected == "unknown" and _arch_hint == "minimax_h3":
+                        detected = _arch_hint
+                item["_architecture"] = detected
+                if item['strength'] != 0 and detected != "unknown" and arch == "unknown":
                     arch = detected
-                    break
             # Fallback for all-virtual (inline-captured) or mixed stacks whose
             # file items didn't resolve: virtual items are keyed by MODEL-SPACE
             # target keys, which STILL carry structural architecture markers
@@ -5253,7 +5537,7 @@ class _LoRAMergeBase:
                     arch = _arch_hint
                 else:
                     for item in normalized:
-                        if not item.get("_precomputed_diffs"):
+                        if not item.get("_precomputed_diffs") or item['strength'] == 0:
                             continue
                         detected = self._detect_architecture(
                             self._stringify_lora_keys(item["lora"]))
@@ -5261,6 +5545,12 @@ class _LoRAMergeBase:
                             arch = detected
                             break
             self._detected_arch = arch if arch != "unknown" else None
+            known = {item.get('_architecture') for item in normalized if item['strength'] != 0}
+            known -= {None, 'unknown'}
+            if 'minimax_h3' in known and len(known) > 1:
+                raise ValueError(f"MiniMax H3 cannot be merged with a different architecture: {sorted(known)}")
+            if 'minimax_h3' in known and _arch_hint not in (None, 'unknown', 'minimax_h3'):
+                raise ValueError(f"MiniMax H3 adapter does not match the target model architecture {_arch_hint}.")
 
             # H3 Diffusers/LightX2V files may carry one uniform network alpha
             # only in the safetensors header. Materialize it before optional
@@ -5269,6 +5559,8 @@ class _LoRAMergeBase:
             if arch == "minimax_h3":
                 partition_items = {}
                 for item in normalized:
+                    if item.get('_architecture') != 'minimax_h3' or item['strength'] == 0:
+                        continue
                     if not item.get("_precomputed_diffs"):
                         component_prefixes = set()
                         for raw_key in item["lora"]:
@@ -5287,8 +5579,13 @@ class _LoRAMergeBase:
                                 "contains both transformer and transformer_ref "
                                 "components. A ComfyUI MODEL represents only one H3 "
                                 "partition; split the components and use the matching base.")
-                        if component_prefixes:
-                            partition = next(iter(component_prefixes))
+                        # Component prefixes identify pipeline slots, not a
+                        # verified training/base fingerprint. Keep them as
+                        # provenance; only explicit metadata asserts partition.
+                        item["h3_components"] = sorted(component_prefixes) or item.get('h3_components', [])
+                        partition = item.get("h3_partition") or item.get("metadata", {}).get("lora_optimizer_h3_partition")
+                        if partition:
+                            item["h3_partition"] = partition
                             partition_items.setdefault(partition, []).append(
                                 item.get("name", "<memory>"))
 
@@ -5305,6 +5602,18 @@ class _LoRAMergeBase:
                                 item["metadata"] = metadata
                         item["lora"] = self._apply_minimax_h3_metadata_alpha(
                             item["lora"], metadata, item.get("name"))
+                        item["h3_basis"] = item.get("h3_basis") or metadata.get("lora_optimizer_h3_basis")
+                        partition = item.get('h3_partition') or metadata.get('lora_optimizer_h3_partition')
+                        if partition:
+                            item['h3_partition'] = partition
+                            partition_items.setdefault(partition, []).append(item['name'])
+                        if item.get("h3_layout", "auto") == "auto":
+                            item["h3_layout"] = metadata.get("lora_optimizer_h3_layout", "auto")
+                        if normalize_keys != 'enabled' and item.get('h3_layout') == 'diffsynth':
+                            raise ValueError("Interleaved H3 layout requires normalize_keys='enabled'.")
+                bases = {item.get('h3_basis') for item in normalized if item['strength'] != 0 and item.get('h3_basis')}
+                if len(bases) > 1:
+                    raise ValueError(f"MiniMax H3 adapters specify different AdaLN bases: {sorted(bases)}")
                 if len(partition_items) > 1:
                     raise ValueError(
                         "MiniMax H3 stack mixes explicit transformer (FL2VA/T2VA) "
@@ -5320,19 +5629,30 @@ class _LoRAMergeBase:
                     logging.info(f"[LoRA Optimizer] Architecture detected: {arch}")
                     logging.info(f"[LoRA Optimizer] Normalizing keys for {len(normalized)} LoRAs...")
                     for item in normalized:
-                        if not item.get("_precomputed_diffs"):
-                            item["lora"] = self._normalize_keys(item["lora"], arch)
+                        if not item.get("_precomputed_diffs") and item['strength'] != 0:
+                            item_arch = item.get("_architecture", "unknown")
+                            if item_arch == "unknown" and _arch_hint:
+                                item_arch = _arch_hint
+                            layout = item.get("h3_layout", "auto")
+                            cache_key = (self._payload_revision(item["lora"]), item_arch, layout)
+                            cached = self._normalized_loras.get(item["name"])
+                            if cached is not None and cached[0] == cache_key:
+                                item["lora"] = cached[1]
+                            else:
+                                raw = item["lora"]
+                                item["lora"] = (self._normalize_keys_minimax_h3(raw, layout=layout)
+                                                if item_arch == "minimax_h3" else self._normalize_keys(raw, item_arch))
+                                self._normalized_loras[item["name"]] = (cache_key, item["lora"])
+                            if item_arch == "minimax_h3":
+                                item["h3_source_layout"] = item.get("h3_source_layout", layout)
+                                item["h3_layout"] = "comfy"
                 else:
                     logging.info("[LoRA Optimizer] Architecture: unknown (no key normalization applied)")
 
-            # Update loaded_loras cache to point at normalized dicts so the
-            # pre-normalization copies can be garbage-collected.  This avoids
-            # keeping both raw and normalized state dicts in memory (saves
-            # 500MB-3GB for large models like Qwen).
-            for item in normalized:
-                name = item["name"]
-                if name in self.loaded_loras:
-                    self.loaded_loras[name] = item["lora"]
+            # Keep raw inputs immutable: toggling normalization/layout must
+            # never operate on a previously transformed cached dictionary.
+            names = {item["name"] for item in normalized}
+            self._normalized_loras = {k: v for k, v in self._normalized_loras.items() if k in names}
         else:
             self._detected_arch = None
 
@@ -6086,6 +6406,9 @@ def _extract_lora_svd(delta: torch.Tensor, rank: int, rank_mode: str, energy_thr
     NEAR_ZERO_NORM = 1e-8
     SV_FLOOR_RATIO = 1e-4  # drop singular values below floor_ratio * S[0]
 
+    if rank < 1 or rank_mode not in ('auto', 'fixed') or not 0 < energy_threshold <= 1:
+        raise ValueError('Extraction requires rank >= 1, auto/fixed mode, and energy in (0, 1].')
+
     if delta.norm().item() < NEAR_ZERO_NORM:
         return None
 
@@ -6113,7 +6436,11 @@ def _extract_lora_svd(delta: torch.Tensor, rank: int, rank_mode: str, energy_thr
     if rank_mode == "auto":
         energy_cumsum = S.pow(2).cumsum(0) / S.pow(2).sum()
         r = int((energy_cumsum < energy_threshold).sum().item()) + 1
-        r = min(r, S.shape[0])
+        r = min(r, S.shape[0], rank)
+        achieved = float(energy_cumsum[r - 1])
+        if achieved < energy_threshold:
+            logging.warning(f"[LoRAExtract] Rank capped at {r}: retained {achieved:.2%} "
+                            f"of above-floor delta energy (requested {energy_threshold:.2%})")
     else:
         r = min(rank, S.shape[0])
 
@@ -6339,6 +6666,28 @@ class LoRAOptimizer(_LoRAMergeBase):
                    for item in active_loras)
 
     @staticmethod
+    def _model_revision(model, clip=None):
+        """Session identity plus Comfy's patch revision; never just display names."""
+        def identity(patcher):
+            if patcher is None:
+                return None
+            p = getattr(patcher, 'patcher', patcher)
+            return (id(patcher), str(getattr(p, 'patches_uuid', '')),
+                    _LoRAMergeBase._payload_revision(getattr(p, 'patches', {})))
+        return (identity(model), identity(clip))
+
+    @staticmethod
+    def _model_shape_signature(model, clip=None):
+        signatures = []
+        for obj in (getattr(model, 'model', None), getattr(clip, 'cond_stage_model', None)):
+            try:
+                signatures.append((type(obj).__name__, [(k, tuple(v.shape), str(v.dtype))
+                                   for k, v in obj.state_dict().items()]))
+            except AttributeError:
+                signatures.append(type(obj).__name__)
+        return signatures
+
+    @staticmethod
     def _compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, auto_strength, optimization_mode="per_prefix", patch_compression="smart", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_refinement="none", strategy_set="full", architecture_preset="auto", auto_strength_floor=-1.0, decision_smoothing=0.25, smooth_slerp_gate=False, star_eta=100.0, tame_layers=0.0, tame_threshold=0.3):
         """
         Build a deterministic SHA-256 hash (16 hex chars) from the stack
@@ -6358,15 +6707,24 @@ class LoRAOptimizer(_LoRAMergeBase):
                     kf = entry[4] if len(entry) > 4 else "all"
                     pres = bool(entry[5]) if len(entry) > 5 else False
                     cs = float(entry[2]) if entry[2] is not None else -1.0
-                    entries.append((str(entry[0]), float(entry[1]), cs, cm, kf, pres))
+                    path = folder_paths.get_full_path("loras", str(entry[0]))
+                    try:
+                        stat = os.stat(path) if path else None
+                        file_rev = (stat.st_mtime_ns, stat.st_size) if stat else None
+                    except OSError:
+                        file_rev = None
+                    entries.append((str(entry[0]), float(entry[1]), cs, cm, kf, pres,
+                                    str(entry[6] if len(entry) > 6 else "auto"), str(file_rev)))
                 elif isinstance(entry, dict):
                     cm = entry.get("conflict_mode", "all")
                     kf = entry.get("key_filter", "all")
                     pres = bool(entry.get("preserve", False))
                     cs_raw = entry.get("clip_strength", None)
                     cs = float(cs_raw) if cs_raw is not None else -1.0
-                    entries.append((str(entry.get("name", "")), float(entry.get("strength", 0)), cs, cm, kf, pres))
-            entries.sort()
+                    revision = _LoRAMergeBase._payload_revision((entry.get("lora"), entry.get("metadata"),
+                                entry.get("h3_layout"), entry.get("h3_partition"), entry.get("h3_basis")))
+                    entries.append((str(entry.get("name", "")), float(entry.get("strength", 0)), cs, cm, kf, pres, revision))
+            # Order is relevant to some strategies; do not alias reordered stacks.
             h.update(json.dumps(entries).encode())
         h.update(f"|os={output_strength}|csm={clip_strength_multiplier}|as={auto_strength}|om={optimization_mode}|cp={patch_compression}|sd={svd_device}|nk={normalize_keys}|sp={sparsification}|spd={sparsification_density}|dd={dare_dampening}|mso={merge_strategy_override}|mq={merge_refinement}|bp={strategy_set}|ap={architecture_preset}|asf={auto_strength_floor}|ds={decision_smoothing}|ssg={smooth_slerp_gate}".encode())
         # Fold per-LoRA cleaning ONLY when active, so default-off keys stay
@@ -6420,7 +6778,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                    merge_strategy_override="", merge_refinement="none",
                    strategy_set="full", architecture_preset="auto",
                    decision_smoothing=0.25, smooth_slerp_gate=False,
-                   tuner_data=None, settings_source="manual"):
+                   tuner_data=None, settings_source="manual",
+                   star_eta=100.0, tame_layers=0.0, tame_threshold=0.3):
         base_key = cls._compute_cache_key(lora_stack, output_strength,
                                           clip_strength_multiplier, auto_strength,
                                           optimization_mode, patch_compression,
@@ -6430,10 +6789,11 @@ class LoRAOptimizer(_LoRAMergeBase):
                                           merge_strategy_override, merge_refinement,
                                           strategy_set, architecture_preset,
                                           auto_strength_floor,
-                                          decision_smoothing, smooth_slerp_gate)
-        cache_key = f"{base_key}|mid={id(model)}|ss={settings_source}"
+                                          decision_smoothing, smooth_slerp_gate,
+                                          star_eta, tame_layers, tame_threshold)
+        cache_key = f"{base_key}|base={cls._model_revision(model, clip)}|ss={settings_source}"
         if settings_source in ("from_autotuner", "from_tuner_data") and tuner_data is not None:
-            return f"{cache_key}|at={id(tuner_data)}"
+            return f"{cache_key}|at={cls._stable_data_hash(tuner_data)}"
         return cache_key
 
     def _save_report_to_disk(self, cache_key, lora_combo, auto_strength, report, selected_params):
@@ -7484,6 +7844,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                     contributed = True
             else:
                 for alias in target_group["aliases"]:
+                    if self._get_dense_payload(item['lora'], alias) is not None:
+                        return None  # do not drop dense contributors on the factor fast path
                     lora_info = self._get_lora_key_info(item["lora"], alias)
                     if lora_info is None:
                         # Check if this alias has LoKr/LoHa keys — can't represent
@@ -7538,6 +7900,8 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         fused_up = torch.cat(up_parts, dim=1)
         fused_down = torch.cat(down_parts, dim=0)
+        if not torch.isfinite(fused_up).all() or not torch.isfinite(fused_down).all():
+            raise ValueError(f"Non-finite merged LoRA factors at {target_group['target_key']}; nothing applied.")
         return {
             "patch": LoRAAdapter(set(), (fused_up, fused_down, float(total_rank), None, None, None)),
             "weights": per_lora_scales,
@@ -8192,6 +8556,9 @@ class LoRAOptimizer(_LoRAMergeBase):
                     architecture_preset=tuner_data.get("architecture_preset", architecture_preset),
                     decision_smoothing=resolved_smoothing,
                     smooth_slerp_gate=tuner_data.get("smooth_slerp_gate", smooth_slerp_gate),
+                    star_eta=tuner_data.get("star_eta", 100.0),
+                    tame_layers=tuner_data.get("tame_layers", 0.0),
+                    tame_threshold=tuner_data.get("tame_threshold", 0.3),
                 )
                 applied_config = dict(config)
                 return {"result": result, "ui": {"applied_settings": [json.dumps(applied_config)]}}
@@ -8285,6 +8652,14 @@ class LoRAOptimizer(_LoRAMergeBase):
         if len(active_loras) == 0:
             return (model, clip, "No LoRAs in stack (all zero strength or malformed).", None, None)
 
+        self._validate_file_payloads(active_loras)
+        if _analysis_cache is None:
+            preflight_keys = self._get_model_keys(model)
+            preflight_clip = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, {}) if clip is not None else {}
+            coverage = self._preflight_coverage(active_loras, model, clip, preflight_keys, preflight_clip)
+        else:
+            coverage = _analysis_cache.get('coverage', [])
+
         # Resolve architecture preset from override or auto-detection
         preset_key, arch_preset = _resolve_arch_preset(
             architecture_preset, getattr(self, '_detected_arch', None) or 'unknown')
@@ -8318,6 +8693,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     "decision_smoothing": decision_smoothing,
                     "smooth_slerp_gate": smooth_slerp_gate,
                     "cache_patches": "disabled",  # sub-merges must not thrash parent cache
+                    "star_eta": star_eta, "tame_layers": tame_layers, "tame_threshold": tame_threshold,
                     "free_vram_between_passes": free_vram_between_passes,
                     "vram_budget": vram_budget,
                     "_skip_qkv_refusion": True,  # sub-merge patches must stay unfused for outer merge compatibility
@@ -8326,43 +8702,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     tree, normalized_stack, model, clip, output_strength,
                     _orig_cache_patches=cache_patches, **merge_kwargs)
 
-        # Single LoRA: skip analysis, apply directly via ComfyUI's standard
-        # additive LoRA application (faster than diff-based pipeline).
-        # auto_strength is a no-op with a single LoRA (scale would be 1.0).
-        # Skip fast path for fused-QKV architectures: normalized
-        # to_q/to_k/to_v keys need the optimizer's slice-target mapping.
-        # Skip for virtual items (_precomputed_diffs): their lora dict maps
-        # MODEL-TARGET keys to adapters/diffs, not trainer-format keys, so
-        # comfy.sd.load_lora_for_models would resolve nothing and silently
-        # apply NO LoRA at all (fatal for the inline node, which has already
-        # stripped the originals off the model).
-        if (len(active_loras) == 1
-                and getattr(self, '_detected_arch', None) not in ('zimage', 'minimax_h3')
-                and not active_loras[0].get("_precomputed_diffs")):
-            item = active_loras[0]
-            lora_dict = item["lora"]
-            strength = item["strength"]
-            resolved_output_strength = 1.0 if output_strength < 0 else output_strength
-
-            if item["clip_strength"] is not None:
-                clip_str = item["clip_strength"]
-            else:
-                clip_str = strength * clip_strength_multiplier
-            new_model, new_clip = comfy.sd.load_lora_for_models(
-                model, clip, lora_dict, resolved_output_strength * strength, resolved_output_strength * clip_str
-            )
-
-            report = (
-                "=" * 50 + "\n"
-                "LORA OPTIMIZER - ANALYSIS REPORT\n"
-                "=" * 50 + "\n\n"
-                "Single LoRA detected — bypassing analysis.\n"
-                f"  Name: {item['name']}\n"
-                f"  Strength: {strength}\n"
-                f"  Applied directly with output_strength={resolved_output_strength}\n"
-                "\n" + "=" * 50
-            )
-            return (new_model, new_clip, report, None, None)
+        # Single adapters use the same filtered patch/data path as a stack.
 
         # Check instance-level patch cache (survives ComfyUI re-execution
         # triggered by downstream seed changes or similar non-LoRA changes)
@@ -8377,7 +8717,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                                             auto_strength_floor,
                                             decision_smoothing, smooth_slerp_gate,
                                             star_eta, tame_layers, tame_threshold)
-        cache_key = f"{cache_key}|mid={id(model)}"
+        cache_key = f"{cache_key}|base={self._model_revision(model, clip)}"
         if cache_patches == "enabled" and cache_key in self._merge_cache:
             model_patches, clip_patches, report, clip_strength_out, lora_data = self._merge_cache[cache_key]
             cached_output_strength = output_strength
@@ -8390,11 +8730,15 @@ class LoRAOptimizer(_LoRAMergeBase):
             new_clip = clip
             if model is not None and len(model_patches) > 0:
                 new_model = model.clone()
-                new_model.add_patches(model_patches, cached_output_strength)
+                accepted = new_model.add_patches(model_patches, cached_output_strength)
+                if isinstance(accepted, (list, set, tuple)) and set(accepted) != set(model_patches):
+                    raise ValueError("Model rejected cached patch targets; refusing partial application.")
                 self._update_model_size(new_model, model_patches)
             if clip is not None and len(clip_patches) > 0:
                 new_clip = clip.clone()
-                new_clip.add_patches(clip_patches, clip_strength_out)
+                accepted = new_clip.add_patches(clip_patches, clip_strength_out)
+                if isinstance(accepted, (list, set, tuple)) and set(accepted) != set(clip_patches):
+                    raise ValueError("CLIP rejected cached patch targets; refusing partial application.")
                 self._update_model_size(new_clip, clip_patches)
             logging.info(f"[LoRA Optimizer] Using cached merge result ({len(model_patches)} model + {len(clip_patches)} CLIP patches)")
             return (new_model, new_clip, report, None, lora_data)
@@ -8958,6 +9302,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                          or self._virtual_group_is_linear_ok(
                              target_group, active_loras, model, clip))
                     and not stack_has_preserve
+                    and star_eta >= 100.0 and tame_layers <= 0.0
                     and (_single_lora_group or _linear_quality_ok)):
                 _t_lin = _prof_t() if _merge_prof is not None else 0.0
                 linear_patch_info = self._build_exact_linear_patch(
@@ -9099,7 +9444,13 @@ class LoRAOptimizer(_LoRAMergeBase):
             # Downcast from float32 to native weight dtype (e.g. fp16/bf16)
             # to halve memory — ComfyUI handles dtype conversion when applying
             if storage_dtype is not None and merged_diff.dtype != storage_dtype:
-                merged_diff = merged_diff.to(storage_dtype)
+                converted = merged_diff.to(storage_dtype)
+                # Finite fp32 merges can overflow native fp16 storage. Keep fp32
+                # in that case; never create an infinite patch to save memory.
+                if torch.isfinite(converted).all():
+                    merged_diff = converted
+            if not torch.isfinite(merged_diff).all():
+                raise ValueError(f"Non-finite merged delta at {target_key}; nothing applied.")
             # Score-during-merge: measure scoring stats while the result is
             # still on the compute device, so _score_merge_result never has
             # to transfer the patch back. Z-Image QKV components are instead
@@ -9367,6 +9718,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         if _analysis_cache is None:
             prefix_stats.clear()
             self.loaded_loras.clear()
+            self._normalized_loras.clear()
         if use_gpu and _analysis_cache is None:
             # Skipped during AutoTuner candidate merges: releasing the
             # allocator's cached blocks here forces cudaFree/cudaMalloc churn
@@ -9422,11 +9774,11 @@ class LoRAOptimizer(_LoRAMergeBase):
         # component happened to populate the fallback last.
         native_qkv_re = re.compile(
             r'(?:layers\.\d+\.attention\.qkv|'
-            r'(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj)$')
+            r'(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj)(?:\.weight)?$')
         for target_key in model_patches:
             if isinstance(target_key, str) and native_qkv_re.search(target_key):
                 reverse_key_map[target_key] = {
-                    "canonical_prefix": target_key,
+                    "canonical_prefix": target_key.removesuffix('.weight'),
                     "aliases": [target_key],
                 }
 
@@ -9457,12 +9809,16 @@ class LoRAOptimizer(_LoRAMergeBase):
         if not _skip_model_apply:
             if model is not None and len(model_patches) > 0:
                 new_model = model.clone()
-                new_model.add_patches(model_patches, output_strength)
+                accepted = new_model.add_patches(model_patches, output_strength)
+                if isinstance(accepted, (list, set, tuple)) and set(accepted) != set(model_patches):
+                    raise ValueError("Model rejected patch targets; refusing partial application.")
                 self._update_model_size(new_model, model_patches)
 
             if clip is not None and len(clip_patches) > 0:
                 new_clip = clip.clone()
-                new_clip.add_patches(clip_patches, clip_strength_out)
+                accepted = new_clip.add_patches(clip_patches, clip_strength_out)
+                if isinstance(accepted, (list, set, tuple)) and set(accepted) != set(clip_patches):
+                    raise ValueError("CLIP rejected patch targets; refusing partial application.")
                 self._update_model_size(new_clip, clip_patches)
 
         merge_summary = {
@@ -9497,6 +9853,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                 strategy_set=strategy_set,
                 architecture_preset=preset_key,
             )
+            report += "\n\nAdapter coverage (unfiltered target preflight):\n" + "\n".join(
+                f"  {r['name']}: {r['applied']}/{r['expected']} matched, {r['filtered']} intentionally filtered, "
+                f"{len(r['missing'])} missing, {len(r['shape_mismatch'])} shape mismatches; base compatibility {r['compatibility']}"
+                for r in coverage)
 
         # Derive per-prefix decision map from the decision log (last-wins if a
         # prefix somehow appears twice — shouldn't, but defensive).
@@ -9515,6 +9875,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             "suggested_max_strength": suggested_max_strength,
             "sum_rank": compress_rank if compress_rank > 0 else 128,
             "per_prefix_decisions": per_prefix_decisions,
+            "coverage": coverage,
             "merge_metadata": {
                 "source_loras": [{"name": item["name"], "strength": item["strength"]} for item in active_loras],
                 "mode": mode,
@@ -9526,6 +9887,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                 "sparsification_density": sparsification_density,
                 "merge_refinement": merge_refinement,
                 "strategy_set": strategy_set,
+                "h3_profiles": [{k: item.get(k) for k in ('h3_layout', 'h3_partition', 'h3_basis', 'h3_source_layout', 'h3_components')}
+                                for item in active_loras] if self._detected_arch == 'minimax_h3' else [],
                 "bake_strength_output": output_strength,
                 "bake_strength_clip": clip_strength_out,
             },
@@ -10209,6 +10572,9 @@ class LoRAOptimizerSimple(LoRAOptimizer):
                 architecture_preset=tuner_data.get("architecture_preset", "auto"),
                 decision_smoothing=tuner_data.get("decision_smoothing", 0.25),
                 smooth_slerp_gate=tuner_data.get("smooth_slerp_gate", False),
+                star_eta=tuner_data.get("star_eta", 100.0),
+                tame_layers=tuner_data.get("tame_layers", 0.0),
+                tame_threshold=tuner_data.get("tame_threshold", 0.3),
                 cache_patches="enabled",
                 patch_compression="smart",
                 svd_device="gpu",
@@ -10238,7 +10604,7 @@ class LoRAOptimizerSimple(LoRAOptimizer):
             ).hexdigest()[:12]
             return f"{base}|settings={settings_hash}"
         if tuner_data is not None:
-            return f"{base}|td={id(tuner_data)}"
+            return f"{base}|td={cls._stable_data_hash(tuner_data)}"
         return base
 
 
@@ -11380,34 +11746,9 @@ class LoRAAutoTuner(LoRAOptimizer):
 
     @staticmethod
     def _compute_names_only_hash(active_loras):
-        """
-        Compute a hash of LoRA file identity independent of strength values.
-        Hash is order-independent (entries sorted before hashing) and based on
-        name + mtime + size — not file content, so same-size same-timestamp
-        replacements are not detected.
-        Returns (hash_str, signs) where signs is {lora_index: +1 or -1} using
-        the original input-list order as indices (matching active_loras indexing).
-        """
-        entries = []
-        for item in active_loras:
-            if item.get("_precomputed_diffs"):
-                # Captured items: their name+mtime+size would change every
-                # session (salted name, no file), so key on the session-stable
-                # content identity to get cross-session analysis-cache reuse.
-                entries.append((LoRAAutoTuner._persistent_lora_key(item), 0, 0))
-                continue
-            name = item["name"]
-            path = folder_paths.get_full_path("loras", name)
-            if path is not None:
-                try:
-                    st = os.stat(path)
-                    entries.append((name, st.st_mtime, st.st_size))
-                except OSError:
-                    entries.append((name, 0, 0))
-            else:
-                entries.append((name, 0, 0))
-        hash_input = json.dumps(sorted(entries), separators=(",", ":"))
-        names_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
+        """Order-independent identity for analysis; index remapping is separate."""
+        entries = [LoRAAutoTuner._lora_identity_hash(item) for item in active_loras]
+        names_hash = hashlib.sha256(json.dumps(sorted(entries)).encode()).hexdigest()[:16]
         signs = {i: (1 if item["strength"] >= 0 else -1)
                  for i, item in enumerate(active_loras)}
         return names_hash, signs
@@ -11638,17 +11979,14 @@ class LoRAAutoTuner(LoRAOptimizer):
 
     @staticmethod
     def _lora_identity_hash(lora_item):
-        """16-char hex hash of a single LoRA's file identity (name+mtime+size).
-
-        Captured/virtual items (_precomputed_diffs) have no file and a per-
-        session salted name, so name+mtime+size would change every session and
-        their per-LoRA/pair analysis disk caches could never cross-session hit.
-        They hash their session-stable content key instead — giving inline the
-        same cross-session analysis-cache reuse the file-based Stack path has.
-        File items are untouched (the branch below runs only for captured)."""
-        if lora_item.get("_precomputed_diffs"):
-            key = LoRAAutoTuner._persistent_lora_key(lora_item)
-            return hashlib.sha256(key.encode()).hexdigest()[:16]
+        """Content/profile/context identity for loaded adapters; file-stat
+        fallback for identity-only records. Analysis caches are independent of
+        display name for in-memory captures but never of preprocessing."""
+        if lora_item.get("lora"):
+            entry = (LoRAAutoTuner._memo_content_hash(lora_item),
+                     lora_item.get("_analysis_context"), lora_item.get("h3_layout"),
+                     lora_item.get("h3_partition"), lora_item.get("h3_basis"))
+            return hashlib.sha256(json.dumps(entry).encode()).hexdigest()[:16]
         name = lora_item["name"]
         path = folder_paths.get_full_path("loras", name)
         if path is not None:
@@ -11780,7 +12118,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             # dataset. File items and unnamed captures use "name" unchanged.
             name = lora_item.get("_resolved_file_name") or lora_item["name"]
             path = folder_paths.get_full_path("loras", name)
-            if path is None:
+            if path is None or not os.path.isfile(path) or lora_item.get("_in_memory_source"):
                 lora_sd = lora_item.get("lora")
                 if isinstance(lora_sd, dict) and lora_sd:
                     h = hashlib.sha256()
@@ -11842,17 +12180,17 @@ class LoRAAutoTuner(LoRAOptimizer):
 
     @staticmethod
     def _memo_content_hash(lora_item):
-        """Memoized _lora_content_hash, cached on the item dict. Content-hashing
-        captured factor tensors is expensive (hundreds of MB across ~1500 keys)
-        and the same active_loras dicts are reused across every candidate +
-        memory + community lookup in a run, so compute it at most once per LoRA.
-        The value is deterministic, so memoizing on the dict is always safe.
-        File items get the same (cheap, disk-cached) hash — result byte-identical,
-        only an in-memory dict key is added (never serialized anywhere)."""
-        if "_content_hash" in lora_item:
+        """Memoize content hashes only while tensor identities/revisions match.
+        Replacing factors or ordinary in-place edits invalidates the memo.
+        External writes through .data/NumPy bypass PyTorch's revision counter:
+        callers must instead replace the tensor or emit a new captured payload.
+        """
+        revision = _LoRAMergeBase._payload_revision(lora_item.get("lora", {}))
+        if "_content_hash" in lora_item and lora_item.get("_content_hash_revision") == revision:
             return lora_item["_content_hash"]
         ch = LoRAAutoTuner._lora_content_hash(lora_item)
         lora_item["_content_hash"] = ch
+        lora_item["_content_hash_revision"] = revision
         return ch
 
     @staticmethod
@@ -12514,6 +12852,14 @@ class LoRAAutoTuner(LoRAOptimizer):
                   memory_mode="disabled", selection=1, record_dataset="disabled",
                   _is_sub_merge=False, _suppress_pbar=False):
         import hashlib, json
+        from functools import partial
+
+        # One binding covers candidates, final application and all replay paths.
+        merge_with_cleaning = partial(super().optimize_merge,
+                                      star_eta=star_eta, tame_layers=tame_layers,
+                                      tame_threshold=tame_threshold)
+        self._star_eta, self._tame_layers = star_eta, tame_layers
+        self._tame_threshold = tame_threshold
 
         # Best-effort cleanup of orphaned cache files (once per process)
         self._gc_autotuner_memory()
@@ -12549,6 +12895,26 @@ class LoRAAutoTuner(LoRAOptimizer):
         if not active_loras:
             return (model, clip, "No active LoRAs in stack.", "", None, None)
 
+        self._validate_file_payloads(active_loras)
+        preflight_keys = self._get_model_keys(model) if model is not None else {}
+        preflight_clip = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, {}) if clip is not None else {}
+        coverage = self._preflight_coverage(active_loras, model, clip, preflight_keys, preflight_clip)
+        # Analysis depends on target shapes/layout and on preprocessing. Taming
+        # additionally depends on this base's weights, so its cache is session-local.
+        analysis_context = self._stable_data_hash({
+            "normalize_keys": normalize_keys, "star_eta": star_eta,
+            "tame_layers": tame_layers, "tame_threshold": tame_threshold,
+            "targets": [(str(k), str(v)) for k, v in sorted(preflight_keys.items(), key=lambda kv: str(kv[0]))],
+            "base": self._model_revision(model, clip) if tame_layers > 0 else self._model_shape_signature(model, clip),
+            "profiles": [{k: item.get(k) for k in ("h3_layout", "h3_partition", "h3_basis")} for item in active_loras],
+        })
+        for item in active_loras:
+            item["_analysis_context"] = analysis_context
+        # The public cache schema has no base/preprocessing identity yet.
+        if community_cache != "disabled" and (star_eta < 100 or tame_layers > 0 or self._detected_arch == "minimax_h3"):
+            logging.info("[AutoTuner] Community cache disabled for H3/cleaned analysis; local context-aware caches remain available.")
+            community_cache = "disabled"
+
         # --- Formula-based hierarchical auto-tune ---
         preset_key = None  # bound in the formula branch; None means "not resolved"
         if merge_formula and len(active_loras) >= 2:
@@ -12575,6 +12941,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "auto_strength_floor": auto_strength_floor,
                     "decision_smoothing": decision_smoothing,
                     "smooth_slerp_gate": smooth_slerp_gate,
+                    "star_eta": star_eta, "tame_layers": tame_layers, "tame_threshold": tame_threshold,
                     "vram_budget": vram_budget,
                     "scoring_speed": scoring_speed,
                     "scoring_formula": scoring_formula,
@@ -12651,7 +13018,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             # Single LoRA: nothing to tune, delegate directly
             if output_mode == "tuning_only":
                 return (model, clip, "Single LoRA detected -- tuning_only passthrough.", "", None, None)
-            merged_model, merged_clip, report, _, lora_data = super().optimize_merge(
+            merged_model, merged_clip, report, _, lora_data = merge_with_cleaning(
                 model, normalized_stack, output_strength,
                 clip=clip, clip_strength_multiplier=clip_strength_multiplier,
                 normalize_keys=normalize_keys, strategy_set="full",
@@ -12689,16 +13056,16 @@ class LoRAAutoTuner(LoRAOptimizer):
             else:
                 logging.info("[AutoTuner Analysis Cache] MISS")
 
-        # Order-independent hash for persistent memory (sorted pairs).
+        # Rankings may select order-dependent strategies; retain stack order.
         # Captured items key on their content hash (session-stable) instead of
         # their per-session salted name — see _persistent_lora_key. File items
         # key on their name exactly as before.
         if memory_mode != "disabled" and not _is_sub_merge:
             if memory_mode == "auto_ignore_strength":
-                _mem_key = sorted([self._persistent_lora_key(l) for l in active_loras])
+                _mem_key = [self._persistent_lora_key(l) for l in active_loras]
             else:
-                _mem_key = sorted([(self._persistent_lora_key(l), l["strength"])
-                                   for l in active_loras])
+                _mem_key = [(self._persistent_lora_key(l), l["strength"])
+                            for l in active_loras]
             memory_lora_hash = hashlib.sha256(
                 json.dumps(_mem_key, separators=(",", ":")).encode()
             ).hexdigest()[:16]
@@ -12714,16 +13081,16 @@ class LoRAAutoTuner(LoRAOptimizer):
         stack_fp = hashlib.sha256(json.dumps(
             [[l["name"], l["strength"], l.get("clip_strength"),
               l.get("conflict_mode", "all"), l.get("key_filter", "all"),
-              bool(l.get("preserve", False))]
+              bool(l.get("preserve", False)), self._payload_revision(l["lora"]), l.get("_analysis_context")]
              for l in active_loras], separators=(",", ":")).encode()
         ).hexdigest()[:16]
         at_cache_key = hashlib.sha256(
             f"{lora_hash}|sfp={stack_fp}|os={output_strength}|csm={clip_strength_multiplier}"
             f"|top_n={top_n}|nk={normalize_keys}|ss={scoring_svd}"
             f"|ap={architecture_preset}|vb={vram_budget}"
-            f"|spd={scoring_speed}|mid={id(model)}|cid={id(clip)}"
+            f"|spd={scoring_speed}|base={self._model_revision(model, clip)}"
             f"|asf={auto_strength_floor}|ds={decision_smoothing}|eh={evaluator_hash}"
-            f"|sf={scoring_formula}|ssg={smooth_slerp_gate}"
+            f"|sf={scoring_formula}|ssg={smooth_slerp_gate}|ctx={analysis_context}"
             f"|mm={memory_mode}|cc={community_cache}".encode()
         ).hexdigest()[:16]
         # selection is deliberately NOT in the key: changing it replays the
@@ -12756,7 +13123,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                              f"config #{sel_idx + 1} without re-sweeping")
                 strategy_override = (sel_config["merge_mode"]
                                      if sel_config["optimization_mode"] == "global" else "")
-                replay_model, replay_clip, replay_report, _, replay_lora_data = super().optimize_merge(
+                replay_model, replay_clip, replay_report, _, replay_lora_data = merge_with_cleaning(
                     model, lora_stack, output_strength,
                     clip=clip,
                     clip_strength_multiplier=clip_strength_multiplier,
@@ -12866,6 +13233,9 @@ class LoRAAutoTuner(LoRAOptimizer):
                     "smooth_slerp_gate": smooth_slerp_gate,
                     "evaluator_hash": evaluator_hash,
                     "per_lora_flags": self._per_lora_merge_signature(active_loras),
+                    "analysis_identity": names_only_hash,
+                    "source_order": [self._lora_identity_hash(item) for item in active_loras],
+                    "analysis_context": analysis_context,
                 }
                 self._memory_save(
                     memory_lora_hash, self._memory_settings_hash(_mem_settings),
@@ -12904,7 +13274,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             _comm_config = _community_tuner_data["top_n"][_sel_idx]["config"]
             _comm_strategy_override = (_comm_config["merge_mode"]
                                         if _comm_config["optimization_mode"] == "global" else "")
-            _comm_model, _comm_clip, _, _comm_analysis_report, _comm_lora_data = super().optimize_merge(
+            _comm_model, _comm_clip, _, _comm_analysis_report, _comm_lora_data = merge_with_cleaning(
                 model, lora_stack, output_strength,
                 clip=clip,
                 clip_strength_multiplier=clip_strength_multiplier,
@@ -12949,6 +13319,9 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "smooth_slerp_gate": smooth_slerp_gate,
                 "evaluator_hash": evaluator_hash,
                 "per_lora_flags": self._per_lora_merge_signature(active_loras),
+                "analysis_identity": names_only_hash,
+                "source_order": [self._lora_identity_hash(item) for item in active_loras],
+                "analysis_context": analysis_context,
             }
             settings_hash = self._memory_settings_hash(memory_settings)
 
@@ -13027,7 +13400,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                     config = cached_tuner_data["top_n"][sel_idx]["config"]
                     strategy_override = (config["merge_mode"]
                                          if config["optimization_mode"] == "global" else "")
-                    merged_model, merged_clip, _replay_report, _, lora_data = super().optimize_merge(
+                    merged_model, merged_clip, _replay_report, _, lora_data = merge_with_cleaning(
                         model, lora_stack, output_strength,
                         clip=clip,
                         clip_strength_multiplier=clip_strength_multiplier,
@@ -13253,6 +13626,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         }
 
         _analysis_cache = {
+            "coverage": coverage,
             "all_key_targets": all_key_targets,
             "target_groups": target_groups,
             "prefix_stats": prefix_stats,
@@ -13595,7 +13969,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             if (score_dev is not None) == use_gpu:
                 _collector = {"stats": {}, "compute_svd": compute_svd}
 
-            merged_model, merged_clip, _report, _, lora_data = super().optimize_merge(
+            merged_model, merged_clip, _report, _, lora_data = merge_with_cleaning(
                 model, lora_stack, output_strength,
                 clip=clip,
                 clip_strength_multiplier=clip_strength_multiplier,
@@ -13865,7 +14239,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                          f"({best_config['merge_mode']}, {best_config['merge_refinement']})...")
             t_final = time.time()
             strategy_override = best_config["merge_mode"] if best_config["optimization_mode"] == "global" else ""
-            best_model, best_clip, best_analysis_report, _, best_lora_data = super().optimize_merge(
+            best_model, best_clip, best_analysis_report, _, best_lora_data = merge_with_cleaning(
                 model, lora_stack, output_strength,
                 clip=clip,
                 clip_strength_multiplier=clip_strength_multiplier,
@@ -13900,6 +14274,7 @@ class LoRAAutoTuner(LoRAOptimizer):
         del all_magnitude_samples
         del _analysis_cache
         self.loaded_loras.clear()
+        self._normalized_loras.clear()
         gc.collect()
         if use_gpu:
             torch.cuda.empty_cache()
@@ -13926,6 +14301,8 @@ class LoRAAutoTuner(LoRAOptimizer):
             "decision_smoothing": decision_smoothing,
             "smooth_slerp_gate": smooth_slerp_gate,
             "scoring_formula": scoring_formula,
+            "star_eta": star_eta, "tame_layers": tame_layers, "tame_threshold": tame_threshold,
+            "analysis_context": analysis_context,
             "analysis_summary": analysis_summary,
             "top_n": [{
                 "rank": r["rank"],
@@ -13963,6 +14340,9 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "smooth_slerp_gate": smooth_slerp_gate,
                 "evaluator_hash": evaluator_hash,
                 "per_lora_flags": self._per_lora_merge_signature(active_loras),
+                "analysis_identity": names_only_hash,
+                "source_order": [self._lora_identity_hash(item) for item in active_loras],
+                "analysis_context": analysis_context,
             }
             settings_hash = self._memory_settings_hash(memory_settings)
             self._memory_save(memory_lora_hash, settings_hash,
@@ -14030,7 +14410,7 @@ class LoRAAutoTuner(LoRAOptimizer):
             if use_gpu:
                 torch.cuda.empty_cache()
             logging.info(f"[LoRA AutoTuner] Replaying selected config #{sel_idx + 1}")
-            ret_model, ret_clip, ret_analysis_report, _, ret_lora_data = super().optimize_merge(
+            ret_model, ret_clip, ret_analysis_report, _, ret_lora_data = merge_with_cleaning(
                 model, lora_stack, output_strength,
                 clip=clip,
                 clip_strength_multiplier=clip_strength_multiplier,
@@ -14332,18 +14712,18 @@ class LoRAAutoTuner(LoRAOptimizer):
                    vram_budget=0.0, scoring_speed="full", scoring_formula="v2",
                    output_mode="merge", decision_smoothing=0.25,
                    smooth_slerp_gate=False, memory_mode="disabled", selection=1,
-                   record_dataset="disabled"):
+                   record_dataset="disabled", star_eta=100.0, tame_layers=0.0, tame_threshold=0.3):
         evaluator_hash = ""
         if evaluator is not None:
             evaluator_hash = (cls._stable_data_hash(evaluator) + "|"
                               + _evaluator_file_fingerprint(evaluator.get("module_path")))
-        return (id(model), id(lora_stack), cls._per_lora_merge_signature(lora_stack),
+        return (cls._model_revision(model, clip), cls._compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, 'disabled'), cls._per_lora_merge_signature(lora_stack),
                 output_strength, clip_strength_multiplier, top_n,
                 normalize_keys, scoring_svd, scoring_device,
                 architecture_preset,
                 vram_budget, community_cache, scoring_speed, scoring_formula, output_mode,
                 auto_strength_floor, decision_smoothing, smooth_slerp_gate, evaluator_hash,
-                memory_mode, selection, record_dataset)
+                memory_mode, selection, record_dataset, star_eta, tame_layers, tame_threshold)
 
     def _run_phase1_for_estimator(self, model, clip, lora_stack,
                                   normalize_keys="enabled",
@@ -14551,6 +14931,9 @@ class LoRAMergeSelector(LoRAOptimizer):
             architecture_preset=tuner_data.get("architecture_preset", "auto"),
             decision_smoothing=resolved_smoothing,
             smooth_slerp_gate=tuner_data.get("smooth_slerp_gate", False),
+            star_eta=tuner_data.get("star_eta", 100.0),
+            tame_layers=tuner_data.get("tame_layers", 0.0),
+            tame_threshold=tuner_data.get("tame_threshold", 0.3),
         )
 
         # Build report for this selection
@@ -14579,7 +14962,9 @@ class LoRAMergeSelector(LoRAOptimizer):
                    vram_budget=0.0):
         # Include the per-LoRA merge flags: the Selector replays a config against
         # this stack, so toggling preserve/conflict_mode/key_filter must re-run it.
-        return (id(tuner_data), cls._per_lora_merge_signature(lora_stack),
+        return (cls._stable_data_hash(tuner_data), cls._per_lora_merge_signature(lora_stack),
+                cls._compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, 'disabled'),
+                cls._model_revision(model, clip), vram_budget,
                 selection, output_strength, clip_strength_multiplier,
                 auto_strength_floor, decision_smoothing)
 
@@ -14687,7 +15072,7 @@ class SaveMergedLoRA:
                 "filename": ("STRING", {"default": "merged_lora", "tooltip": "Name for the saved file. Subdirectories are allowed (e.g. 'merged/my_lora'). Extension .safetensors is added automatically."}),
                 "save_rank": ("INT", {
                     "default": 0, "min": 0, "max": 2048, "step": 4,
-                    "tooltip": "0 = auto: uses the sum of all input LoRA ranks (e.g. 3 rank-32 LoRAs → rank 96). Non-zero = compress all layers to exactly this rank via SVD. Use a non-zero value to reduce output file size — set it to match your largest input LoRA's rank or lower. Higher values = more accurate but larger file."
+                    "tooltip": "0 = lossless: preserve factor ranks and dense patches (potentially large files). Non-zero = opt matrix patches into SVD compression with this maximum rank. Biases and LoCon middle tensors remain intact. Reconstruction error is stored in metadata."
                 }),
                 "bake_strength": ("BOOLEAN", {
                     "default": True,
@@ -14716,248 +15101,136 @@ class SaveMergedLoRA:
     DESCRIPTION = "Saves merged LoRA data as a standalone .safetensors file that can be loaded by any standard LoRA loader."
 
     def save_lora(self, lora_data, save_folder, filename, save_rank=0, bake_strength=True, prompt="", description=""):
+        """Export complete patches; rank=0 preserves their representation."""
         if lora_data is None:
-            logging.warning("[Save Merged LoRA] No lora_data received (optimizer may have returned early). Nothing to save.")
-            return ("",)
-
+            raise ValueError("No LORA_DATA to export. Check the optimizer's compatibility report.")
         save_path = _resolve_safe_output_path(save_folder, filename, ".safetensors", "Save Merged LoRA")
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-        model_patches = lora_data["model_patches"]
-        clip_patches = lora_data["clip_patches"]
         key_map = lora_data["key_map"]
-        output_strength = lora_data["output_strength"]
-        clip_strength = lora_data["clip_strength"]
-
-        auto_rank = save_rank == 0
-
-        # Auto mode: adapt rank for any full-rank diffs that need compression.
-        if auto_rank:
-            has_diffs = any(
-                isinstance(patch, tuple) and patch[0] == "diff"
-                for patch in list(model_patches.values()) + list(clip_patches.values())
-            )
-            if has_diffs:
-                initial_rank = lora_data.get("sum_rank", 128)
-                fallback_rank = LoRAOptimizer._estimate_save_rank(initial_rank, model_patches, clip_patches)
-                logging.info(f"[Save Merged LoRA] Auto rank for diffs: {fallback_rank} "
-                             f"(initial estimate {initial_rank}, adapted from sample diffs)")
-            else:
-                fallback_rank = lora_data.get("sum_rank", 128)
-                n_loras = len(lora_data.get("merge_metadata", {}).get("source_loras", []))
-                logging.info(
-                    f"[Save Merged LoRA] Auto rank: {fallback_rank} (sum of {n_loras} input LoRA ranks). "
-                    f"Set save_rank to a fixed value to compress below this."
-                )
-
-        save_dtype = None
-        for patch in list(model_patches.values()) + list(clip_patches.values()):
-            if isinstance(patch, tuple) and patch[0] == "diff":
-                dtype = patch[1][0].dtype
-            elif hasattr(patch, "weights") and patch.weights[0] is not None:
-                dtype = patch.weights[0].dtype
-            else:
-                continue
-            if dtype not in (torch.float32, torch.float64):
-                save_dtype = dtype
-                break
-        if save_dtype is None:
-            save_dtype = torch.float16
-        logging.info(f"[Save Merged LoRA] Output dtype: {save_dtype}")
-
-        # SVD decomposition is the bottleneck here — especially with a high auto
-        # rank over many diffs. The diffs live on CPU, so run the SVD on the GPU
-        # when one is available (_compress_to_lowrank moves each diff to the device).
-        svd_device = LoRAOptimizer._get_compute_device()
-        if svd_device.type != "cpu":
-            logging.info(f"[Save Merged LoRA] SVD device: {svd_device}")
-
+        model_patches = _LoRAMergeBase._refuse_fused_qkv_patches(lora_data["model_patches"])
+        clip_patches = lora_data["clip_patches"]
         state_dict = {}
+        errors = {}
+        svd_device = LoRAOptimizer._get_compute_device()
 
-        for is_clip, patches in [(False, model_patches), (True, clip_patches)]:
-            for target_key, patch in patches.items():
-                tkey = target_key[0] if isinstance(target_key, tuple) else target_key
-                key_info = key_map.get(target_key)
-                if key_info is None:
-                    key_info = key_map.get(tkey, tkey)
+        def emit(key, tensor):
+            if key in state_dict:
+                raise ValueError(f"Duplicate export key {key}; refusing to overwrite a contribution")
+            # Never silently downcast float32 factors; promote unsupported
+            # storage dtypes to fp32. Clone also breaks safetensors shared storage.
+            dtype = tensor.dtype if tensor.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64) else torch.float32
+            tensor = tensor.detach().to(device="cpu", dtype=dtype).contiguous().clone()
+            if not torch.isfinite(tensor).all():
+                raise ValueError(f"Non-finite export tensor {key}; destination was not changed")
+            state_dict[key] = tensor
+
+        for is_clip, patches in ((False, model_patches), (True, clip_patches)):
+            strength = (lora_data.get("clip_strength", 1.0) if is_clip else lora_data.get("output_strength", 1.0)) if bake_strength else 1.0
+            strength = 1.0 if strength is None else float(strength)
+            if not math.isfinite(strength):
+                raise ValueError("Non-finite export strength")
+            for target, patch in patches.items():
+                if isinstance(target, tuple):
+                    raise ValueError(f"Unresolved sliced target {target}; cannot export without its native layout")
+                if not _LoRAMergeBase._is_plain_additive_payload(patch):
+                    raise ValueError(f"Unsupported/base-dependent export patch at {target}")
+                key_info = key_map.get(target)
                 if isinstance(key_info, dict):
-                    lora_prefix = key_info.get("canonical_prefix", tkey)
+                    prefix = key_info.get("canonical_prefix", target)
                 else:
-                    lora_prefix = key_info
+                    prefix = key_info or target
+                # Re-fused QKV must use a native module prefix, not the last
+                # component's reverse-map fallback.
+                if re.search(r'(?:attention\.qkv|attn\.qkv_proj)\.weight$', target):
+                    prefix = target[:-len(".weight")]
+                bias = target.endswith(".bias") or prefix.endswith(".__bias__")
+                prefix = prefix.removesuffix(".__bias__")
+                if prefix == target:
+                    prefix = prefix.removesuffix(".bias") if bias else prefix.removesuffix(".weight")
+                dense = None
+                if isinstance(patch, tuple):
+                    dense = patch[1][0]
+                elif isinstance(patch, (LoKrAdapter, LoHaAdapter)):
+                    dense = _LoRAMergeBase._expand_patch_to_diff(patch)
+                elif not isinstance(patch, LoRAAdapter):
+                    raise ValueError(f"Unknown export payload at {target}")
 
-                if isinstance(patch, (LoKrAdapter, LoHaAdapter)):
-                    diff_tensor = _LoRAMergeBase._expand_patch_to_diff(patch)
-                    rank = fallback_rank if auto_rank else save_rank
-                    compressed = LoRAOptimizer._compress_to_lowrank(diff_tensor, rank, svd_device=svd_device, output_dtype=save_dtype)
+                if dense is not None:
+                    # Dense matrices and vectors remain exact in lossless mode.
+                    # A nonzero save_rank explicitly opts matrices into lossy SVD.
+                    if save_rank == 0 or dense.ndim < 2 or bias:
+                        stored = dense if dense.dtype == torch.float64 else dense.float()
+                        emit(prefix + (".diff_b" if bias else ".diff"), stored * strength)
+                        continue
+                    compressed = LoRAOptimizer._compress_to_lowrank(
+                        dense, save_rank, svd_device=svd_device, output_dtype=torch.float32)
                     if compressed is None:
-                        logging.warning(f"[Save Merged LoRA] SVD failed for {lora_prefix}; skipping this layer.")
-                        continue
-                    mat_up, mat_down, alpha, mid, _, _ = compressed.weights
-                    alpha = float(alpha)
-                elif isinstance(patch, LoRAAdapter):
-                    mat_up, mat_down, alpha, mid, _, _ = patch.weights
-                    alpha = float(alpha) if alpha is not None else float(mat_down.shape[0])
-                    current_rank = int(mat_down.shape[0])
-                    target_rank = fallback_rank if auto_rank else save_rank
-                    # The fast linear path (_build_exact_linear_patch) produces LoRAAdapters
-                    # with rank = sum of all input ranks, bypassing patch_compression entirely.
-                    # Compress here when the patch rank exceeds the requested target rank.
-                    # Skip LoCon (mid != None): mid tensor requires special reshape handling.
-                    if target_rank > 0 and current_rank > target_rank and mid is None:
-                        diff = _LoRAMergeBase._expand_patch_to_diff(patch)
-                        compressed = LoRAOptimizer._compress_to_lowrank(diff, target_rank, svd_device=svd_device, output_dtype=save_dtype)
-                        del diff
-                        if compressed is None:
-                            logging.warning(f"[Save Merged LoRA] SVD failed for {lora_prefix}; saving at full patch rank.")
-                        else:
-                            mat_up, mat_down, alpha, mid, _, _ = compressed.weights
-                            alpha = float(alpha)
-                elif isinstance(patch, tuple) and len(patch) == 2 and patch[0] == "diff":
-                    diff_tensor = patch[1][0]
-                    # All-zero diff (untrained layer) merges to nothing — skip it
-                    # rather than waste an SVD and write a dead layer to the file.
-                    if diff_tensor.abs().amax().item() == 0:
-                        continue
-                    rank = fallback_rank if auto_rank else save_rank
-                    compressed = LoRAOptimizer._compress_to_lowrank(diff_tensor, rank, svd_device=svd_device, output_dtype=save_dtype)
+                        raise ValueError(f"SVD failed for {prefix}; destination was not changed")
+                    rebuilt = _LoRAMergeBase._expand_patch_to_diff(compressed).reshape(dense.shape)
+                    errors[prefix] = float((rebuilt.float() - dense.float()).norm() / dense.float().norm().clamp_min(1e-12))
+                    patch = compressed
+
+                up, down, alpha, mid, _, _ = patch.weights
+                if bias:
+                    emit(prefix + ".diff_b", _LoRAMergeBase._expand_patch_to_diff(patch).reshape(-1) * strength)
+                    continue
+                alpha = float(down.shape[0]) if alpha is None else float(alpha)
+                if save_rank > 0 and down.shape[0] > save_rank and mid is None:
+                    original = _LoRAMergeBase._expand_patch_to_diff(patch)
+                    compressed = LoRAOptimizer._compress_to_lowrank(
+                        original, save_rank, svd_device=svd_device, output_dtype=torch.float32)
                     if compressed is None:
-                        logging.warning(f"[Save Merged LoRA] SVD failed for {lora_prefix}; skipping this layer.")
-                        continue
-                    mat_up, mat_down, alpha, mid, _, _ = compressed.weights
-                    alpha = float(alpha)
-                else:
-                    logging.warning(f"[Save Merged LoRA] Skipping unknown patch type for {lora_prefix}: {type(patch)}")
-                    continue
+                        raise ValueError(f"SVD failed for {prefix}; destination was not changed")
+                    rebuilt = _LoRAMergeBase._expand_patch_to_diff(compressed)
+                    errors[prefix] = float((rebuilt - original).norm() / original.norm().clamp_min(1e-12))
+                    up, down, alpha, mid, _, _ = compressed.weights
+                emit(prefix + ".lora_up.weight", up)
+                emit(prefix + ".lora_down.weight", down)
+                emit(prefix + ".alpha", torch.tensor(float(alpha) * strength))
+                if mid is not None:
+                    emit(prefix + ".lora_mid.weight", mid)
 
-                if bake_strength:
-                    strength = clip_strength if is_clip else output_strength
-                    alpha *= strength
-
-                state_dict[f"{lora_prefix}.lora_up.weight"] = mat_up.to(save_dtype).cpu().contiguous()
-                state_dict[f"{lora_prefix}.lora_down.weight"] = mat_down.to(save_dtype).cpu().contiguous()
-                state_dict[f"{lora_prefix}.alpha"] = torch.tensor(alpha)
-
-        unmapped_keys = []
-        nan_keys = []
-        zero_keys = []
-        for is_clip, patches in [(False, model_patches), (True, clip_patches)]:
-            for target_key, _patch in patches.items():
-                direct = key_map.get(target_key)
-                if direct is None:
-                    tkey = target_key[0] if isinstance(target_key, tuple) else target_key
-                    fallback = key_map.get(tkey)
-                    label = f"{'CLIP' if is_clip else 'MODEL'} {tkey}"
-                    if fallback is None:
-                        unmapped_keys.append(f"{label} (using raw key as prefix)")
-                    else:
-                        unmapped_keys.append(f"{label} (fallback to base key)")
-
-        for state_key, tensor in state_dict.items():
-            if state_key.endswith(".alpha"):
-                continue
-            if torch.isnan(tensor).any():
-                nan_keys.append(state_key)
-            if tensor.abs().max().item() == 0:
-                zero_keys.append(state_key)
-
-        if unmapped_keys:
-            logging.warning(f"[Save Merged LoRA] {len(unmapped_keys)} keys fell through to fallback mapping:")
-            for item in unmapped_keys[:5]:
-                logging.warning(f"  {item}")
-        if nan_keys:
-            logging.error(f"[Save Merged LoRA] {len(nan_keys)} tensors contain NaN")
-            for item in nan_keys[:5]:
-                logging.error(f"  {item}")
-        if zero_keys:
-            logging.warning(f"[Save Merged LoRA] {len(zero_keys)} tensors are all zeros")
-
-        prefixes = sorted(set(key.rsplit(".lora_", 1)[0] for key in state_dict if ".lora_" in key))
-        if prefixes:
-            logging.info(f"[Save Merged LoRA] Sample prefixes: {prefixes[:3]} ... ({len(prefixes)} total)")
-
-        # Reconstruction-error check is a diagnostic — sample a few diffs rather
-        # than reconstructing all of them on CPU (that's minutes on a large model
-        # like LTX-2, and drags vram_budget GPU patches back to CPU). 32 is plenty.
-        svd_errors = []
-        _MAX_SVD_CHECKS = 32
-        for is_clip, patches in [(False, model_patches), (True, clip_patches)]:
-            if len(svd_errors) >= _MAX_SVD_CHECKS:
-                break
-            for target_key, patch in patches.items():
-                if len(svd_errors) >= _MAX_SVD_CHECKS:
-                    break
-                if not (isinstance(patch, tuple) and patch[0] == "diff"):
-                    continue
-                key_info = key_map.get(target_key)
-                lora_prefix = (key_info.get("canonical_prefix")
-                               if isinstance(key_info, dict) else key_info)
-                if not lora_prefix:
-                    continue
-                up_key = f"{lora_prefix}.lora_up.weight"
-                if up_key not in state_dict:  # e.g. an all-zero layer we skipped
-                    continue
-                original_diff = patch[1][0].float()
-                strength = clip_strength if is_clip else output_strength
-                reference = original_diff * strength if bake_strength else original_diff
-                original_norm = reference.norm().item()
-                if original_norm <= 0:
-                    continue
-                # Diagnostic only — never let it abort the save (device/shape, etc.).
-                try:
-                    saved_up = state_dict[up_key].float()
-                    saved_down = state_dict[f"{lora_prefix}.lora_down.weight"].float()
-                    rank = saved_down.shape[0]
-                    scale = state_dict[f"{lora_prefix}.alpha"].item() / rank
-                    reconstructed = torch.mm(saved_up, saved_down) * scale
-                    ref = reference.to(reconstructed.device)
-                    svd_errors.append((reconstructed - ref).norm().item() / original_norm)
-                except Exception:
-                    pass
-        if svd_errors:
-            avg_error = sum(svd_errors) / len(svd_errors)
-            max_error = max(svd_errors)
-            logging.info(f"[Save Merged LoRA] SVD reconstruction error: "
-                         f"avg={avg_error:.4f}, max={max_error:.4f} "
-                         f"({len(svd_errors)} diffs checked)")
-            # High error = the merged diffs are higher-rank than the save rank can
-            # capture (common for TIES / refine merges). A larger save_rank retains
-            # more detail. Only nudge in auto mode; a fixed save_rank is the user's call.
-            eff_rank = fallback_rank if auto_rank else save_rank
-            if avg_error > 0.05 or max_error > 0.20:
-                suggested = min(eff_rank * 2, 1024) if eff_rank > 0 else 256
-                logging.warning(
-                    f"[Save Merged LoRA] Lossy compression at rank {eff_rank} "
-                    f"(avg {avg_error*100:.1f}%, max {max_error*100:.1f}% reconstruction "
-                    f"error) — the merge is higher-rank than this. For more fidelity set "
-                    f"save_rank to ~{suggested} (larger file); rank 0 = auto.")
-
-        # Build safetensors metadata header
-        metadata = {"tool": "ComfyUI-ZImage-LoRA-Merger"}
+        if not state_dict:
+            raise ValueError("No supported patches to export; destination was not changed")
+        metadata = {"tool": "ComfyUI-ZImage-LoRA-Merger",
+                    "merge_bake_strength": str(bake_strength),
+                    "merge_output_strength": str(lora_data.get("output_strength", 1.0)),
+                    "merge_clip_strength": str(lora_data.get("clip_strength", 1.0))}
         merge_meta = lora_data.get("merge_metadata", {})
-        if merge_meta:
-            source_loras = merge_meta.get("source_loras", [])
-            if source_loras:
-                metadata["source_loras"] = ", ".join(
-                    f"{s['name']} @ {s['strength']}" for s in source_loras
-                )
-            for key in ("mode", "optimization_mode", "architecture", "architecture_preset",
-                        "auto_strength", "sparsification", "merge_refinement", "strategy_set"):
-                val = merge_meta.get(key)
-                if val is not None:
-                    metadata[f"merge_{key}"] = str(val)
-            if merge_meta.get("sparsification_density") is not None:
-                metadata["merge_sparsification_density"] = str(merge_meta["sparsification_density"])
-            metadata["merge_output_strength"] = str(merge_meta.get("bake_strength_output", output_strength))
-            metadata["merge_clip_strength"] = str(merge_meta.get("bake_strength_clip", clip_strength))
-            metadata["merge_bake_strength"] = str(bake_strength)
+        sources = merge_meta.get("source_loras", [])
+        if sources:
+            metadata["source_loras"] = ", ".join(f"{s['name']} @ {s['strength']}" for s in sources)
+        for key in ("mode", "optimization_mode", "architecture", "architecture_preset", "auto_strength",
+                    "sparsification", "sparsification_density", "merge_refinement", "strategy_set"):
+            if merge_meta.get(key) is not None:
+                metadata["merge_" + key] = str(merge_meta[key])
+        if merge_meta.get("architecture") == "minimax_h3":
+            metadata["lora_optimizer_h3_layout"] = "comfy"
+            profiles = merge_meta.get("h3_profiles", [])
+            metadata["lora_optimizer_h3_sources"] = json.dumps(profiles)
+            for key in ("h3_partition", "h3_basis"):
+                values = {p.get(key) for p in profiles if p.get(key)}
+                if len(values) == 1:
+                    metadata["lora_optimizer_" + key] = next(iter(values))
+        if errors:
+            metadata["reconstruction_relative_error"] = json.dumps(errors)
+            logging.info(f"[Save Merged LoRA] SVD relative error: max={max(errors.values()):.4g}")
         if prompt.strip():
             metadata["prompt"] = prompt.strip()
         if description.strip():
             metadata["description"] = description.strip()
 
-        save_file(state_dict, save_path, metadata=metadata)
-        logging.info(f"[Save Merged LoRA] Saved {len(state_dict) // 3} LoRA keys to {save_path}")
-
+        # All validation precedes destination replacement. A failed write leaves
+        # the old file intact and removes only our own temporary file.
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".lora-export-", suffix=".safetensors", dir=os.path.dirname(save_path))
+        os.close(fd)
+        try:
+            save_file(state_dict, temp_path, metadata=metadata)
+            os.replace(temp_path, save_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        logging.info(f"[Save Merged LoRA] Saved {len(state_dict)} tensors to {save_path}")
         return (save_path,)
 
 
@@ -16511,6 +16784,7 @@ class LoRAExtractFromModel:
         n_processed = 0
         n_skipped_zero = 0
         n_skipped_no_map = 0
+        n_skipped_shape = n_skipped_nonfloat = n_skipped_vector = n_failed_svd = 0
         n_rank_capped = 0
         sum_extracted_ranks = 0
 
@@ -16531,11 +16805,19 @@ class LoRAExtractFromModel:
             W_fine = fine_sd[model_key]
 
             if W_base.shape != W_fine.shape:
+                n_skipped_shape += 1
                 logging.warning(f"[LoRAExtract] Shape mismatch for {model_key}, skipping.")
                 continue
 
-            # Skip non-float layers (embeddings, norms, etc.)
+            # Quantized/non-floating storage cannot be subtracted as weights.
             if not W_base.is_floating_point():
+                n_skipped_nonfloat += 1
+                continue
+            if W_base.ndim < 2:
+                if not torch.equal(W_base, W_fine):
+                    n_skipped_vector += 1
+                else:
+                    n_skipped_zero += 1
                 continue
 
             # Subtract on the compute device. This both fixes the cross-device
@@ -16545,7 +16827,10 @@ class LoRAExtractFromModel:
             result = _extract_lora_svd(delta, rank=rank, rank_mode=rank_mode, energy_threshold=energy_threshold)
 
             if result is None:
-                n_skipped_zero += 1
+                if delta.norm().item() < 1e-8:
+                    n_skipped_zero += 1
+                else:
+                    n_failed_svd += 1
                 continue
 
             lora_up, lora_down, alpha = result
@@ -16575,6 +16860,8 @@ class LoRAExtractFromModel:
             f"[LoRAExtract] Extracted {n_processed} layers "
             f"({len(model_patches)} model, {len(clip_patches)} CLIP). "
             f"Skipped: {n_skipped_zero} near-zero, {n_skipped_no_map} unmapped. "
+            f"Omitted: {n_skipped_vector} changed bias/norm vectors, {n_skipped_nonfloat} non-floating, "
+            f"{n_skipped_shape} shape mismatches, {n_failed_svd} SVD failures. "
             f"Rank-capped layers (actual < requested): {n_rank_capped}."
         )
 

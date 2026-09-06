@@ -707,9 +707,9 @@ class LoRAOptimizerTests(unittest.TestCase):
         tuner = lora_optimizer.LoRAAutoTuner()
 
         # Build a lora_stack with formula metadata
-        fake_lora_a = {"key_a": torch.randn(4, 4)}
-        fake_lora_b = {"key_a": torch.randn(4, 4)}
-        fake_lora_c = {"key_c": torch.randn(4, 4)}
+        fake_lora_a = {"key_a.lora_A.weight": torch.randn(1, 4), "key_a.lora_B.weight": torch.randn(4, 1)}
+        fake_lora_b = {"key_a.lora_A.weight": torch.randn(1, 4), "key_a.lora_B.weight": torch.randn(4, 1)}
+        fake_lora_c = {"key_c.lora_A.weight": torch.randn(1, 4), "key_c.lora_B.weight": torch.randn(4, 1)}
         lora_stack = [
             {"name": "lora_a", "lora": fake_lora_a, "strength": 1.0},
             {"name": "lora_b", "lora": fake_lora_b, "strength": 1.0},
@@ -1189,12 +1189,12 @@ class PreserveFlagTests(unittest.TestCase):
         )
         self.assertIsInstance(key, str)
         self.assertEqual(len(key), 16)
-        # order-independent: same entries reversed hash identically
+        # Order-sensitive strategies must not reuse reversed-stack patches.
         key2 = lora_optimizer.LoRAOptimizer._compute_cache_key(
             [{"name": "<extracted>", "lora": {}, "strength": 1.5}, ("loraA", 1.0, 1.0)],
             output_strength=1.0, clip_strength_multiplier=1.0, auto_strength="disabled",
         )
-        self.assertEqual(key, key2)
+        self.assertNotEqual(key, key2)
 
     def test_build_stack_passes_through_inmemory_dict(self):
         """The dynamic stacker must pass dict entries carrying weights through
@@ -1674,8 +1674,8 @@ class LoRASettingsNodeTests(unittest.TestCase):
     def test_optimize_merge_extracts_formula_metadata(self):
         """optimize_merge strips formula metadata before normalization."""
         stack = [
-            {"name": "a", "lora": {"key1": ("diff", (torch.randn(4, 4),))}, "strength": 1.0},
-            {"name": "b", "lora": {"key1": ("diff", (torch.randn(4, 4),))}, "strength": 1.0},
+            {"name": "a", "lora": {"key1": ("diff", (torch.randn(4, 4),))}, "strength": 1.0, "_precomputed_diffs": True},
+            {"name": "b", "lora": {"key1": ("diff", (torch.randn(4, 4),))}, "strength": 1.0, "_precomputed_diffs": True},
             {"_merge_formula": "1 + 2"},
         ]
         opt = lora_optimizer.LoRAOptimizer()
@@ -1687,8 +1687,8 @@ class LoRASettingsNodeTests(unittest.TestCase):
     def test_optimize_merge_invalid_formula_falls_back(self):
         """Invalid formula logs a warning and falls back to flat merge."""
         stack = [
-            {"name": "a", "lora": {"key1": ("diff", (torch.randn(4, 4),))}, "strength": 1.0},
-            {"name": "b", "lora": {"key1": ("diff", (torch.randn(4, 4),))}, "strength": 1.0},
+            {"name": "a", "lora": {"key1": ("diff", (torch.randn(4, 4),))}, "strength": 1.0, "_precomputed_diffs": True},
+            {"name": "b", "lora": {"key1": ("diff", (torch.randn(4, 4),))}, "strength": 1.0, "_precomputed_diffs": True},
             {"_merge_formula": "((1+2"},  # malformed
         ]
         opt = lora_optimizer.LoRAOptimizer()
@@ -3314,6 +3314,7 @@ class TestMiniMaxH3Support(unittest.TestCase):
             "transformer.transformer_blocks.3.attn.to_q.lora_A.weight",
             "transformer.transformer_blocks.3.ff.net.0.proj.lora_B.weight",
         ])
+        diffusers["transformer.transformer_blocks.3.ff.net.0.proj.lora_B.weight"] = torch.zeros(28672, 1)
         refiner = self._zeros([
             "base_model.model.token_refiner.refiner_blocks.1.attn.to_v.lora_A.weight",
         ])
@@ -3370,7 +3371,7 @@ class TestMiniMaxH3Support(unittest.TestCase):
             "blocks.0.attn.qkv_proj.lora_B.default.weight": up,
         }
 
-        out = lora_optimizer._LoRAMergeBase._normalize_keys_minimax_h3(sd)
+        out = lora_optimizer._LoRAMergeBase._normalize_keys_minimax_h3(sd, layout="diffsynth")
         grouped = up.reshape(heads, 3 * head_dim, rank)
         expected = tuple(
             part.reshape(heads * head_dim, rank).contiguous()
@@ -3481,17 +3482,17 @@ class TestMiniMaxH3Support(unittest.TestCase):
     def test_stack_rejects_explicit_cross_partition_h3_merge(self):
         main = {
             "transformer.transformer_blocks.0.ff.net.2.lora_A.weight": torch.zeros(2, 4),
-            "transformer.transformer_blocks.0.ff.net.2.lora_B.weight": torch.zeros(8, 2),
+            "transformer.transformer_blocks.0.ff.net.2.lora_B.weight": torch.zeros(5376, 2),
         }
         ref = {
             "transformer_ref.transformer_blocks.0.ff.net.2.lora_A.weight": torch.zeros(2, 4),
-            "transformer_ref.transformer_blocks.0.ff.net.2.lora_B.weight": torch.zeros(8, 2),
+            "transformer_ref.transformer_blocks.0.ff.net.2.lora_B.weight": torch.zeros(5376, 2),
         }
         merger = lora_optimizer._LoRAMergeBase()
         with self.assertRaisesRegex(ValueError, "different model partitions"):
             merger._normalize_stack([
-                {"name": "main.safetensors", "lora": main, "strength": 1.0},
-                {"name": "ref.safetensors", "lora": ref, "strength": 1.0},
+                {"name": "main.safetensors", "lora": main, "strength": 1.0, "h3_partition": "fl2va"},
+                {"name": "ref.safetensors", "lora": ref, "strength": 1.0, "h3_partition": "ref2va"},
             ], normalize_keys="enabled")
 
     def test_native_qkv_aliases_target_exact_fused_slices(self):

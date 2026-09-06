@@ -1,0 +1,38 @@
+name: Correctness tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check out pinned ComfyUI (no models)
+        uses: actions/checkout@v4
+        with:
+          repository: Comfy-Org/ComfyUI
+          ref: e6a51d7db7673e083e5f01f3740bd5515a8132a2
+          path: .comfy-integration
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r .comfy-integration/requirements.txt pytest pytest-subtests scikit-learn
+      - name: Unit regressions
+        run: python -m pytest -q
+      - name: Workflow migration
+        run: node tests/js/dynamic_migration.test.cjs
+      - name: Real ComfyUI and safetensors round trip (isolated process)
+        run: python tests/integration/comfy_roundtrip.py .comfy-integration
