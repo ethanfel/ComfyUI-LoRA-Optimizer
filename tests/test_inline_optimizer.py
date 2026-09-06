@@ -2377,12 +2377,14 @@ class TestInlineAutoTunerDelegation(unittest.TestCase):
         node.execute_inline(model, output_strength=1.0,
                             settings=_autotuner_settings(
                                 top_n=3, memory_mode="auto",
+                                experimental_options={"np_lora": True, "ct_merge": False},
                                 community_cache="upload_and_download",
                                 architecture_preset="dit"))
         self.assertEqual(seen["top_n"], 3)
         self.assertEqual(seen["memory_mode"], "auto")
         self.assertEqual(seen["community_cache"], "upload_and_download")
         self.assertEqual(seen["architecture_preset"], "dit")
+        self.assertEqual(seen["experimental_options"], {"np_lora": True, "ct_merge": False})
 
     def test_cache_patches_pinned_disabled_for_delegate(self):
         # cache_patches is NOT forwarded from settings — the delegate's in-node
@@ -2481,6 +2483,31 @@ class TestInlineAutoTunerEndToEnd(unittest.TestCase):
     (_precomputed_diffs) items end to end, with no file reload."""
 
     KEY = "layer.weight"
+
+    def test_both_experimental_modes_apply_on_captured_chains(self):
+        for mode in ("np_lora", "ct_merge"):
+            with self.subTest(mode=mode):
+                chain = ((1., {self.KEY: _adapter(out_dim=16, in_dim=16)}),
+                         (.7, {self.KEY: _adapter(out_dim=16, in_dim=16)}))
+                applied = {}
+                model = _pipeline_model(_chain_patches(*chain), applied)
+                original = {k: list(v) for k, v in model.patches.items()}
+                node = lora_optimizer.LoRAOptimizerInline()
+                node._get_model_keys = lambda model: {"alias_layer": self.KEY}
+                node._autotuner_delegate = lora_optimizer.LoRAAutoTuner()
+                node._autotuner_delegate._get_model_keys = lambda model: {"alias_layer": self.KEY}
+                def choose(_e, _m, _c, _ld, config, _summary):
+                    return {"score": 1. if config["merge_mode"] == mode else 0.}
+                with mock.patch.object(lora_optimizer, "_run_autotuner_evaluator", side_effect=choose):
+                    result = node.execute_inline(model, 1., settings=_autotuner_settings(
+                        architecture_preset="dit", experimental_options={"np_lora": True, "ct_merge": True},
+                        evaluator={"combine_mode": "external_only"}))
+                out = result["result"] if isinstance(result, dict) else result
+                self.assertEqual(out[4]["merge_metadata"]["mode"], mode)
+                self.assertIn(self.KEY, applied["patches"])
+                self.assertTrue(torch.isfinite(lora_optimizer._LoRAMergeBase._expand_patch_to_diff(
+                    applied["patches"][self.KEY])).all())
+                self.assertEqual(model.patches[self.KEY], original[self.KEY])
 
     def test_two_lora_chain_autotunes_and_reapplies(self):
         up_a = torch.linspace(-1.0, 1.0, 16 * 4).reshape(16, 4)

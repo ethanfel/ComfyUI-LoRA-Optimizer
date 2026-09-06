@@ -49,6 +49,14 @@ except Exception:
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+# Load by sibling path too: ComfyUI and the standalone tests use different
+# package names, and neither should depend on the working directory.
+_experimental_spec = importlib.util.spec_from_file_location(
+    "lora_optimizer_experimental", os.path.join(os.path.dirname(__file__), "experimental_merge.py"))
+_experimental = importlib.util.module_from_spec(_experimental_spec)
+_experimental_spec.loader.exec_module(_experimental)
+LoRAExperimentalOptions = _experimental.LoRAExperimentalOptions
+
 # --- Triton SVD kernel (optional) ---
 # Set LORA_OPTIMIZER_DISABLE_TRITON=1 to skip the bundled Triton SVD kernel and
 # fall back to torch.linalg. The kernel can hard-crash the process (e.g.
@@ -4873,7 +4881,8 @@ class _LoRAMergeBase:
                      compute_device=None, sparsification="disabled",
                      sparsification_density=0.7, sparsification_generator=None,
                      merge_refinement="none", dare_dampening=0.0,
-                     keep_on_gpu=False, preserve_flags=None):
+                     keep_on_gpu=False, preserve_flags=None, experimental_config=None,
+                     source_indices=None, role_indices=None, experimental_factors=None):
         """
         Merges a list of diffs with their weights.
         When compute_device is given, tensors are moved there for faster ops,
@@ -4914,6 +4923,8 @@ class _LoRAMergeBase:
         # "blend these characters", so additive preservation must be opt-in.
         if any_preserve:
             rest = [dw for dw, p in zip(diffs_with_weights, preserve_flags) if not p]
+            rest_indices = ([i for i, p in zip(source_indices, preserve_flags) if not p]
+                            if source_indices is not None else None)
             preserved_sum = None
             for (d, w), p in zip(diffs_with_weights, preserve_flags):
                 if not p:
@@ -4927,11 +4938,27 @@ class _LoRAMergeBase:
                     sparsification_density=sparsification_density,
                     sparsification_generator=sparsification_generator,
                     merge_refinement=merge_refinement, dare_dampening=dare_dampening,
-                    keep_on_gpu=True, preserve_flags=None)
+                    keep_on_gpu=True, preserve_flags=None,
+                    experimental_config=experimental_config,
+                    source_indices=rest_indices, role_indices=role_indices,
+                    experimental_factors=experimental_factors)
                 result = blended.to(device=dev, dtype=torch.float32) + preserved_sum
             else:
                 result = preserved_sum
             result = result.to(dtype)
+            return result.cpu() if to_cpu else result
+
+        if mode in _experimental.MODES:
+            if sparsification != "disabled" or merge_refinement != "none":
+                raise ValueError("Experimental modes do not support sparsification/refinement.")
+            items = [(d.to(device=dev), w) for d, w in diffs_with_weights]
+            result = _experimental.merge(items, mode, experimental_config,
+                                         source_indices, role_indices, experimental_factors)
+            if not torch.isfinite(result).all():
+                raise _experimental.UnsupportedMerge(f"{mode}: non-finite merged delta.")
+            result = result.to(dtype)
+            if not torch.isfinite(result).all():
+                raise _experimental.UnsupportedMerge(f"{mode}: output dtype overflow.")
             return result.cpu() if to_cpu else result
 
         # DARE/DELLA preprocessing for non-TIES modes
@@ -8518,10 +8545,16 @@ class LoRAOptimizer(_LoRAMergeBase):
                 if "decision_smoothing" in tuner_data:
                     report_lines.append(f"  decision_smoothing: {tuner_data['decision_smoothing']}")
                 report_lines.append("")
-                report_lines.append("Switch settings_source to 'manual' to tweak from these settings.")
+                if "experimental" in config:
+                    report_lines.append("Experimental settings: use Experimental Options and re-tune, or use Merge Selector. "
+                                        "Legacy manual controls do not carry these parameters.")
+                else:
+                    report_lines.append("Switch settings_source to 'manual' to tweak from these settings.")
                 report = "\n".join(report_lines)
 
                 logging.info("[AutoTuner Bridge] Passthrough mode — model already merged by AutoTuner")
+                if "experimental" in config:
+                    return {"result": (model, clip, report, tuner_data, None)}
                 return {"result": (model, clip, report, tuner_data, None),
                         "ui": {"applied_settings": [json.dumps(applied_config)]}}
 
@@ -8552,6 +8585,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     dare_dampening=config["dare_dampening"],
                     merge_strategy_override=strategy_override,
                     merge_refinement=config["merge_refinement"],
+                    _experimental_config=config.get("experimental"),
                     strategy_set=config.get("strategy_set", "full"),
                     architecture_preset=tuner_data.get("architecture_preset", architecture_preset),
                     decision_smoothing=resolved_smoothing,
@@ -8561,6 +8595,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                     tame_threshold=tuner_data.get("tame_threshold", 0.3),
                 )
                 applied_config = dict(config)
+                if "experimental" in config:
+                    return {"result": result}
                 return {"result": result, "ui": {"applied_settings": [json.dumps(applied_config)]}}
 
         return self.optimize_merge(
@@ -8587,7 +8623,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             smooth_slerp_gate=smooth_slerp_gate,
         )
 
-    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", auto_strength_floor=-1.0, free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", patch_compression="smart", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_refinement="none", strategy_set="full", architecture_preset="auto", decision_smoothing=0.25, smooth_slerp_gate=False, star_eta=100.0, tame_layers=0.0, tame_threshold=0.3, _analysis_cache=None, _diff_cache=None, _skip_report=False, _skip_qkv_refusion=False, _sl_patch_cache=None, _score_collector=None, _skip_model_apply=False, _group_patch_cache=None):
+    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", auto_strength_floor=-1.0, free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", patch_compression="smart", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_refinement="none", strategy_set="full", architecture_preset="auto", decision_smoothing=0.25, smooth_slerp_gate=False, star_eta=100.0, tame_layers=0.0, tame_threshold=0.3, _analysis_cache=None, _diff_cache=None, _skip_report=False, _skip_qkv_refusion=False, _sl_patch_cache=None, _score_collector=None, _skip_model_apply=False, _group_patch_cache=None, _experimental_config=None):
         """
         Main entry point. Two-pass streaming architecture:
         Pass 1: Resolve aliases to target groups, compute diffs, sample metrics, discard diffs
@@ -8595,6 +8631,15 @@ class LoRAOptimizer(_LoRAMergeBase):
         Pass 2: Recompute diffs per target group, merge immediately, discard
         Peak memory tracks the largest active target group, not the whole stack.
         """
+        if merge_strategy_override in _experimental.MODES or _experimental_config is not None:
+            _experimental_config = _experimental.validate_method(merge_strategy_override, _experimental_config)
+            if optimization_mode != "global" or sparsification != "disabled" or merge_refinement != "none":
+                raise ValueError("Experimental modes require global merging without sparsification/refinement.")
+            # Existing group/single-patch caches do not encode experiment settings.
+            _group_patch_cache = _sl_patch_cache = None
+            # Factor decompositions must describe the same full-precision diffs
+            # that will be used at replay, not a lossy disk/RAM diff-cache copy.
+            _diff_cache = None
         # Reset the per-merge shape-incompatibility log (populated in
         # _prepare_group_diffs when a LoRA's tensor shape doesn't match the
         # target model weight). Only on report-producing top-level calls, so
@@ -8648,6 +8693,13 @@ class LoRAOptimizer(_LoRAMergeBase):
         normalized_stack = self._normalize_stack(
             lora_stack, normalize_keys=normalize_keys, _arch_hint=arch_hint)
         active_loras = [item for item in normalized_stack if item["strength"] != 0]
+
+        experimental_roles = None
+        if _experimental_config is not None:
+            if merge_formula:
+                raise ValueError("Experimental merging currently requires a flat stack, without a merge formula.")
+            experimental_roles = _experimental.validate_stack(
+                merge_strategy_override, _experimental_config, active_loras)
 
         if len(active_loras) == 0:
             return (model, clip, "No LoRAs in stack (all zero strength or malformed).", None, None)
@@ -8718,6 +8770,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                                             decision_smoothing, smooth_slerp_gate,
                                             star_eta, tame_layers, tame_threshold)
         cache_key = f"{cache_key}|base={self._model_revision(model, clip)}"
+        if _experimental_config is not None:
+            cache_key += "|experimental=" + self._stable_data_hash(_experimental_config)
         if cache_patches == "enabled" and cache_key in self._merge_cache:
             model_patches, clip_patches, report, clip_strength_out, lora_data = self._merge_cache[cache_key]
             cached_output_strength = output_strength
@@ -9002,7 +9056,7 @@ class LoRAOptimizer(_LoRAMergeBase):
         # Apply merge strategy override from Conflict Editor
         # Skip when user explicitly chose additive (protects DPO/edit LoRAs)
         if merge_strategy_override and optimization_mode != "additive":
-            if merge_strategy_override in ("ties", "weighted_average", "weighted_sum", "consensus", "slerp"):
+            if merge_strategy_override in ("ties", "weighted_average", "weighted_sum", "consensus", "slerp") + _experimental.MODES:
                 mode = merge_strategy_override
                 if _analysis_cache is not None:
                     # AutoTuner reuses the override parameter to apply a
@@ -9238,7 +9292,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             # Apply merge strategy override from Conflict Editor (takes priority over auto-selection)
             # Skip when user explicitly chose additive (protects DPO/edit LoRAs)
             if (merge_strategy_override and optimization_mode != "additive"
-                    and merge_strategy_override in ("ties", "weighted_average", "weighted_sum", "consensus", "slerp")):
+                    and merge_strategy_override in ("ties", "weighted_average", "weighted_sum", "consensus", "slerp") + _experimental.MODES):
                 pf_mode = merge_strategy_override
 
             pf = prefix_stats.get(label_prefix, {})
@@ -9401,6 +9455,24 @@ class LoRAOptimizer(_LoRAMergeBase):
                 pf_quality = "none"
 
             _t_merge = _prof_t() if _merge_prof is not None else 0.0
+            experimental_factors = {}
+            if (pf_mode in _experimental.MODES and not stack_has_conflict_modes
+                    and star_eta >= 100.0 and tame_layers <= 0.0):
+                for i in diff_indices:
+                    d = prepared["diffs"][i]
+                    if d.ndim != 2 or active_loras[i].get("preserve", False):
+                        continue
+                    # Reuse the validated factor-concatenation path for this
+                    # contributor only. Filtering has already selected its keys.
+                    item = dict(active_loras[i], key_filter="all", strength=prepared["eff_strengths"][i],
+                                clip_strength=prepared["eff_strengths"][i])
+                    info = self._build_exact_linear_patch(target_group, [item], raw_n, "weighted_sum",
+                                                          is_clip_key=is_clip_key)
+                    if info is not None:
+                        up, down = info["patch"].weights[:2]
+                        if (up.ndim == down.ndim == 2 and (up.shape[0], down.shape[1]) == tuple(d.shape)
+                                and 2 * down.shape[0] < min(d.shape)):
+                            experimental_factors[i] = (up, down)
             merged_diff = self._merge_diffs(
                 diffs_list, pf_mode,
                 density=pf_density, majority_sign_method=pf_sign,
@@ -9415,6 +9487,10 @@ class LoRAOptimizer(_LoRAMergeBase):
                 # moves half the bytes and skips a full CPU-side read
                 keep_on_gpu=True,
                 preserve_flags=preserve_list,
+                experimental_config=_experimental_config,
+                source_indices=diff_indices,
+                role_indices=experimental_roles,
+                experimental_factors=experimental_factors,
             )
             if _merge_prof is not None:
                 _prof_add(f"merge:{pf_mode}", _prof_t() - _t_merge)
@@ -9596,7 +9672,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                     _sl_store(_sl_key, result)
                 _collect_merge_result(result)
         else:
-            max_workers = min(4, max(1, len(target_groups)))
+            max_workers = 1 if _experimental_config is not None else min(4, max(1, len(target_groups)))
             # Separate cached single-LoRA results from groups that need computation
             compute_items = []
             for label_prefix, target_group in target_groups.items():
@@ -9895,6 +9971,15 @@ class LoRAOptimizer(_LoRAMergeBase):
         }
 
         # Cache patches for re-use (single entry to limit memory)
+        if _experimental_config is not None:
+            lora_data["merge_metadata"]["experimental"] = dict(_experimental_config)
+            lora_data["merge_metadata"]["experimental_roles"] = [active_loras[i]["name"] for i in experimental_roles]
+            role_names = ", ".join(f"{pos + 1}: {active_loras[i]['name']}" for pos, i in enumerate(experimental_roles))
+            report = (f"EXPERIMENTAL: {merge_strategy_override} "
+                      f"{json.dumps(_experimental_config, sort_keys=True)}\n"
+                      f"Active non-preserved participants: {role_names}\n"
+                      "Bias/norm vectors, unique targets and preserved overlays are additive. "
+                      "H3 video/audio quality is not validated.\n\n" + report)
         if cache_patches == "enabled":
             self._merge_cache = {cache_key: (model_patches, clip_patches, report, clip_strength_out, lora_data)}
         else:
@@ -10352,7 +10437,7 @@ class LoRAAutoTunerSettings:
                                "clear_and_run: Delete cached entry and re-tune from scratch."
                 }),
                 "selection": ("INT", {
-                    "default": 1, "min": 1, "max": 10, "step": 1,
+                    "default": 1, "min": 1, "max": 17, "step": 1,
                     "tooltip": "Which ranked configuration to apply (1 = top-ranked). "
                                "Change this to try a different config without re-running the full sweep."
                 }),
@@ -10371,6 +10456,9 @@ class LoRAAutoTunerSettings:
                 "evaluator": ("AUTOTUNER_EVALUATOR", {
                     "tooltip": "Connect an external evaluator to influence how configurations are ranked. Optional — the built-in scoring works well on its own."
                 }),
+                "experimental_options": ("LORA_EXPERIMENTAL_OPTIONS", {
+                    "tooltip": "Opt-in NP-LoRA/CT-Merging trials alongside stable candidates. Disconnected = unchanged behavior."
+                }),
             },
         }
 
@@ -10387,9 +10475,9 @@ class LoRAAutoTunerSettings:
                        scoring_speed, scoring_formula,
                        diff_cache_mode, diff_cache_ram_pct, community_cache,
                        memory_mode="disabled", selection=1, record_dataset="disabled",
-                       merge_settings=None, evaluator=None):
+                       merge_settings=None, evaluator=None, experimental_options=None):
         ms = merge_settings if merge_settings is not None else LoRAMergeSettings._DEFAULTS
-        return ({
+        result = {
             "mode": "autotuner",
             "top_n": top_n,
             "scoring_svd": scoring_svd,
@@ -10414,7 +10502,11 @@ class LoRAAutoTunerSettings:
             "memory_mode": memory_mode,
             "selection": selection,
             "record_dataset": record_dataset,
-        },)
+        }
+        exp = _experimental.options(experimental_options)
+        if exp is not None:
+            result["experimental_options"] = exp
+        return (result,)
 
 
 class LoRAOptimizerSimple(LoRAOptimizer):
@@ -10535,6 +10627,7 @@ class LoRAOptimizerSimple(LoRAOptimizer):
                     memory_mode=settings.get("memory_mode", "disabled"),
                     selection=settings.get("selection", 1),
                     record_dataset=settings.get("record_dataset", "disabled"),
+                    experimental_options=settings.get("experimental_options"),
                 )
                 # Map 6-value AutoTuner return to 5-value Simple return
                 # (model, clip, report, analysis_report, tuner_data, lora_data)
@@ -10567,6 +10660,7 @@ class LoRAOptimizerSimple(LoRAOptimizer):
                 dare_dampening=config["dare_dampening"],
                 merge_strategy_override=strategy_override,
                 merge_refinement=config["merge_refinement"],
+                _experimental_config=config.get("experimental"),
                 strategy_set=config.get("strategy_set", "full"),
                 normalize_keys=tuner_data.get("normalize_keys", "enabled"),
                 architecture_preset=tuner_data.get("architecture_preset", "auto"),
@@ -11431,6 +11525,7 @@ class LoRAOptimizerInline(LoRAOptimizer):
                 memory_mode=settings.get("memory_mode", "disabled"),
                 selection=settings.get("selection", 1),
                 record_dataset=settings.get("record_dataset", "disabled"),
+                experimental_options=settings.get("experimental_options"),
             )
             # Map the 6-tuple AutoTuner return to the inline node's 5-tuple
             # (model, clip, report, tuner_data, lora_data), mirroring
@@ -11706,7 +11801,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                                "Does not track LoRA file contents — if you retrain a LoRA with the same filename, use clear_and_run."
                 }),
                 "selection": ("INT", {
-                    "default": 1, "min": 1, "max": 10, "step": 1,
+                    "default": 1, "min": 1, "max": 17, "step": 1,
                     "tooltip": "Which ranked configuration to apply (1 = top-ranked). "
                                "Change this to try a different config without re-running the full sweep."
                 }),
@@ -11716,6 +11811,9 @@ class LoRAAutoTuner(LoRAOptimizer):
                                "user/lora_optimizer_reports/autotuner_dataset.jsonl for "
                                "threshold-tuning research. Entries are recorded only when "
                                "a full sweep runs (cache/memory replays don't add entries)."
+                }),
+                "experimental_options": ("LORA_EXPERIMENTAL_OPTIONS", {
+                    "tooltip": "Adds bounded experimental trials and an additive baseline; does not replace stable candidates."
                 }),
             },
         }
@@ -12850,9 +12948,17 @@ class LoRAAutoTuner(LoRAOptimizer):
                   decision_smoothing=0.25, smooth_slerp_gate=False,
                   star_eta=100.0, tame_layers=0.0, tame_threshold=0.3,
                   memory_mode="disabled", selection=1, record_dataset="disabled",
-                  _is_sub_merge=False, _suppress_pbar=False):
+                  _is_sub_merge=False, _suppress_pbar=False, experimental_options=None):
         import hashlib, json
         from functools import partial
+
+        experimental_options = _experimental.options(experimental_options)
+        if experimental_options is not None:
+            # Community rankings have no experimental namespace. Strength-
+            # ignoring replay is unsafe for a directional/role-aware experiment.
+            community_cache = "disabled"
+            if memory_mode == "auto_ignore_strength":
+                memory_mode = "auto"
 
         # One binding covers candidates, final application and all replay paths.
         merge_with_cleaning = partial(super().optimize_merge,
@@ -12882,6 +12988,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                 clean_stack.append(item)
         if merge_formula:
             lora_stack = clean_stack
+            if experimental_options is not None:
+                raise ValueError("Experimental AutoTuner requires a flat stack; disconnect the merge formula or experimental options.")
 
         # --- Normalize & validate stack ---
         # Pass the model-class arch hint so captured (inline) chains score
@@ -12894,6 +13002,10 @@ class LoRAAutoTuner(LoRAOptimizer):
         active_loras = [item for item in normalized_stack if item["strength"] != 0]
         if not active_loras:
             return (model, clip, "No active LoRAs in stack.", "", None, None)
+
+        experimental_candidates, experimental_skipped = _experimental.candidates(experimental_options, active_loras)
+        for reason in experimental_skipped:
+            logging.warning("[Experimental merge] %s", reason)
 
         self._validate_file_payloads(active_loras)
         preflight_keys = self._get_model_keys(model) if model is not None else {}
@@ -13016,8 +13128,10 @@ class LoRAAutoTuner(LoRAOptimizer):
 
         if len(active_loras) == 1:
             # Single LoRA: nothing to tune, delegate directly
+            exp_note = ("Experimental candidates skipped: " + "; ".join(experimental_skipped) + "\n"
+                        if experimental_skipped else "")
             if output_mode == "tuning_only":
-                return (model, clip, "Single LoRA detected -- tuning_only passthrough.", "", None, None)
+                return (model, clip, exp_note + "Single LoRA detected -- tuning_only passthrough.", "", None, None)
             merged_model, merged_clip, report, _, lora_data = merge_with_cleaning(
                 model, normalized_stack, output_strength,
                 clip=clip, clip_strength_multiplier=clip_strength_multiplier,
@@ -13030,7 +13144,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 _skip_qkv_refusion=_is_sub_merge,
             )
             return (merged_model, merged_clip,
-                    "Single LoRA detected -- no parameters to tune.\n\n" + report, report, None, lora_data)
+                    exp_note + "Single LoRA detected -- no parameters to tune.\n\n" + report, report, None, lora_data)
 
         # Compute lora_hash for cache validation
         hash_input = json.dumps([(l["name"], l["strength"]) for l in active_loras],
@@ -13093,6 +13207,8 @@ class LoRAAutoTuner(LoRAOptimizer):
             f"|sf={scoring_formula}|ssg={smooth_slerp_gate}|ctx={analysis_context}"
             f"|mm={memory_mode}|cc={community_cache}".encode()
         ).hexdigest()[:16]
+        if experimental_options is not None:
+            at_cache_key += "|experimental=" + self._stable_data_hash(experimental_options)
         # selection is deliberately NOT in the key: changing it replays the
         # selected config from the cached sweep instead of re-sweeping.
         # clear_and_run must always recompute — never serve the in-node cache.
@@ -13134,6 +13250,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                     sparsification_density=sel_config["sparsification_density"],
                     dare_dampening=sel_config["dare_dampening"],
                     merge_refinement=sel_config["merge_refinement"],
+                    _experimental_config=sel_config.get("experimental"),
                     merge_strategy_override=strategy_override,
                     strategy_set=sel_config.get("strategy_set", "full"),
                     normalize_keys=cached_tuner.get("normalize_keys", normalize_keys),
@@ -13323,6 +13440,9 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "source_order": [self._lora_identity_hash(item) for item in active_loras],
                 "analysis_context": analysis_context,
             }
+            if experimental_options is not None:
+                memory_settings["experimental_options"] = experimental_options
+                memory_settings["stable_top_n"] = top_n
             settings_hash = self._memory_settings_hash(memory_settings)
 
             if memory_mode == "clear_and_run":
@@ -13380,7 +13500,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                     untruncated_tuner_data = dict(cached_tuner_data)
                     untruncated_tuner_data["top_n"] = list(cached_tuner_data["top_n"])
                     # Truncate top_n if needed
-                    if len(cached_tuner_data["top_n"]) > top_n:
+                    if experimental_options is None and len(cached_tuner_data["top_n"]) > top_n:
                         cached_tuner_data["top_n"] = cached_tuner_data["top_n"][:top_n]
 
                     sel_idx = min(selection, len(cached_tuner_data["top_n"])) - 1
@@ -13412,6 +13532,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                         sparsification_density=config["sparsification_density"],
                         dare_dampening=config["dare_dampening"],
                         merge_refinement=config["merge_refinement"],
+                        _experimental_config=config.get("experimental"),
                         merge_strategy_override=strategy_override,
                         strategy_set=config.get("strategy_set", "full"),
                         normalize_keys=cached_tuner_data.get(
@@ -13485,7 +13606,8 @@ class LoRAAutoTuner(LoRAOptimizer):
         t_start = time.time()
         # Progress bar: analysis groups + top_n merges (+ 1 final winner merge —
         # candidates are discarded after scoring whenever there is more than one)
-        n_pbar_merges = top_n + (1 if top_n > 1 and output_mode != "tuning_only" else 0)
+        trial_count = top_n + len(experimental_candidates)
+        n_pbar_merges = trial_count + (1 if trial_count > 1 and output_mode != "tuning_only" else 0)
         if _suppress_pbar:
             class _NullPbar:
                 def update(self, n): pass
@@ -13685,7 +13807,10 @@ class LoRAAutoTuner(LoRAOptimizer):
         gc.collect()
 
         # --- Prefix subsampling for Phase 2 (scoring_speed) ---
-        use_subsampling = scoring_speed != "full" and top_n > 1
+        # First experimental iteration checks ALL targets before ranking a
+        # candidate. Otherwise an unsupported unsampled layer could win and
+        # fail only during final application. Stable-only runs are unchanged.
+        use_subsampling = scoring_speed != "full" and top_n > 1 and experimental_options is None
         scoring_cache = _analysis_cache  # default: use full cache
         if use_subsampling:
             step = {"fast": 2, "turbo": 3, "turbo+": 4}[scoring_speed]
@@ -13784,6 +13909,9 @@ class LoRAAutoTuner(LoRAOptimizer):
                 continue
             _seen_behaviors.add(behavior)
             top_candidates.append((h_score, config))
+        # Neutral heuristic placeholder, NOT a quality prior. These candidates
+        # receive actual trials and are ranked by the same measured evaluator.
+        top_candidates.extend((0.0, config) for config in experimental_candidates)
         if _n_dedup_skipped:
             logging.info(f"[LoRA AutoTuner] Skipped {_n_dedup_skipped} duplicate candidate(s) "
                          f"with identical per-prefix decisions — slots given to distinct configs")
@@ -13894,6 +14022,8 @@ class LoRAAutoTuner(LoRAOptimizer):
                 _g_sel = None  # global-mode (mode, density, sign), resolved lazily
                 _plan = {}
                 for _h, _cfg in top_candidates:
+                    if "experimental" in _cfg:
+                        continue  # these use their own method/parameter identity
                     _setting = _cfg["auto_strength"]
                     _refn = _cfg["merge_refinement"]
                     for _pfx, _tinfo in _scoring_targets.items():
@@ -13951,6 +14081,17 @@ class LoRAAutoTuner(LoRAOptimizer):
                                 f"(sweep continues uncached): {e}")
                 _group_cache = None
 
+        def try_merge_candidate(config, *args, **kwargs):
+            try:
+                return merge_with_cleaning(*args, **kwargs)
+            except _experimental.UnsupportedMerge as exc:
+                if "experimental" not in config:
+                    raise
+                reason = f"{config['merge_mode']} {config['experimental']}: {exc}"
+                experimental_skipped.append(reason)
+                logging.warning("[Experimental merge] Candidate skipped: %s", reason)
+                return None
+
         for rank_idx, (h_score, config) in enumerate(top_candidates):
             logging.info(f"[LoRA AutoTuner]   Candidate {rank_idx + 1}/{len(top_candidates)}: "
                          f"{config['merge_mode']}, {config['merge_refinement']}"
@@ -13969,8 +14110,8 @@ class LoRAAutoTuner(LoRAOptimizer):
             if (score_dev is not None) == use_gpu:
                 _collector = {"stats": {}, "compute_svd": compute_svd}
 
-            merged_model, merged_clip, _report, _, lora_data = merge_with_cleaning(
-                model, lora_stack, output_strength,
+            candidate_result = try_merge_candidate(
+                config, model, lora_stack, output_strength,
                 clip=clip,
                 clip_strength_multiplier=clip_strength_multiplier,
                 auto_strength=config["auto_strength"],
@@ -13980,6 +14121,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 sparsification_density=config["sparsification_density"],
                 dare_dampening=config["dare_dampening"],
                 merge_refinement=config["merge_refinement"],
+                _experimental_config=config.get("experimental"),
                 merge_strategy_override=strategy_override,
                 free_vram_between_passes="disabled",
                 vram_budget=vram_budget,
@@ -14005,6 +14147,12 @@ class LoRAAutoTuner(LoRAOptimizer):
                                    and evaluator is None),
                 _group_patch_cache=_group_cache,
             )
+            if candidate_result is None:
+                _collector = None
+                pbar.update(1)
+                continue
+            merged_model, merged_clip, _report, _, lora_data = candidate_result
+            del candidate_result
             _inline = _collector["stats"] if _collector is not None else None
 
             # Measure output quality (single-LoRA prefixes may still produce
@@ -14250,6 +14398,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 sparsification_density=best_config["sparsification_density"],
                 dare_dampening=best_config["dare_dampening"],
                 merge_refinement=best_config["merge_refinement"],
+                _experimental_config=best_config.get("experimental"),
                 merge_strategy_override=strategy_override,
                 free_vram_between_passes="disabled",
                 vram_budget=vram_budget,
@@ -14316,6 +14465,15 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "per_prefix_decisions": r.get("per_prefix_decisions", {}),
             } for r in results],
         }
+        if experimental_options is not None:
+            tuner_data["experimental_options"] = experimental_options
+            tuner_data["experimental_skipped"] = list(experimental_skipped)
+            tuner_data["analysis_summary"]["experimental_participants"] = [
+                active_loras[i]["name"] for i in _experimental.participants(active_loras)]
+            tuner_data["analysis_summary"]["experimental_notice"] = (
+                "Experimental trials enabled; all targets scored (speed subsampling bypassed). "
+                "Weight-space ranking is not H3 video/audio quality validation. "
+                + ("Skipped: " + "; ".join(experimental_skipped) if experimental_skipped else ""))
 
         if record_dataset == "enabled" and not _is_sub_merge:
             self._save_tuner_dataset_entry(
@@ -14344,6 +14502,9 @@ class LoRAAutoTuner(LoRAOptimizer):
                 "source_order": [self._lora_identity_hash(item) for item in active_loras],
                 "analysis_context": analysis_context,
             }
+            if experimental_options is not None:
+                memory_settings["experimental_options"] = experimental_options
+                memory_settings["stable_top_n"] = top_n
             settings_hash = self._memory_settings_hash(memory_settings)
             self._memory_save(memory_lora_hash, settings_hash,
                               memory_settings, active_loras, tuner_data)
@@ -14421,6 +14582,7 @@ class LoRAAutoTuner(LoRAOptimizer):
                 sparsification_density=sel_config["sparsification_density"],
                 dare_dampening=sel_config["dare_dampening"],
                 merge_refinement=sel_config["merge_refinement"],
+                _experimental_config=sel_config.get("experimental"),
                 merge_strategy_override=strategy_override,
                 strategy_set=sel_config.get("strategy_set", "full"),
                 normalize_keys=tuner_data.get("normalize_keys", normalize_keys),
@@ -14559,7 +14721,9 @@ class LoRAAutoTuner(LoRAOptimizer):
             user_dir = folder_paths.get_user_directory()
             dataset_dir = os.path.join(user_dir, "lora_optimizer_reports")
             os.makedirs(dataset_dir, exist_ok=True)
-            dataset_path = os.path.join(dataset_dir, "autotuner_dataset.jsonl")
+            dataset_name = ("autotuner_experimental_dataset.jsonl" if tuner_data.get("experimental_options")
+                            else "autotuner_dataset.jsonl")
+            dataset_path = os.path.join(dataset_dir, dataset_name)
 
             # Summarize per-prefix conflict/cosine distributions
             conflict_ratios = []
@@ -14655,7 +14819,11 @@ class LoRAAutoTuner(LoRAOptimizer):
         lines.append(f"    Output strength: {output_strength}")
         if suggested_max_strength is not None:
             lines.append(f"    Suggested max output_strength: {suggested_max_strength:.2f}")
-        if scoring_speed != "full":
+        if s.get("experimental_notice"):
+            lines.append("    " + s["experimental_notice"])
+            participants = ", ".join(f"{i + 1}: {name}" for i, name in enumerate(s.get("experimental_participants", [])))
+            lines.append("    Active non-preserved participants: " + participants)
+        elif scoring_speed != "full":
             lines.append(f"    Scoring speed: {scoring_speed} (subsampled prefix scoring)")
         if s.get("decision_smoothing", 0.0) > 0:
             lines.append(f"    Decision smoothing: {s['decision_smoothing']:.2f}")
@@ -14676,6 +14844,10 @@ class LoRAAutoTuner(LoRAOptimizer):
             lines.append(score_line)
             mode_display = "per-prefix (auto)" if c["optimization_mode"] == "per_prefix" else c["merge_mode"]
             lines.append(f"    Mode: {mode_display} | Refinement: {c['merge_refinement']}")
+            if "experimental" in c:
+                lines.append("    EXPERIMENTAL: " + json.dumps(c["experimental"], sort_keys=True))
+            elif c.get("experimental_baseline"):
+                lines.append("    Additive baseline for experimental comparison")
             if c["sparsification"] != "disabled":
                 spars_info = f"{c['sparsification']} (density={c['sparsification_density']}"
                 if c["dare_dampening"] > 0:
@@ -14712,18 +14884,21 @@ class LoRAAutoTuner(LoRAOptimizer):
                    vram_budget=0.0, scoring_speed="full", scoring_formula="v2",
                    output_mode="merge", decision_smoothing=0.25,
                    smooth_slerp_gate=False, memory_mode="disabled", selection=1,
-                   record_dataset="disabled", star_eta=100.0, tame_layers=0.0, tame_threshold=0.3):
+                   record_dataset="disabled", star_eta=100.0, tame_layers=0.0, tame_threshold=0.3,
+                   experimental_options=None):
         evaluator_hash = ""
         if evaluator is not None:
             evaluator_hash = (cls._stable_data_hash(evaluator) + "|"
                               + _evaluator_file_fingerprint(evaluator.get("module_path")))
-        return (cls._model_revision(model, clip), cls._compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, 'disabled'), cls._per_lora_merge_signature(lora_stack),
+        identity = (cls._model_revision(model, clip), cls._compute_cache_key(lora_stack, output_strength, clip_strength_multiplier, 'disabled'), cls._per_lora_merge_signature(lora_stack),
                 output_strength, clip_strength_multiplier, top_n,
                 normalize_keys, scoring_svd, scoring_device,
                 architecture_preset,
                 vram_budget, community_cache, scoring_speed, scoring_formula, output_mode,
                 auto_strength_floor, decision_smoothing, smooth_slerp_gate, evaluator_hash,
                 memory_mode, selection, record_dataset, star_eta, tame_layers, tame_threshold)
+        exp = _experimental.options(experimental_options)
+        return identity + (cls._stable_data_hash(exp),) if exp is not None else identity
 
     def _run_phase1_for_estimator(self, model, clip, lora_stack,
                                   normalize_keys="enabled",
@@ -14824,7 +14999,7 @@ class LoRAMergeSelector(LoRAOptimizer):
                     "tooltip": "Connect from the LoRA AutoTuner's tuner_data output."
                 }),
                 "selection": ("INT", {
-                    "default": 1, "min": 1, "max": 10, "step": 1,
+                    "default": 1, "min": 1, "max": 17, "step": 1,
                     "tooltip": "Which ranked configuration to apply (1 = top-ranked, 2 = next-ranked, etc.)."
                 }),
                 "output_strength": ("FLOAT", {
@@ -14920,6 +15095,7 @@ class LoRAMergeSelector(LoRAOptimizer):
             sparsification_density=config["sparsification_density"],
             dare_dampening=config["dare_dampening"],
             merge_refinement=config["merge_refinement"],
+            _experimental_config=config.get("experimental"),
             merge_strategy_override=strategy_override,
             free_vram_between_passes="disabled",
             vram_budget=vram_budget,
@@ -14941,6 +15117,8 @@ class LoRAMergeSelector(LoRAOptimizer):
         lines.append(f"Merge Selector \u2014 Applied config #{selection}")
         mode_display = "per-prefix (auto)" if config["optimization_mode"] == "per_prefix" else config["merge_mode"]
         lines.append(f"  Mode: {mode_display} | Refinement: {config['merge_refinement']}")
+        if "experimental" in config:
+            lines.append("  EXPERIMENTAL: " + json.dumps(config["experimental"], sort_keys=True))
         if config["sparsification"] != "disabled":
             lines.append(f"  Sparsification: {config['sparsification']} "
                          f"(density={config['sparsification_density']})")
@@ -15203,6 +15381,9 @@ class SaveMergedLoRA:
                     "sparsification", "sparsification_density", "merge_refinement", "strategy_set"):
             if merge_meta.get(key) is not None:
                 metadata["merge_" + key] = str(merge_meta[key])
+        if "experimental" in merge_meta:
+            metadata["merge_experimental"] = json.dumps(merge_meta["experimental"], sort_keys=True)
+            metadata["merge_experimental_roles"] = json.dumps(merge_meta.get("experimental_roles", []))
         if merge_meta.get("architecture") == "minimax_h3":
             metadata["lora_optimizer_h3_layout"] = "comfy"
             profiles = merge_meta.get("h3_profiles", [])
@@ -17317,6 +17498,7 @@ class LoRACombinationGenerator:
 
 # Node registration
 NODE_CLASS_MAPPINGS = {
+    "LoRAExperimentalOptions": LoRAExperimentalOptions,
     "LoRAStack": LoRAStack,
     "LoRAStackDynamic": LoRAStackDynamic,
     "LoRAOptimizer": LoRAOptimizer,
@@ -17345,6 +17527,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "LoRAExperimentalOptions": "LoRA Experimental Options",
     "LoRAStack": "LoRA Stack",
     "LoRAStackDynamic": "LoRA Stack (Dynamic)",
     "LoRAOptimizer": "LoRA Optimizer (Legacy)",

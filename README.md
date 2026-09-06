@@ -61,6 +61,8 @@ Everything is automatic. Connect `analysis_report` to a **Show Text** node to se
 **Want more control?** Add a Settings node → connect to the optimizer's `settings` input.
 **Want the best config found for you?** Use the **LoRA AutoTuner** instead of the optimizer.
 
+**Want to test new merge methods?** Connect **LoRA Experimental Options** to AutoTuner or AutoTuner Settings for opt-in **NP-LoRA / CT-Merging** trials. Existing behavior is unchanged when disconnected. See [experimental controls, costs, and H3 limitations](docs/experimental-merging.md).
+
 ---
 
 ## Installation
@@ -91,6 +93,7 @@ Restart ComfyUI. Nodes appear under the `loaders` category.
 | **LoRA Inline Chain Options** | Optional side node for the Inline Chain optimizer — set per-LoRA enable/strength/conflict/preserve options |
 | **Settings Nodes** | Optional fine-tuning: sparsification, compression, smoothing, etc. |
 | **LoRA AutoTuner** | Sweep 2000+ parameter combos, rank the best configs |
+| **LoRA Experimental Options** | Opt-in NP-LoRA / CT-Merging trials alongside stable AutoTuner candidates |
 | **LoRA Merge Estimator** | Predict the best config via k-NN over the community cache — skip the sweep |
 | **Merge Selector** | Try alternative ranked configs from AutoTuner results |
 | **Conflict Editor** | Inspect pairwise conflicts, set per-LoRA conflict modes + merge strategy by hand |

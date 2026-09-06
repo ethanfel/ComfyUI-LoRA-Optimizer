@@ -1,8 +1,10 @@
 # H3 and node correctness plan, followed by improvement review
 
-Status: Phase 1 implemented and CPU-validated; full-model render checks remain pending a usable GPU. Phase 2 has not started.
+Status: Phase 1 implemented and CPU-validated; full-model render checks remain pending a usable GPU. Following user approval to proceed, Phase 2's opt-in node, NP-LoRA, and CT-Merging are implemented, with commit/push authorized at handoff. CPU and real-ComfyUI tensor round trips are covered; full H3 audiovisual quality and performance remain unvalidated.
 
-Results and limitations: [Phase 1 validation record](../audits/2026-09-06-phase1-validation.md). Package version remains 1.8.3; no commit, push, or publication in this phase.
+Results and limitations: [Phase 1 validation record](../audits/2026-09-06-phase1-validation.md). Phase 1 was committed and pushed as `5bc2970` following user approval. Package version remains 1.8.3; no new release was published.
+
+Phase 2 implementation checks: [experimental validation record](../audits/2026-09-06-phase2-experimental-validation.md).
 
 Baseline: repository `a5e80a9`, version `1.8.3`. Evidence: [September 6 audit](../audits/2026-09-06-h3-release-audit.md) and [diagnostic probes](../audits/h3_release_probes.py).
 
@@ -114,7 +116,23 @@ Suggested reviewable implementation groups: regression infrastructure → detect
 
 ## Phase 2 — Detailed improvement review, after fixes
 
-The following are investigation items, not preapproved implementations. For each, produce a short design covering upstream evidence at that time, intended users, exact semantics, compatibility, UI changes, runtime/memory cost, licensing/dependencies, failure policy, tests, and a go/no-go recommendation.
+The remaining items are investigations, not preapproved implementations. The user approved the experimental-node boundary and then implementation of NP-LoRA/CT-Merging. For each other item, produce a short design covering upstream evidence at that time, intended users, exact semantics, compatibility, UI changes, runtime/memory cost, licensing/dependencies, failure policy, tests, and a go/no-go recommendation.
+
+### 2.0. Separate experimental options — agreed integration boundary
+
+Implemented: a dedicated **LoRA Experimental Options** node with appended optional inputs on AutoTuner Settings and the standalone AutoTuner, propagated through Simple/Inline settings and result replay. Existing stable mode dropdowns are unchanged. See [experimental usage and numerical policies](../experimental-merging.md).
+
+- Disconnected, disabled, or with no methods enabled: preserve the current candidate grid, scoring, defaults, output semantics, and stable cache identity. Existing saved workflows need no edits.
+- Connected with methods enabled: consider those methods **alongside the existing stable candidates**, not in place of them. Explicitly enabling experiments can change the selected result.
+- Give experiments a bounded additional trial budget. The current tuner heuristically shortlists candidates before merging; reserve actual trials so legacy scoring cannot discard every new method before evaluation. Do not silently reduce the stable trial allocation.
+- Carry method ID, algorithm/schema version, role assignments, parameters, and any calibration identity through candidate generation, application, TUNER_DATA, Selector replay, reports, and export metadata.
+- Isolate experimental cache entries from stable runs. Removing the node must not reuse an experimental winner; changing experimental settings must invalidate the relevant results.
+- Reject invalid node configuration clearly. Report unsupported candidate/input combinations explicitly, retaining the stable baseline when valid; never silently drop adapter tensors to make an experiment run.
+- Keep calibration or base-model transfer in separate explicit preparation steps. Enabling an algorithm must not implicitly download models or launch unbudgeted sampling/training.
+
+Acceptance tests: disconnected/disabled/empty-option equivalence; connected candidate inclusion and bounded trial counts; configuration propagation through all entry points; fresh/cached/Selector replay equivalence; cache isolation after disconnect; and actionable unsupported-format reports. Version bumps and any future promotion to stable behavior remain separate decisions.
+
+Initial implementation choices: 1–3 extra trials per eligible method plus one additive baseline; full-target scoring while experiments are enabled (no speed subsampling); serial CPU experimental group merges; QR/small-core SVD for eligible ordinary factors; dense fallback for other supported matrices. Experimental formula trees are rejected, and community rankings / strength-ignoring memory are disabled for experimental runs. Version remains 1.8.3; no commit/push or publication for this implementation without a separate request.
 
 ### 2A. Automatic H3 full-to-pruned AdaLN conversion
 
@@ -130,10 +148,36 @@ Design an opt-in evaluation workflow using fixed prompts/seeds and an additive b
 
 ### 2D. New merge algorithms
 
-Recheck current implementations and evidence, then compare SSR-Merge, CT-Merging, and TARA-Merging with the repaired additive/conflict-aware baseline. Assess calibration requirements and whether a meaningful H3 audiovisual objective exists. Start with one justified prototype, not three new default modes. Require demonstrated benefit, acceptable resource use, and clear opt-in semantics before integration.
+Research shortlist checked on September 6, 2026. These are candidates for evaluation, not claims of better H3 output.
+
+Following the user's interest in both leading candidates and subsequent go-ahead, **NP-LoRA and CT-Merging** are implemented as the first experimental iteration. Implementation does not establish H3 perceptual quality.
+
+- Give each method an independent enable switch on LoRA Experimental Options; users can opt into either or both. Both enabled means separate competing candidates, not an implicit NP-then-CT transformation.
+- NP-LoRA controls: explicit subject/style adapter selection, projection strength, and style-subspace rank/energy policy. Initially require exactly two active merge participants; protected additive overlays are outside that pair.
+- CT-Merging controls: shared/residual rank budgets and scaling policy for the active multi-adapter stack. Resolve signed and zero strengths in the mathematical design before exposing controls.
+- Implement and verify the shared opt-in plumbing first, then NP-LoRA, then CT-Merging as separate reviewable steps. Neither method changes existing stable dropdowns or disconnected behavior.
+
+| Candidate | What it adds and what it needs | Recommendation |
+| --- | --- | --- |
+| [NP-LoRA](https://arxiv.org/abs/2511.11051v3) (revised May 2026) | Asymmetric subject/content-plus-style fusion: soft projection suppresses content updates along dominant style directions. Closed-form weight-space operation; no calibration forward passes. | First prototype: two adapters with explicit subject/style roles, projection strength, and subspace-rank/energy controls. Do not silently generalize to an unordered multi-adapter stack. |
+| [CT-Merging](https://arxiv.org/abs/2607.20561) (July 2026) | Data-free construction of shared directions and task-level RMS scaling. Evidence is from CLIP adapter classification, not generative video. | Second weight-only candidate for multi-adapter stacks. Use a distinct mode ID; this is not the repository's existing `consensus` algorithm. Define signed-strength and rank-budget semantics before implementation. |
+| [SSR-Merge](https://github.com/nagara214/SSR-Merge) (June 2026) | Diffusion-oriented subspace routing with one prompt per adapter and a GPU calibration pass; exports an ordinary LoRA. The official demo lists Flux, Qwen, Z-Image, HiDream, and Flux2, not H3. | Later integration with a separate reusable calibration object/node. Training-free does not mean calibration-free. Establish an H3 conditioning/activation-collection path before advertising H3 support. |
+| [TARA-Merging](https://arxiv.org/html/2603.26299v1) (March 2026) | Preference-aware direction weighting optimized using an entropy surrogate; evaluated on vision and language tasks. Requires model/data-dependent optimization, not just a closed-form merge. | Defer: first define a meaningful generative audiovisual objective and an explicit optimization budget. |
+
+NP-LoRA prototype review must distinguish its directional projection from existing preserve-overlay and orthogonalization options. Test the zero-projection additive limit, role reversal, orthogonal/overlapping subspaces, missing target overlap, rank/alpha/strength handling, numerical finiteness, and stock-loader export reconstruction. Benchmark memory and runtime on H3-sized matrices; weight-only does not mean cost-free.
+
+For every method, explicitly define dense matrix, bias/norm vector, convolution, and partial-QKV behavior. Use a documented additive side-payload policy where mathematically appropriate, or reject unsupported combinations. Keep compatible Turbo/distillation adapters as protected additive overlays in the initial experiments, not projection/scaling candidates. Existing basis, partition, and PDD safety checks remain mandatory.
+
+Both selected prototypes remain behind the experimental boundary and are compared with additive and stable candidates. None of the sources reviewed establishes superiority on H3 video/audio. Weight-space scores alone are insufficient evidence of perceptual improvement; use the bounded evaluation from 2C before making quality claims. Implementations were written independently from the paper algorithms; no third-party node code or new dependency was imported.
 
 ### 2E. PDD interoperability
 
 Choose between documenting a supported external-runtime workflow and carrying PDD heads/schedule metadata through a dedicated integration. Define ownership and patch ordering, and verify rejection of incompatible exports or schedules. Do not expand an ordinary LORA_DATA payload into a runtime-dependent format implicitly.
+
+### 2F. Distilled-base LoRA transfer — separate from merge modes
+
+[CASA](https://github.com/Noahwangyuchen/CASA) studies data-free transfer from a base video model to its distilled variants, with Wan/Krea examples. It needs the source LoRA, a source-weight SVD, and the source-to-target weight difference projected into that basis. This entails source/target weights or matching precomputed artifacts, not merely two LoRA files.
+
+Review as a separate experimental preparation node, not an ordinary AutoTuner merge candidate. Confirm aligned parameter coordinates, artifact provenance, compute/storage cost, licensing, and H3 applicability before a prototype. It does not replace 2A's affine full-to-pruned AdaLN conversion or permit mixing incompatible H3 partitions. Priority: investigate its video-specific relevance separately while the first weight-only merge prototype is evaluated.
 
 Phase-2 exit: an evidence-backed shortlist with implementation order and acceptance tests, reviewed before coding. Improvements can ship independently after the corrective release is ready; they must not weaken the fix phase's fidelity and compatibility guarantees.

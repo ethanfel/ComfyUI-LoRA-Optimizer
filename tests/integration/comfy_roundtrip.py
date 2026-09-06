@@ -134,7 +134,44 @@ with tempfile.TemporaryDirectory() as tmp:
         expected = comfy.lora.calculate_weight([(clip_data['clip_strength'], patch, 1., None, None)], weight.clone(), key)
         actual = comfy.lora.calculate_weight(loaded_clip.patcher.patches[key], weight.clone(), key)
         torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
-print("PASS: real ComfyUI mapping/application, partial QKV, signed alpha, dense AdaLN/bias/norm, LoCon, fp32 export, atomic rejection, signed CLIP weights/bias")
+# Experimental global modes: real H3 partial QKV + AdaLN/norm payloads, signed
+# model/CLIP weights, complete save -> stock reload, and method provenance.
+import json
+from safetensors import safe_open
+te = 'text_encoder.text_model.encoder.layers.0.self_attn.q_proj'
+exp_a = {**item, 'lora': {**sd, te + '.diff': torch.eye(4), te + '.diff_b': torch.arange(4.)},
+         'clip_strength': -.3}
+exp_b = {**item, 'name': 'tiny-h3-style', 'strength': .4, 'clip_strength': .6,
+         'lora': {k: (v.clone() if k.endswith('.alpha') else v.clone() * -1.5) for k, v in exp_a['lora'].items()}}
+for mode, cfg in (('np_lora', dict(version=1, subject_slot=1, style_slot=2, strength=.5, rank=0, energy=1.)),
+                  ('ct_merge', dict(version=1, common_rank=1, residual_rank=2, scale=1.))):
+    exp_result = opt.optimize_merge(base, [exp_a, exp_b], 1.3, clip=clip,
+        optimization_mode='global', merge_strategy_override=mode,
+        _experimental_config=cfg, patch_compression='disabled', normalize_keys='enabled')
+    exp_data = exp_result[4]
+    assert exp_data['merge_metadata']['mode'] == mode
+    assert exp_data['merge_metadata']['experimental'] == cfg
+    actual_qkv = m._LoRAMergeBase._expand_patch_to_diff(exp_data['model_patches'][target])
+    torch.testing.assert_close(actual_qkv[256:], torch.zeros(512, 4))
+    bias_key = 'diffusion_model.blocks.0.adaln_proj.linear.bias'
+    torch.testing.assert_close(m._LoRAMergeBase._expand_patch_to_diff(exp_data['model_patches'][bias_key]),
+                               sd['diffusion_model.blocks.0.adaln_proj.linear.diff_b'] * (-.7 - .6))
+    with tempfile.TemporaryDirectory() as tmp:
+        exp_path = m.SaveMergedLoRA().save_lora(exp_data, tmp, mode)[0]
+        with safe_open(exp_path, framework='pt') as f:
+            assert json.loads(f.metadata()['merge_experimental']) == cfg
+        loaded_model, loaded_exp_clip = comfy.sd.load_lora_for_models(base, clip, load_file(exp_path), 1., 1.)
+        for patches, reloaded_patcher, module, strength in (
+                (exp_data['model_patches'], loaded_model, base.model, exp_data['output_strength']),
+                (exp_data['clip_patches'], loaded_exp_clip.patcher, clip.cond_stage_model, exp_data['clip_strength'])):
+            assert set(reloaded_patcher.patches) == set(patches)
+            for key, patch in patches.items():
+                weight = module.state_dict()[key].float()
+                expected = comfy.lora.calculate_weight([(strength, patch, 1., None, None)], weight.clone(), key)
+                actual = comfy.lora.calculate_weight(reloaded_patcher.patches[key], weight.clone(), key)
+                torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5, msg=mode + ': ' + key)
+    del exp_result, loaded_model, loaded_exp_clip, reloaded_patcher
+print("PASS: real ComfyUI mapping/application, partial QKV, signed alpha, dense AdaLN/bias/norm, LoCon, fp32 export, atomic rejection, signed CLIP weights/bias, NP-LoRA/CT-Merging round trips and metadata")
 # Release while Comfy's modules are still alive (avoid interpreter-shutdown
 # ModelPatcher destructor warnings masking useful test output).
 del result, reloaded, base, opt, clip, clip_result, loaded_clip, _
