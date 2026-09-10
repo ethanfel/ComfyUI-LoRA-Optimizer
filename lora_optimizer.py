@@ -2424,18 +2424,121 @@ class _LoRAMergeBase:
         return lora_sd  # unknown — pass through unchanged
 
     @staticmethod
-    def _fuse_qkv_component_patches(component_patches):
+    def _patch_tensors(patch):
+        """Yield patch tensors without expanding adapters or copying storage."""
+        def walk(value):
+            if isinstance(value, torch.Tensor):
+                yield value
+            elif isinstance(value, (tuple, list)):
+                for child in value:
+                    yield from walk(child)
+        yield from walk(patch.weights if hasattr(patch, "weights") else patch)
+
+    @classmethod
+    def _cuda_patch_bytes(cls, patches):
+        return sum(t.numel() * t.element_size()
+                   for p in patches.values() for t in cls._patch_tensors(p)
+                   if t.is_cuda)
+
+    @staticmethod
+    def _plain_qkv_lora(patch):
+        if not isinstance(patch, LoRAAdapter):
+            return False
+        w = patch.weights
+        return (len(w) >= 6 and all(v is None for v in w[3:6])
+                and all(isinstance(t, torch.Tensor) and t.dim() == 2 for t in w[:2]))
+
+    @classmethod
+    def _qkv_refusion_bytes(cls, components, existing=None, pad_missing=False):
+        """Conservative output/workspace bounds, calculated BEFORE allocations.
+
+        Unknown/exotic adapters go to RAM: do not expand a dense CUDA tensor
+        just to discover its size. Inputs are already resident and excluded
+        from workspace, but their possible casts are included below.
+        """
+        dense = all(isinstance(p, tuple) and cls._is_plain_additive_payload(p)
+                    for p in components)
+        factored = all(cls._plain_qkv_lora(p) for p in components)
+        if not components or not (dense or factored):
+            return None
+        copies = 3 if pad_missing else 1  # upper bound, including absent K/V
+        input_fp32 = sum(t.numel() * max(4, t.element_size())
+                         for p in components for t in cls._patch_tensors(p)) * copies
+        if dense:
+            # Concatenation promotes EVERY component to the widest dtype.
+            width = max(4, max(p[1][0].element_size() for p in components))
+            output = sum(p[1][0].numel() for p in components) * width * copies
+            dense_bytes = output
+        else:
+            rows = sum(p.weights[0].shape[0] for p in components) * copies
+            rank = sum(p.weights[1].shape[0] for p in components) * copies
+            cols = max(p.weights[1].shape[1] for p in components)
+            output = (rows * rank + rank * cols) * 4
+            dense_bytes = rows * cols * 4
+        if existing is not None:
+            if isinstance(existing, tuple) and cls._is_plain_additive_payload(existing):
+                existing_bytes = existing[1][0].numel() * 4
+            elif cls._plain_qkv_lora(existing):
+                existing_bytes = existing.weights[0].shape[0] * existing.weights[1].shape[1] * 4
+            else:
+                return None
+            # Both expansions, accumulation and scoring may need FP32 buffers.
+            input_fp32 += existing_bytes
+            output = max(dense_bytes, existing_bytes)
+        # Also covers inline GPU scoring's float/abs/mask/SVD projection scratch.
+        return output, 8 * (output + input_fp32)
+
+    @classmethod
+    def _qkv_refusion_device(cls, components, existing=None,
+                            gpu_allowance_bytes=None, pad_missing=False):
+        """Never promote CPU components onto CUDA merely because Q is on GPU."""
+        cpu = torch.device("cpu")
+        tensors = [t for p in components + ([existing] if existing is not None else [])
+                   for t in cls._patch_tensors(p)]
+        devices = {t.device for t in tensors}
+        if len(devices) != 1 or not tensors or not tensors[0].is_cuda:
+            return cpu
+        sizes = cls._qkv_refusion_bytes(components, existing, pad_missing)
+        if sizes is None:
+            return cpu
+        output_bytes, workspace_bytes = sizes
+        if gpu_allowance_bytes is not None and output_bytes > gpu_allowance_bytes:
+            return cpu
+        device = tensors[0].device
+        try:
+            free = comfy.model_management.get_free_memory(device)
+        except Exception:
+            return cpu  # Unavailable telemetry is not permission to allocate.
+        if workspace_bytes + 512 * 1024**2 > free:
+            return cpu
+        return device
+
+    @classmethod
+    def _fuse_qkv_component_patches(cls, component_patches, device=None):
         """Fuse ordered Q/K/V patches without changing their effective diffs."""
         if len(component_patches) != 3:
             return None
 
+        if device is None:
+            device = cls._qkv_refusion_device(component_patches)
+
         if all(isinstance(p, tuple) and len(p) >= 2 and p[0] == "diff"
                for p in component_patches):
             parts = [p[1][0] for p in component_patches]
-            device = parts[0].device
-            parts = [part if part.device == device else part.to(device)
-                     for part in parts]
-            out = torch.cat(parts, dim=0)
+            shape = list(parts[0].shape)
+            if any(tuple(p.shape[1:]) != tuple(shape[1:]) for p in parts):
+                raise ValueError("Incompatible QKV component shapes")
+            shape[0] = sum(p.shape[0] for p in parts)
+            dtype = parts[0].dtype
+            for part in parts[1:]:
+                dtype = torch.promote_types(dtype, part.dtype)
+            # One destination, sequential blocking copies: no all-components
+            # device migration followed by a second, full-size torch.cat.
+            out = torch.empty(shape, device=device, dtype=dtype)
+            row = 0
+            for part in parts:
+                out.narrow(0, row, part.shape[0]).copy_(part)
+                row += part.shape[0]
             return ("diff", (out,))
 
         if all(isinstance(p, LoRAAdapter) for p in component_patches):
@@ -2447,7 +2550,6 @@ class _LoRAMergeBase:
                         and w[0].dim() == 2 and w[1].dim() == 2
                         for w in data)
             if plain:
-                device = data[0][0].device
                 downs = [w[1] if w[1].device == device else w[1].to(device)
                          for w in data]
                 ups = [w[0] if w[0].device == device else w[0].to(device)
@@ -2492,17 +2594,16 @@ class _LoRAMergeBase:
         if any(hasattr(p, "weights")
                or (isinstance(p, tuple) and p and p[0] == "diff")
                for p in component_patches):
-            parts = [_LoRAMergeBase._expand_patch_to_diff(p)
+            # Move BEFORE float()/matmul, including the mixed diff/adapter path.
+            parts = [cls._expand_patch_to_diff(cls._move_patch_to_device(p, device))
                      for p in component_patches]
-            device = parts[0].device
-            parts = [part if part.device == device else part.to(device)
-                     for part in parts]
             out = torch.cat(parts, dim=0)
             return ("diff", (out,))
         return None
 
     @classmethod
-    def _refuse_fused_qkv_patches(cls, patches):
+    def _refuse_fused_qkv_patches(cls, patches, *, gpu_budget_bytes=None,
+                                _consume=False, _score_collector=None):
         """Re-fuse Z-Image/H3 component patches to native QKV targets.
 
         Z-Image may surface component names as strings. MiniMax H3 uses
@@ -2510,14 +2611,16 @@ class _LoRAMergeBase:
         Returning native fused keys keeps both model application and standalone
         Save Merged LoRA output compatible with stock ComfyUI.
         """
-        fused = {}
-        named_groups = {}   # base -> {q|k|v: (key, patch)}
-        offset_groups = {}  # native target -> {start: (key, patch, length)}
+        # The merger owns its patch dictionary and can consume replaced entries.
+        # Export/default callers retain their dictionary and tensor contents.
+        fused = patches if _consume else dict(patches)
+        named_groups = {}   # base -> {q|k|v: key}; metadata must not pin tensors
+        offset_groups = {}  # native target -> {start: (key, length)}
         native_qkv_re = re.compile(
             r'(?:layers\.\d+\.attention\.qkv|'
             r'(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj)(?:\.weight)?$')
 
-        for key, patch in patches.items():
+        for key in list(fused):
             key_str = key[0] if isinstance(key, tuple) else key
 
             if (isinstance(key, tuple) and len(key) > 1
@@ -2525,15 +2628,13 @@ class _LoRAMergeBase:
                     and isinstance(key_str, str) and native_qkv_re.search(key_str)):
                 offset = key[1]
                 if offset[0] == 0:
-                    offset_groups.setdefault(key_str, {})[offset[1]] = (
-                        key, patch, offset[2])
+                    offset_groups.setdefault(key_str, {})[offset[1]] = (key, offset[2])
                     continue
 
             match = re.search(
                 r'(layers\.\d+\.attention)\.to_(q|k|v)(?:\.|$)', key_str)
             if match:
-                named_groups.setdefault(match.group(1), {})[match.group(2)] = (
-                    key, patch)
+                named_groups.setdefault(match.group(1), {})[match.group(2)] = key
                 continue
 
             match_out = re.search(
@@ -2542,61 +2643,127 @@ class _LoRAMergeBase:
                 new_key_str = key_str.replace('.to_out.0', '.out')
                 new_key = ((new_key_str,) + key[1:]
                            if isinstance(key, tuple) else new_key_str)
-                fused[new_key] = patch
+                fused[new_key] = fused.pop(key)
                 continue
-            fused[key] = patch
+
+        gpu_groups = cpu_groups = 0
+
+        def assemble(target, keys, missing_rows=None):
+            """One group's inputs, output and scoring scratch live at a time."""
+            nonlocal gpu_groups, cpu_groups
+            components = [fused[k] for k in keys if k is not None]
+            existing = fused.get(target)
+            allowance = (None if gpu_budget_bytes is None else
+                         max(0, gpu_budget_bytes - cls._cuda_patch_bytes(fused)))
+            device = cls._qkv_refusion_device(
+                components, existing, allowance, missing_rows is not None)
+
+            def build(destination):
+                # Keep allocation locals in this frame so an OOM retry starts
+                # after its tensors/traceback have been released. Inputs and
+                # collector entries are not consumed until the build succeeds.
+                ordered = []
+                for key in keys:
+                    if key is not None:
+                        ordered.append(fused[key])
+                    else:
+                        # Select the destination BEFORE padding or expansion.
+                        exemplar = cls._move_patch_to_device(components[0], destination)
+                        if cls._plain_qkv_lora(exemplar):
+                            w = exemplar.weights
+                            zero = LoRAAdapter(set(), (torch.zeros_like(w[0]), w[1], w[2], None, None, None))
+                        else:
+                            zero = ("diff", (torch.zeros_like(cls._expand_patch_to_diff(exemplar)),))
+                        ordered.append(zero)
+                combined = cls._fuse_qkv_component_patches(ordered, device=destination)
+                if combined is None:
+                    return None, None
+                if existing is not None:
+                    # Move BEFORE expansion. Addition is newly-owned, so
+                    # in-place accumulation cannot mutate an input tensor.
+                    addition = cls._expand_patch_to_diff(combined)
+                    prior = cls._expand_patch_to_diff(cls._move_patch_to_device(existing, destination))
+                    if addition.shape != prior.shape:
+                        raise ValueError(f"Incompatible native/sliced QKV shapes: {target}")
+                    addition.add_(prior)
+                    combined = ("diff", (addition,))
+                    del addition, prior
+                stats = None
+                # GPU scoring stays on GPU; release each completed fused
+                # result before processing another group, not after the map.
+                if (_score_collector is not None and destination.type == "cuda"
+                        and isinstance(combined, tuple) and combined[0] == "diff"):
+                    tensor = combined[1][0]
+                    stats = _diff_score_stats(tensor, _score_collector.get("compute_svd", False))
+                    combined = ("diff", (tensor.cpu(),))
+                return combined, stats
+
+            retry_cpu = False
+            try:
+                combined, stats = build(device)
+            except torch.cuda.OutOfMemoryError:
+                if device.type != "cuda":
+                    raise
+                retry_cpu = True
+            if retry_cpu:
+                logging.warning("[LoRA Optimizer] QKV workspace exhausted for %s; "
+                                "retrying reassembly on CPU (GPU scoring unchanged)", target)
+                device = torch.device("cpu")
+                combined, stats = build(device)
+            if combined is None:
+                return
+            # Remove replaced scoring entries as well as dictionary references.
+            # Otherwise the identity guard pins old GPU tensors until the end
+            # of this candidate, defeating per-group reclamation.
+            for key in [k for k in keys if k is not None] + ([target] if existing is not None else []):
+                old = fused.pop(key)
+                if _score_collector is not None:
+                    for tensor in cls._patch_tensors(old):
+                        _score_collector["stats"].pop(id(tensor), None)
+            del components, existing, old
+            if device.type == "cuda":
+                gpu_groups += 1
+            else:
+                cpu_groups += 1
+            if stats is not None:
+                tensor_cpu = combined[1][0]
+                _score_collector["stats"][id(tensor_cpu)] = (tensor_cpu, stats)
+            fused[target] = combined
 
         for base, components in named_groups.items():
             if all(component in components for component in ('q', 'k', 'v')):
-                entries = [components[c] for c in ('q', 'k', 'v')]
-                combined = cls._fuse_qkv_component_patches([p for _, p in entries])
-                if combined is not None:
-                    q_key = entries[0][0]
-                    q_key_str = q_key[0] if isinstance(q_key, tuple) else q_key
-                    fused_key_str = re.sub(r'\.to_q(?=\.|$)', '.qkv', q_key_str)
-                    fused_key = ((fused_key_str,) + q_key[1:]
-                                 if isinstance(q_key, tuple) else fused_key_str)
-                    fused[fused_key] = combined
-                    continue
-            for key, patch in components.values():
-                fused[key] = patch
+                keys = [components[c] for c in ('q', 'k', 'v')]
+                q_key = keys[0]
+                q_key_str = q_key[0] if isinstance(q_key, tuple) else q_key
+                fused_key_str = re.sub(r'\.to_q(?=\.|$)', '.qkv', q_key_str)
+                fused_key = ((fused_key_str,) + q_key[1:]
+                             if isinstance(q_key, tuple) else fused_key_str)
+                assemble(fused_key, keys)
 
         for target, pieces in offset_groups.items():
             # Partial H3 adapters still need a full fused target on export.
             if '.attn.qkv_proj' in target and pieces:
-                lengths = {entry[2] for entry in pieces.values()}
+                lengths = {entry[1] for entry in pieces.values()}
                 if len(lengths) != 1:
                     raise ValueError(f"Inconsistent H3 QKV slice lengths: {target}")
                 rows = next(iter(lengths))
                 if rows <= 0 or any(start not in (0, rows, 2 * rows) for start in pieces):
                     raise ValueError(f"Invalid H3 QKV slice offset: {target}")
-                exemplar = next(iter(pieces.values()))[1]
-                for start in (0, rows, 2 * rows):
-                    if start not in pieces:
-                        if isinstance(exemplar, LoRAAdapter) and cls._is_plain_additive_payload(exemplar):
-                            w = exemplar.weights
-                            zero = LoRAAdapter(set(), (torch.zeros_like(w[0]), w[1], w[2], None, None, None))
-                        else:
-                            zero = ("diff", (torch.zeros_like(cls._expand_patch_to_diff(exemplar)),))
-                        pieces[start] = ((target, (0, start, rows)), zero, rows)
+                keys = [pieces[start][0] if start in pieces else None
+                        for start in (0, rows, 2 * rows)]
+                assemble(target, keys, rows if len(pieces) < 3 else None)
+                continue
             ordered = sorted(pieces.items())
             complete = (len(ordered) == 3 and ordered[0][0] == 0
-                        and all(ordered[i][0] + ordered[i][1][2] == ordered[i + 1][0]
+                        and all(ordered[i][0] + ordered[i][1][1] == ordered[i + 1][0]
                                 for i in range(2)))
-            combined = (cls._fuse_qkv_component_patches(
-                [entry[1][1] for entry in ordered]) if complete else None)
-            if combined is None:
-                for _start, (key, patch, _length) in ordered:
-                    fused[key] = patch
-                continue
-            if target in fused:
-                # Rare mixed exotic/native case: accumulate both contributions.
-                existing = cls._expand_patch_to_diff(fused[target])
-                addition = cls._expand_patch_to_diff(combined)
-                if addition.device != existing.device:
-                    addition = addition.to(existing.device)
-                combined = ("diff", (existing + addition,))
-            fused[target] = combined
+            if complete:
+                assemble(target, [entry[1][0] for entry in ordered])
+
+        if gpu_groups or cpu_groups:
+            logging.info("[LoRA Optimizer] QKV reassembly: %d GPU, %d CPU groups; "
+                         "%dMB final CUDA patches (scoring device unchanged)",
+                         gpu_groups, cpu_groups, cls._cuda_patch_bytes(fused) // (1024**2))
 
         return fused
 
@@ -9990,7 +10157,14 @@ class LoRAOptimizer(_LoRAMergeBase):
         if (getattr(self, '_detected_arch', None) in ('zimage', 'minimax_h3')
                 and not _skip_qkv_refusion):
             if len(model_patches) > 0:
-                model_patches = self._refuse_fused_qkv_patches(model_patches)
+                # Include still-live CLIP storage in the patch budget. The
+                # zero-budget Z-Image deferral is temporary GPU scoring work,
+                # bounded separately and released group by group by refusion.
+                _qkv_budget = max(vram_budget_bytes, _defer_budget)
+                model_patches = self._refuse_fused_qkv_patches(
+                    model_patches,
+                    gpu_budget_bytes=max(0, _qkv_budget - self._cuda_patch_bytes(clip_patches)),
+                    _consume=True, _score_collector=_score_collector)
                 logging.info(
                     f"[LoRA Optimizer] Re-fused {self._detected_arch} QKV patches "
                     f"({len(model_patches)} model patches)")
@@ -15507,7 +15681,8 @@ class SaveMergedLoRA:
             raise ValueError("No LORA_DATA to export. Check the optimizer's compatibility report.")
         save_path = _resolve_safe_output_path(save_folder, filename, ".safetensors", "Save Merged LoRA")
         key_map = lora_data["key_map"]
-        model_patches = _LoRAMergeBase._refuse_fused_qkv_patches(lora_data["model_patches"])
+        model_patches = _LoRAMergeBase._refuse_fused_qkv_patches(
+            lora_data["model_patches"], gpu_budget_bytes=0)
         clip_patches = lora_data["clip_patches"]
         state_dict = {}
         errors = {}
