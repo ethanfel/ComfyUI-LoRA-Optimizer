@@ -411,17 +411,19 @@ All numeric thresholds in the optimizer (density estimation, conflict detection,
 <details>
 <summary><b>SVD Patch Compression</b></summary>
 
-After merging, full-rank diff patches consume ~128x more RAM than standard LoRA patches (64MB vs 0.5MB per key for a 4096x4096 weight). The optimizer re-compresses merged patches to low-rank via truncated SVD, dramatically reducing post-merge RAM.
+Dense merged deltas can be much larger than the original LoRA factors. Plain linear merges retain concatenated factors without SVD. Eligible two-LoRA SLERP outputs now do the same using the actual SLERP coefficients, with a bounded numerical parity check. Unsupported, modified, unstable, or non-smaller representations fall back to the dense/compression path.
 
 | Mode | What gets compressed | Quality | RAM savings |
 |------|---------------------|---------|-------------|
-| `smart` (default) | `weighted_sum` and `weighted_average` prefixes only | Lossless — sum of input ranks preserves all merge information | ~32x on compressed prefixes |
-| `aggressive` | Everything including TIES | Lossy on TIES prefixes — nonlinear ops (trim, sign election) produce full-rank results that can't be perfectly captured | ~32x on all prefixes |
-| `disabled` | Nothing | No loss | No savings |
+| `smart` (default) | Eligible rank-bounded dense results, without rank-increasing processing | Preserves the known rank budget; numerical SVD/storage rounding still applies | Depends on shape and rank |
+| `aggressive` | Dense results, including TIES | Can discard merge information; explicitly lossy | Depends on shape and rank |
+| `disabled` | No SVD compression | Native factor paths still apply; genuinely dense results stay dense | Factor paths only |
 
 When dense compression is needed, the compression rank is automatically computed as the sum of all input LoRA ranks. For example, 3 rank-32 LoRAs produce a rank-96 compressed patch — enough to represent the full merge on linear operations when no extra nonlinear processing is involved.
 
-> **Tip:** For video models (LTX, Wan, MiniMax H3, etc.) with high RAM usage, use `additive` mode + `smart` (or `aggressive`) compression. Every patch gets losslessly compressed with minimal RAM footprint.
+AutoTuner measures discarded dense candidates on the requested scoring device, then keeps their statistics instead of the dense tensors. QKV pieces remain real until their native/sliced contributions have been assembled and scored. The final selected output is rebuilt after sweep caches are cleared. External evaluators still receive real complete patches. This does not change the scoring formula or silently enable lossy compression.
+
+The `Resident patch tensors` log reports output tensor storage (CPU and GPU combined), not total process RAM. Dense TIES/consensus/refined outputs, input weights, and ComfyUI's own loaded models/backups can still require substantial RAM. See [RAM regression notes](docs/merge-ram-regression.md) for measured results and limitations.
 
 </details>
 

@@ -5,6 +5,7 @@ with TIES conflict resolution and automatic parameter selection.
 """
 
 import torch
+import collections
 import logging
 import math
 import os
@@ -845,7 +846,7 @@ class _DiffCache:
     Modes:
       - "ram": All entries in RAM (fastest, most memory).
       - "disk": All entries on disk via torch.save/mmap (slowest, least memory).
-      - "auto": RAM up to ram_pct of free system memory, then spills to disk.
+      - "auto": RAM up to ram_pct of free system memory; overflow recomputes.
     """
 
 
@@ -963,13 +964,14 @@ class _DiffCache:
         # fit in the cache (they match the "disabled" path). Pairs with auto
         # mode's recompute-past-budget below; the bypass in _prepare_group_diffs
         # already keeps cheap low-rank diffs out of here entirely.
-        cached = tensor.detach().cpu()
-        tensor_bytes = cached.nelement() * cached.element_size()
+        tensor_bytes = tensor.nelement() * tensor.element_size()
         # auto mode caps RAM: decline past the budget so the diff recomputes on
         # the next miss (cheaper and more deterministic than a disk spill).
         if self.mode == "auto" and (self._ram_bytes + tensor_bytes) > self._ram_limit:
             self._ram_overflow_skips = getattr(self, "_ram_overflow_skips", 0) + 1
             return
+        # Refused entries must not allocate a full CPU copy first.
+        cached = tensor.detach().cpu()
         if self._use_disk(tensor_bytes) and not self._disk_failed:
             if not self._disk_has_space(tensor_bytes):
                 # Volume nearly full: skip caching this diff entirely (it will be
@@ -2602,8 +2604,26 @@ class _LoRAMergeBase:
         return None
 
     @classmethod
+    def _sum_compact_lora_patches(cls, left, right):
+        """Exact additive factors for a native/sliced collision, when smaller."""
+        if not (cls._plain_qkv_lora(left) and cls._plain_qkv_lora(right)):
+            return None
+        lu, ld, la = left.weights[:3]
+        ru, rd, ra = right.weights[:3]
+        if lu.shape[0] != ru.shape[0] or ld.shape[1] != rd.shape[1]:
+            return None
+        rank = ld.shape[0] + rd.shape[0]
+        if rank * (lu.shape[0] + ld.shape[1]) >= lu.shape[0] * ld.shape[1]:
+            return None
+        up = torch.cat((lu.float() * (float(la) / ld.shape[0] if la is not None else 1.),
+                        ru.float() * (float(ra) / rd.shape[0] if ra is not None else 1.)), dim=1)
+        down = torch.cat((ld.float(), rd.float()), dim=0)
+        return LoRAAdapter(set(), (up, down, float(rank), None, None, None))
+
+    @classmethod
     def _refuse_fused_qkv_patches(cls, patches, *, gpu_budget_bytes=None,
-                                _consume=False, _score_collector=None):
+                                _consume=False, _score_collector=None, _score_only=None,
+                                _compact_output=False):
         """Re-fuse Z-Image/H3 component patches to native QKV targets.
 
         Z-Image may surface component names as strings. MiniMax H3 uses
@@ -2679,16 +2699,24 @@ class _LoRAMergeBase:
                 if combined is None:
                     return None, None
                 if existing is not None:
-                    # Move BEFORE expansion. Addition is newly-owned, so
-                    # in-place accumulation cannot mutate an input tensor.
-                    addition = cls._expand_patch_to_diff(combined)
-                    prior = cls._expand_patch_to_diff(cls._move_patch_to_device(existing, destination))
-                    if addition.shape != prior.shape:
-                        raise ValueError(f"Incompatible native/sliced QKV shapes: {target}")
-                    addition.add_(prior)
-                    combined = ("diff", (addition,))
-                    del addition, prior
+                    prior_patch = cls._move_patch_to_device(existing, destination)
+                    compact = (cls._sum_compact_lora_patches(combined, prior_patch)
+                               if _compact_output else None)
+                    if compact is not None:
+                        combined = compact
+                    else:
+                        # Move BEFORE expansion. Addition is newly-owned, so
+                        # in-place accumulation cannot mutate an input tensor.
+                        addition = cls._expand_patch_to_diff(combined)
+                        prior = cls._expand_patch_to_diff(prior_patch)
+                        if addition.shape != prior.shape:
+                            raise ValueError(f"Incompatible native/sliced QKV shapes: {target}")
+                        addition.add_(prior)
+                        combined = ("diff", (addition,))
+                        del addition, prior
                 stats = None
+                if _score_only is not None:
+                    return _score_only_patch(combined, _score_only), None
                 # GPU scoring stays on GPU; release each completed fused
                 # result before processing another group, not after the map.
                 if (_score_collector is not None and destination.type == "cuda"
@@ -5096,7 +5124,7 @@ class _LoRAMergeBase:
                      merge_refinement="none", dare_dampening=0.0,
                      keep_on_gpu=False, preserve_flags=None, experimental_config=None,
                      source_indices=None, role_indices=None, experimental_factors=None,
-                     sparsification_stats=None):
+                     sparsification_stats=None, _linear_coefficients=None):
         """
         Merges a list of diffs with their weights.
         When compute_device is given, tensors are moved there for faster ops,
@@ -5315,6 +5343,9 @@ class _LoRAMergeBase:
             # order-independent spherical mean it tried to approximate).
             # Final norm corrected to match weighted average of input norms.
             n_diffs = len(diffs_with_weights)
+            coefficient_order = sorted(range(n_diffs),
+                                       key=lambda i: abs(diffs_with_weights[i][1]), reverse=True)
+            coefficient_signs = [(-1.0 if w < 0 else 1.0) for _, w in diffs_with_weights]
 
             # Handle negative weights by negating diff direction
             items = []
@@ -5359,6 +5390,7 @@ class _LoRAMergeBase:
 
                 # Nearly-parallel fallback to linear interpolation
                 if theta.item() < 1e-6:
+                    a, b = 1.0 - frac, frac
                     acc_v = (1.0 - frac) * acc_v + frac * next_v
                 else:
                     sin_theta = torch.sin(theta)
@@ -5429,6 +5461,11 @@ class _LoRAMergeBase:
             current_norm = acc_v.norm().item()
             if current_norm > 1e-8:
                 acc_v = acc_v * (target_norm / current_norm)
+            if _linear_coefficients is not None and n_diffs == 2:
+                correction = target_norm / current_norm if current_norm > 1e-8 else 1.0
+                indices = source_indices if source_indices is not None else range(n_diffs)
+                for pos, coefficient in zip(coefficient_order, (a, b)):
+                    _linear_coefficients[indices[pos]] = float(coefficient) * coefficient_signs[pos] * correction
 
             result = acc_v.reshape(ref_diff.shape)
             del acc_v
@@ -6219,6 +6256,26 @@ def _diff_score_stats(tensor, compute_svd):
     return fro_norm, sparsity, eff_rank
 
 
+class _ScoredDiff:
+    """Internal, tensor-free candidate result; never a loadable model patch."""
+    __slots__ = ("stats",)
+
+    def __init__(self, stats):
+        self.stats = stats
+
+
+def _score_only_patch(patch, config, stats=None):
+    if isinstance(patch, tuple) and len(patch) == 2 and patch[0] == "diff":
+        if stats is None:
+            tensor = patch[1][0]
+            device = config.get("device")
+            if device is not None:
+                tensor = tensor.to(device)
+            stats = _diff_score_stats(tensor, config.get("compute_svd", False))
+        return _ScoredDiff(stats)
+    return patch
+
+
 def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                         score_device=None, arch_preset=None, lora_svd=False,
                         _baseline=None, _return_raw=False, _inline_stats=None):
@@ -6256,6 +6313,14 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
         if (patch_idx + 1) % log_interval == 0 or patch_idx + 1 == total:
             logging.info(f"[LoRA AutoTuner]     Scored {patch_idx + 1}/{total} patches")
         if patch is None:
+            continue
+        if isinstance(patch, _ScoredDiff):
+            fro_norm, sparsity, eff_rank = patch.stats
+            norms.append(fro_norm)
+            if sparsity is not None:
+                sparsities.append(sparsity)
+            if eff_rank is not None:
+                effective_ranks.append(eff_rank)
             continue
         target_key = patch_key[0] if isinstance(patch_key, tuple) else patch_key
         if isinstance(patch, tuple) and len(patch) >= 2:
@@ -8042,7 +8107,8 @@ class LoRAOptimizer(_LoRAMergeBase):
         return len(target_shape) == 2
 
     def _build_exact_linear_patch(self, target_group, active_loras, raw_n_loras,
-                                  mode, is_clip_key=False, model_scale=1.0):
+                                  mode, is_clip_key=False, model_scale=1.0,
+                                  _coefficients=None):
         """
         Build an exact low-rank patch for linear merges by concatenating factors
         instead of materializing a dense diff. Falls back to None when the group
@@ -8142,6 +8208,10 @@ class LoRAOptimizer(_LoRAMergeBase):
             per_lora_scales = {idx: w / denom for idx, w in lora_weights.items()}
         else:
             per_lora_scales = dict(lora_weights)
+        if _coefficients is not None:
+            if set(_coefficients) != set(lora_weights):
+                return None  # Never omit a filtered/missing contributor.
+            per_lora_scales = dict(_coefficients)
 
         up_parts = []
         down_parts = []
@@ -8171,6 +8241,35 @@ class LoRAOptimizer(_LoRAMergeBase):
             "patch": LoRAAdapter(set(), (fused_up, fused_down, float(total_rank), None, None, None)),
             "weights": per_lora_scales,
         }
+
+    @classmethod
+    def _compact_slerp_patch(cls, patch, dense, storage_dtype):
+        """Accept a smaller factor representation only after bounded parity checks.
+
+        No truncated SVD: these are the original factors with the actual
+        pairwise SLERP coefficients. Check the full matrix in row chunks to
+        reject unstable cancellation and unsupported factor layouts. The tiny
+        FP32 tolerance is tighter than native fp16/bf16 storage rounding.
+        """
+        if not cls._plain_qkv_lora(patch) or dense.ndim != 2:
+            return None
+        up, down = patch.weights[:2]
+        if (up.shape[0], down.shape[1]) != tuple(dense.shape):
+            return None
+        dense_bytes = dense.numel() * torch.empty((), dtype=storage_dtype or dense.dtype).element_size()
+        if cls._estimate_single_patch_bytes(patch) >= dense_bytes:
+            return None
+        up, down = up.to(dense.device), down.to(dense.device)
+        rows = max(1, (8 * 1024**2) // max(1, dense.shape[1] * 4))
+        error_sq = reference_sq = 0.0
+        for start in range(0, dense.shape[0], rows):
+            block = up[start:start + rows] @ down
+            ref = dense[start:start + rows].float()
+            error_sq += float((block - ref).square().sum())
+            reference_sq += float(ref.square().sum())
+        if not math.isfinite(error_sq) or error_sq > max(reference_sq, 1e-30) * 4e-10:
+            return None
+        return patch
 
     def _build_experimental_factor_patch(self, target_group, active_loras, raw_n_loras,
                                          mode, cfg, role_indices, model, clip,
@@ -8904,7 +9003,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             smooth_slerp_gate=smooth_slerp_gate,
         )
 
-    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", auto_strength_floor=-1.0, free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", patch_compression="smart", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_refinement="none", strategy_set="full", architecture_preset="auto", decision_smoothing=0.25, smooth_slerp_gate=False, star_eta=100.0, tame_layers=0.0, tame_threshold=0.3, _analysis_cache=None, _diff_cache=None, _skip_report=False, _skip_qkv_refusion=False, _sl_patch_cache=None, _score_collector=None, _skip_model_apply=False, _group_patch_cache=None, _experimental_config=None):
+    def optimize_merge(self, model, lora_stack, output_strength, clip=None, clip_strength_multiplier=1.0, auto_strength="disabled", auto_strength_floor=-1.0, free_vram_between_passes="disabled", vram_budget=0.0, optimization_mode="per_prefix", cache_patches="enabled", patch_compression="smart", svd_device="gpu", normalize_keys="disabled", sparsification="disabled", sparsification_density=0.7, dare_dampening=0.0, merge_strategy_override="", merge_refinement="none", strategy_set="full", architecture_preset="auto", decision_smoothing=0.25, smooth_slerp_gate=False, star_eta=100.0, tame_layers=0.0, tame_threshold=0.3, _analysis_cache=None, _diff_cache=None, _skip_report=False, _skip_qkv_refusion=False, _sl_patch_cache=None, _score_collector=None, _skip_model_apply=False, _group_patch_cache=None, _experimental_config=None, _compact_output=True, _score_only=None):
         """
         Main entry point. Two-pass streaming architecture:
         Pass 1: Resolve aliases to target groups, compute diffs, sample metrics, discard diffs
@@ -8927,6 +9026,10 @@ class LoRAOptimizer(_LoRAMergeBase):
         # sub-merges / tuner candidates don't clear the parent's collection.
         if not _skip_report:
             self._shape_mismatches = {}
+
+        if _score_only is not None and (
+                not _skip_model_apply or not _skip_report or cache_patches != "disabled"):
+            raise ValueError("Score-only patches are private to discarded, uncached candidates.")
 
         # Per-LoRA cleaning knobs, read by _prepare_group_diffs. Set on every
         # (including recursive sub-merge) entry so the value propagates. Defaults
@@ -8953,6 +9056,7 @@ class LoRAOptimizer(_LoRAMergeBase):
 
         # Normalize stack format (standard tuples or LoRAStack dicts)
         if not lora_stack or len(lora_stack) == 0:
+            self._merge_cache.clear()
             return (model, clip, "No LoRAs in stack.", None, None)
 
         # Extract merge formula metadata before normalization
@@ -8983,6 +9087,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 merge_strategy_override, _experimental_config, active_loras)
 
         if len(active_loras) == 0:
+            self._merge_cache.clear()
             return (model, clip, "No LoRAs in stack (all zero strength or malformed).", None, None)
 
         self._validate_file_payloads(active_loras)
@@ -9051,6 +9156,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                                             decision_smoothing, smooth_slerp_gate,
                                             star_eta, tame_layers, tame_threshold)
         cache_key = f"{cache_key}|base={self._model_revision(model, clip)}"
+        cache_key += f"|compact={_compact_output}"
         if _experimental_config is not None:
             cache_key += "|experimental=v3:" + self._stable_data_hash(_experimental_config)
         if cache_patches == "enabled" and cache_key in self._merge_cache:
@@ -9078,6 +9184,11 @@ class LoRAOptimizer(_LoRAMergeBase):
             logging.info(f"[LoRA Optimizer] Using cached merge result ({len(model_patches)} model + {len(clip_patches)} CLIP patches)")
             return (new_model, new_clip, report, None, lora_data)
 
+        # A miss invalidates the single-entry cache NOW, not at function exit.
+        # Otherwise an entire old dense patch set survives the new merge.
+        if self._merge_cache:
+            self._merge_cache.clear()
+            gc.collect()
         logging.info(f"[LoRA Optimizer] Starting analysis of {len(active_loras)} LoRAs")
         t_start = time.time()
 
@@ -9482,11 +9593,35 @@ class LoRAOptimizer(_LoRAMergeBase):
                 _defer_budget = 0
         _deferred_bytes = [0]
 
+        def _qkv_score_target(key):
+            if _skip_qkv_refusion or getattr(self, '_detected_arch', None) not in ('zimage', 'minimax_h3'):
+                return None
+            name = key[0] if isinstance(key, tuple) else key
+            if re.search(r'(?:layers\.\d+\.attention\.qkv|(?:blocks|token_refiner\.blocks)\.\d+\.attn\.qkv_proj)(?:\.weight)?$', name):
+                return name
+            if re.search(r'layers\.\d+\.attention\.to_(?:q|k|v)(?:\.|$)', name):
+                return re.sub(r'\.to_(?:q|k|v)(?=\.|$)', '.qkv', name)
+            return None
+
+        _score_target_counts = collections.Counter(
+            (g['is_clip'], g['target_key']) for g in target_groups.values())
+        _score_qkv_pending = collections.Counter()
+        _score_qkv_keys = {}
+        if _score_only is not None:
+            for group in target_groups.values():
+                target = None if group['is_clip'] else _qkv_score_target(group['target_key'])
+                if target is not None:
+                    _score_qkv_pending[target] += 1
+                    _score_qkv_keys.setdefault(target, set()).add(group['target_key'])
+
         def _sl_store(key, result_tuple):
             """Budgeted store for the single-LoRA patch cache (CPU patches only)."""
             if _sl_patch_cache is None or result_tuple is None:
                 return
             patch = result_tuple[2]
+            if (_score_only is not None and _qkv_score_target(result_tuple[0]) is not None
+                    and isinstance(patch, tuple) and patch[0] == "diff"):
+                return  # Do not pin dense QKV inputs after streamed refusion.
             tensors = patch.weights if hasattr(patch, "weights") else (
                 patch[1] if isinstance(patch, tuple) and len(patch) >= 2 else ())
             for _t in (tensors if isinstance(tensors, (tuple, list)) else ()):
@@ -9508,6 +9643,10 @@ class LoRAOptimizer(_LoRAMergeBase):
             if planned < 2:
                 return
             patch = result_tuple[2]
+            if (_score_only is not None and not is_clip_key
+                    and _qkv_score_target(result_tuple[0]) is not None
+                    and isinstance(patch, tuple) and patch[0] == "diff"):
+                return
             tensors = patch.weights if hasattr(patch, "weights") else (
                 patch[1] if isinstance(patch, tuple) and len(patch) >= 2 else ())
             for _t in (tensors if isinstance(tensors, (tuple, list)) else ()):
@@ -9533,6 +9672,11 @@ class LoRAOptimizer(_LoRAMergeBase):
             should_keep = vram_budget_bytes > 0 and gpu_patch_bytes < vram_budget_bytes
             target_key = target_group["target_key"]
             is_clip_key = target_group["is_clip"]
+            stream_diff = (_score_only is not None
+                           and _score_target_counts[(is_clip_key, target_key)] == 1
+                           and (is_clip_key or _qkv_score_target(target_key) is None))
+            if stream_diff:
+                should_keep = False
 
             # Determine strategy BEFORE computing diffs (use Pass 1 stats)
             pf_conflict = 0.0
@@ -9783,6 +9927,13 @@ class LoRAOptimizer(_LoRAMergeBase):
                                 and 2 * down.shape[0] < min(d.shape)):
                             experimental_factors[i] = (up, down)
             sparsification_stats = {}
+            coefficients = {} if (
+                _compact_output and pf_mode == "slerp" and len(diff_indices) == 2
+                and merge_refinement == "none" and not stack_has_preserve
+                and not stack_has_conflict_modes and _diff_cache is None
+                and star_eta >= 100.0 and tame_layers <= 0.0
+                and (not has_virtual_loras or self._virtual_group_is_linear_ok(
+                    target_group, active_loras, model, clip))) else None
             merged_diff = self._merge_diffs(
                 diffs_list, pf_mode,
                 density=pf_density, majority_sign_method=pf_sign,
@@ -9802,6 +9953,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 role_indices=experimental_roles,
                 experimental_factors=experimental_factors,
                 sparsification_stats=sparsification_stats,
+                _linear_coefficients=coefficients,
             )
             if _merge_prof is not None:
                 _prof_add(f"merge:{pf_mode}", _prof_t() - _t_merge)
@@ -9809,6 +9961,22 @@ class LoRAOptimizer(_LoRAMergeBase):
             diffs_list.clear()  # Free input diffs from GPU
             if merged_diff is None:
                 return None
+            if coefficients and not sparsification_stats.get("applied"):
+                info = self._build_exact_linear_patch(
+                    target_group, active_loras, raw_n, "weighted_sum",
+                    is_clip_key=is_clip_key, model_scale=model_auto_scale,
+                    _coefficients=coefficients)
+                compact = (self._compact_slerp_patch(info["patch"], merged_diff, storage_dtype)
+                           if info is not None else None)
+                if compact is not None:
+                    if should_keep:
+                        p_bytes = self._estimate_single_patch_bytes(compact)
+                        if gpu_patch_bytes + p_bytes <= vram_budget_bytes:
+                            compact = self._move_patch_to_device(compact, compute_device)
+                            gpu_patch_bytes += p_bytes
+                    return (target_key, is_clip_key, compact, pf_mode, label_prefix,
+                            pf_conflict, max(pf_n_loras, 1), False,
+                            input_norms_mean, merged_norm, None, sparsification_stats)
             # The guard was evaluated on the actual prepared updates, not on
             # sampled Pass-1 conflict statistics. If it skipped, an otherwise
             # plain linear merge can retain exactly the same native factors as
@@ -9890,6 +10058,16 @@ class LoRAOptimizer(_LoRAMergeBase):
                 if not defer_gpu:
                     score_stats = _diff_score_stats(
                         merged_diff, _score_collector.get("compute_svd", False))
+            if stream_diff and not should_compress:
+                # Score the SAME native-dtype dense delta on the requested
+                # device, then retain only scalars. No CPU copy or full model
+                # patch set is needed for an internal candidate.
+                patch = _score_only_patch(("diff", (merged_diff,)), _score_only, score_stats)
+                result = (target_key, is_clip_key, patch, pf_mode, label_prefix,
+                          pf_conflict, max(pf_n_loras, 1), False,
+                          input_norms_mean, merged_norm, None, sparsification_stats)
+                _gc_store(_gc_key, result, is_clip_key)
+                return result
             # Move off-GPU now unless deferred for refusion scoring, kept by
             # the VRAM budget, or a GPU-side SVD is about to consume it anyway
             if (merged_diff.is_cuda and not should_keep and not defer_gpu
@@ -9933,6 +10111,7 @@ class LoRAOptimizer(_LoRAMergeBase):
             nonlocal processed_keys, lowrank_count, compressed_count
             nonlocal total_input_energy, total_merged_energy
             nonlocal _overwrite_count
+            nonlocal gpu_patch_bytes
             if result is None:
                 return
             (target_key, is_clip_key, patch, used_mode, prefix, conflict,
@@ -9982,9 +10161,24 @@ class LoRAOptimizer(_LoRAMergeBase):
                 compressed_count += 1
             strategy_counts[used_mode] = strategy_counts.get(used_mode, 0) + 1
             prefix_decisions.append((prefix, used_mode, conflict, n_loras))
+            if _score_only is not None and not is_clip_key:
+                qkv_target = _qkv_score_target(target_key)
+                if qkv_target is not None:
+                    _score_qkv_pending[qkv_target] -= 1
+                    if _score_qkv_pending[qkv_target] == 0:
+                        # All native/sliced contributors are now present. Fuse
+                        # and score this group before collecting the next one.
+                        pending = {k: model_patches.pop(k) for k in _score_qkv_keys[qkv_target]
+                                   if k in model_patches}
+                        completed = self._refuse_fused_qkv_patches(
+                            pending, gpu_budget_bytes=vram_budget_bytes, _consume=True,
+                            _score_collector=_score_collector, _score_only=_score_only)
+                        for k, p in completed.items():
+                            model_patches[k] = _score_only_patch(p, _score_only)
+                        gpu_patch_bytes = self._cuda_patch_bytes(model_patches) + self._cuda_patch_bytes(clip_patches)
 
         _sl_cache_hits = 0
-        if use_gpu:
+        if use_gpu or _score_only is not None:
             group_items = list(target_groups.items())
             n_loras = len(active_loras)
             for idx, (label_prefix, target_group) in enumerate(group_items):
@@ -10021,6 +10215,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 if _sl_key is not None:
                     _sl_store(_sl_key, result)
                 _collect_merge_result(result)
+                del result  # refusion may have consumed its last dense component
         else:
             max_workers = 1 if _experimental_config is not None else min(4, max(1, len(target_groups)))
             # Separate cached single-LoRA results from groups that need computation
@@ -10041,7 +10236,9 @@ class LoRAOptimizer(_LoRAMergeBase):
                 }
                 for future in concurrent.futures.as_completed(futures):
                     result = future.result()
-                    lp = futures[future]
+                    # Completed futures otherwise pin every dense result until
+                    # the pool exits, even after the patch was scored/replaced.
+                    lp = futures.pop(future)
                     if _sl_patch_cache is not None and prefix_stats.get(lp, {}).get("n_loras", 0) <= 1:
                         _sl_store((lp, auto_strength), result)
                     _collect_merge_result(result)
@@ -10164,7 +10361,8 @@ class LoRAOptimizer(_LoRAMergeBase):
                 model_patches = self._refuse_fused_qkv_patches(
                     model_patches,
                     gpu_budget_bytes=max(0, _qkv_budget - self._cuda_patch_bytes(clip_patches)),
-                    _consume=True, _score_collector=_score_collector)
+                    _consume=True, _score_collector=_score_collector, _score_only=_score_only,
+                    _compact_output=_compact_output)
                 logging.info(
                     f"[LoRA Optimizer] Re-fused {self._detected_arch} QKV patches "
                     f"({len(model_patches)} model patches)")
@@ -10187,6 +10385,27 @@ class LoRAOptimizer(_LoRAMergeBase):
                         _t_cpu = _t.cpu()
                         model_patches[_k] = ("diff", (_t_cpu,))
                         _stats_map[id(_t_cpu)] = (_t_cpu, _st)
+
+        if _score_only is not None:
+            # Colliding targets or incomplete QKV groups stayed real until all
+            # additions/refusion completed. Finish those now, with old inline
+            # identities removed so they cannot keep the tensors resident.
+            for patches in (model_patches, clip_patches):
+                for key in patches:
+                    patch = patches[key]
+                    stats = None
+                    if _score_collector is not None:
+                        for tensor in self._patch_tensors(patch):
+                            entry = _score_collector["stats"].pop(id(tensor), None)
+                            if entry is not None and entry[0] is tensor:
+                                stats = entry[1]
+                    patches[key] = _score_only_patch(patch, _score_only, stats)
+
+        resident_bytes = sum(self._estimate_single_patch_bytes(p)
+                             for patches in (model_patches, clip_patches) for p in patches.values())
+        logging.info("[LoRA Optimizer] Resident patch tensors: %.1f MB%s",
+                     resident_bytes / 1024**2,
+                     " (discarded dense candidates retain scores only)" if _score_only is not None else "")
 
         # Build reverse key map: target_key → canonical prefix metadata
         # (used by SaveMergedLoRA to reconstruct standard LoRA key names)
@@ -10362,7 +10581,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                 # Only log on standalone merges: AutoTuner candidate merges
                 # always run with cache_patches="disabled" by design, and the
                 # message reads as if the USER's setting were being ignored
-                logging.info("[LoRA Optimizer] Patch cache disabled — RAM freed after merge")
+                logging.info("[LoRA Optimizer] Patch cache disabled — output patches remain resident for sampling")
 
         # Save report to disk for later reference
         lora_combo = [[item["name"], item["strength"]] for item in active_loras]
@@ -13466,6 +13685,8 @@ class LoRAAutoTuner(LoRAOptimizer):
             _arch_hint=self._model_class_arch(model))
         active_loras = [item for item in normalized_stack if item["strength"] != 0]
         if not active_loras:
+            self._merge_cache.clear()
+            getattr(self, '_autotuner_cache', {}).clear()
             return (model, clip, "No active LoRAs in stack.", "", None, None)
 
         experimental_candidates, experimental_skipped = _experimental.candidates(experimental_options, active_loras)
@@ -13690,7 +13911,10 @@ class LoRAAutoTuner(LoRAOptimizer):
                     report = self._build_autotuner_report(
                         top_list, cached_tuner["analysis_summary"], output_strength,
                         scoring_speed=scoring_speed, applied_rank=sel_idx + 1)
-                return (model, clip, report, "", cached_tuner, None)
+                result = (model, clip, report, "", cached_tuner, None)
+                self._merge_cache.clear()
+                self._autotuner_cache = {at_cache_key: (result, "tuning_only", selection)}
+                return result
             if cached_mode == "merge" and selection == cached_selection:
                 logging.info("[LoRA AutoTuner] Using cached result")
                 return cached_result
@@ -13702,6 +13926,11 @@ class LoRAAutoTuner(LoRAOptimizer):
                 sel_config = top_list[sel_idx]["config"]
                 logging.info(f"[LoRA AutoTuner] Cached sweep hit — replaying "
                              f"config #{sel_idx + 1} without re-sweeping")
+                # Keep sweep metadata, not the old patched clone, during replay.
+                self._autotuner_cache.clear()
+                self._merge_cache.clear()
+                del cached_result
+                gc.collect()
                 strategy_override = (sel_config["merge_mode"]
                                      if sel_config["optimization_mode"] == "global" else "")
                 replay_model, replay_clip, replay_report, _, replay_lora_data = merge_with_cleaning(
@@ -13733,7 +13962,15 @@ class LoRAAutoTuner(LoRAOptimizer):
                           replay_report, cached_tuner, replay_lora_data)
                 self._autotuner_cache[at_cache_key] = (result, "merge", selection)
                 return result
+            del cached_result
 
+        # Same base model with new settings is also a cache miss. Release the
+        # previous output before any candidate is built (also when caching was
+        # just disabled). Do not touch patches held by downstream Comfy nodes.
+        if getattr(self, '_autotuner_cache', None) or self._merge_cache:
+            getattr(self, '_autotuner_cache', {}).clear()
+            self._merge_cache.clear()
+            gc.collect()
         # Load pair/lora caches and run community cache check before any early returns
         pairs_for_cache = [(i, j) for i in range(len(active_loras))
                                    for j in range(i+1, len(active_loras))]
@@ -14391,9 +14628,9 @@ class LoRAAutoTuner(LoRAOptimizer):
         # DISCARDED; the winner is re-merged once after the sweep (caches
         # freed first). Keeping the running best alive doubled peak RAM by a
         # full patch set — on video-scale models that filled whole machines.
-        # A single candidate keeps the old keep-it path (re-merge would only
-        # duplicate work).
-        _discard_candidates = len(top_candidates) > 1
+        # Even a single candidate uses scalar-only dense scoring now; re-merge
+        # its final output with compact factors enabled, after caches are freed.
+        _discard_candidates = True
         logging.info(f"[LoRA AutoTuner] Phase 2: Merging and measuring top {len(top_candidates)} candidates...")
 
         # Pre-identify single-LoRA target keys for scoring cache.
@@ -14611,6 +14848,12 @@ class LoRAAutoTuner(LoRAOptimizer):
                 _skip_model_apply=((_discard_candidates or output_mode == "tuning_only")
                                    and evaluator is None),
                 _group_patch_cache=_group_cache,
+                # Candidate scoring keeps its historical dense/factor choice.
+                # Compact only the final output, after selection.
+                _compact_output=False,
+                _score_only=({"device": score_dev if score_dev is not None else torch.device("cpu"),
+                              "compute_svd": compute_svd}
+                             if evaluator is None else None),
             )
             if candidate_result is None:
                 _collector = None
