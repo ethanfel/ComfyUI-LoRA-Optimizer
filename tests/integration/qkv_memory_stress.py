@@ -65,11 +65,11 @@ def main(mode):
     m.comfy.model_management.get_free_memory = lambda _: max(0, cap - torch.cuda.memory_allocated(device))
     gpu_scores = 0
     original_stats = m._diff_score_stats
-    def stats(tensor, compute_svd):
+    def stats(tensor, compute_svd, target_key=None):
         nonlocal gpu_scores
         assert tensor.is_cuda, "the fix must keep scoring on GPU"
         gpu_scores += 1
-        return original_stats(tensor, compute_svd)
+        return original_stats(tensor, compute_svd, target_key)
     m._diff_score_stats = stats
     start = time.perf_counter()
     oom = False

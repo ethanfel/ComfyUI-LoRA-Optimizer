@@ -606,6 +606,17 @@ The AutoTuner ranks candidate configs with a heuristic score before merging the 
 
 Ranking stays fair because every candidate is scored on the same subset of prefixes.
 
+**Sampled sparsity:** dense deltas and ordinary LoRA factors use the same up-to-64
+columns and the same threshold for each final target key. Sampling indices are
+identical on CPU and GPU; GPU scoring still runs on GPU. This is an estimate,
+not the exact fraction of small values across the whole weight matrix. A
+conflict-aware DARE/DELLA operation skipped by its guard must not gain score
+merely because its temporary representation became dense or a diff cache was
+enabled. AutoTuner scoring revision `1.13.2` invalidates older saved rankings;
+explicitly wired older `TUNER_DATA` should be regenerated. Merge equations and
+the existing optional SVD rank metrics are unchanged. See the
+[scoring consistency regression](docs/scoring-consistency-regression.md).
+
 </details>
 
 <details>

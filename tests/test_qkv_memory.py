@@ -227,9 +227,9 @@ def test_real_cuda_native_collision_offloads_before_fp32_expansion(kind, mixed_d
     torch.testing.assert_close(out[TARGET][1][0], expected)
     devices = []
     score_stats = m._diff_score_stats
-    def gpu_stats(t, compute_svd):
+    def gpu_stats(t, compute_svd, target_key=None):
         devices.append(t.device.type)
-        return score_stats(t, compute_svd)
+        return score_stats(t, compute_svd, target_key)
     with mock.patch.object(m, "_diff_score_stats", side_effect=gpu_stats):
         score = m._score_merge_result(out, {}, compute_svd=False, score_device=torch.device("cuda"))
     assert devices == ["cuda"]

@@ -251,7 +251,7 @@ AUTOTUNER_MEMORY_VERSION = 1
 # (weighted_sum), which preserves the dominant LoRA without oversaturating (it defines
 # the auto-strength reference). Changes per-prefix mode selection for imbalanced stacks;
 # bump re-tunes them.
-AUTOTUNER_ALGO_VERSION = "1.13.1"  # Cache revision: truthful conflict-sparsification skips/scoring
+AUTOTUNER_ALGO_VERSION = "1.13.2"  # Shared sparsity sampling and cache-independent no-op scoring
 
 
 def _warn_stale_tuner_data(tuner_data, context):
@@ -2716,13 +2716,13 @@ class _LoRAMergeBase:
                         del addition, prior
                 stats = None
                 if _score_only is not None:
-                    return _score_only_patch(combined, _score_only), None
+                    return _score_only_patch(combined, _score_only, target_key=target), None
                 # GPU scoring stays on GPU; release each completed fused
                 # result before processing another group, not after the map.
                 if (_score_collector is not None and destination.type == "cuda"
                         and isinstance(combined, tuple) and combined[0] == "diff"):
                     tensor = combined[1][0]
-                    stats = _diff_score_stats(tensor, _score_collector.get("compute_svd", False))
+                    stats = _diff_score_stats(tensor, _score_collector.get("compute_svd", False), target)
                     combined = ("diff", (tensor.cpu(),))
                 return combined, stats
 
@@ -3681,11 +3681,21 @@ class _LoRAMergeBase:
                         raw_contributors.add(i)
                         if lora_info is not None:
                             rank_sum += int(lora_info[1].shape[0])
+                            # A cache hit still has the source storage dtype.
+                            # Losing it made cached fp16/bf16 groups stay FP32
+                            # while identical recomputed groups were downcast.
+                            item_dtype = torch.promote_types(lora_info[0].dtype, lora_info[1].dtype)
+                            storage_dtype = (item_dtype if storage_dtype is None
+                                             else torch.promote_types(storage_dtype, item_dtype))
                             if not linear_rank_bound:
                                 rank_bound_known = False
                         else:
                             rank_sum += 1
                             rank_bound_known = False
+                            dense_source = self._get_dense_payload(item['lora'], alias)
+                            if dense_source is not None:
+                                storage_dtype = (dense_source.dtype if storage_dtype is None
+                                                 else torch.promote_types(storage_dtype, dense_source.dtype))
                         diff_accum = diff if diff_accum is None else diff_accum + diff
                     continue
 
@@ -6211,7 +6221,38 @@ def _score_config_heuristic(config, avg_conflict_ratio, avg_cos_sim,
     return score
 
 
-def _diff_score_stats(tensor, compute_svd):
+def _score_sample_columns(n_cols, target_key, device):
+    """Same 64 columns for dense/factored patches and CPU/CUDA scoring.
+
+    Draw indices on CPU with a local RNG: CUDA generators use a different
+    permutation for the same seed. Target identity must be the final patch
+    key (including QKV refusion), not its trainer alias or candidate settings.
+    None means all columns fit; do not allocate a needless permutation.
+    """
+    if n_cols <= 64:
+        return None
+    key = target_key[0] if isinstance(target_key, tuple) else target_key
+    if isinstance(key, str) and re.search(r'layers\.\d+\.attention\.to_out\.0(?:\.|$)', key):
+        # Refusion also renames Z-Image's output projection. Inline scoring
+        # can happen before that rename; use its final identity in either case.
+        key = key.replace('.to_out.0', '.out')
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(zlib.crc32(str(key).encode("utf-8")) & 0xFFFFFFFF)
+    return torch.randperm(n_cols, generator=generator)[:64].to(device)
+
+
+def _sample_sparsity(sample):
+    """A single threshold/measurement rule, independent of patch storage."""
+    absolute = sample.float().abs()
+    if absolute.numel() == 0:
+        return None
+    threshold = absolute.max().item() * 0.01
+    if threshold <= 0:
+        return None
+    return torch.count_nonzero(absolute < threshold).item() / absolute.numel()
+
+
+def _diff_score_stats(tensor, compute_svd, target_key=None):
     """Scoring stats for one full-rank diff tensor: (fro_norm, sparsity, eff_rank).
 
     Single implementation shared by _score_merge_result and the inline
@@ -6220,14 +6261,14 @@ def _diff_score_stats(tensor, compute_svd):
     None when not measurable (all-zero tensor / non-2D / SVD failure).
     """
     fro_norm = torch.linalg.vector_norm(tensor, dtype=torch.float32).item()
-    t_abs = tensor.abs()
-    threshold = t_abs.max().item() * 0.01
-    sparsity = None
-    if threshold > 0:
-        # count_nonzero is exact where a float32 mean of 0/1s starts
-        # rounding above 2^24 elements
-        sparsity = torch.count_nonzero(t_abs < threshold).item() / t_abs.numel()
-    del t_abs
+    sample = tensor
+    if tensor.dim() >= 2:
+        matrix = tensor.flatten(start_dim=1)
+        columns = _score_sample_columns(matrix.shape[1], target_key, matrix.device)
+        if columns is not None:
+            sample = matrix.index_select(1, columns)
+    sparsity = _sample_sparsity(sample)
+    del sample
     eff_rank = None
     if compute_svd and tensor.dim() == 2 and min(tensor.shape) > 1:
         try:
@@ -6264,14 +6305,14 @@ class _ScoredDiff:
         self.stats = stats
 
 
-def _score_only_patch(patch, config, stats=None):
+def _score_only_patch(patch, config, stats=None, target_key=None):
     if isinstance(patch, tuple) and len(patch) == 2 and patch[0] == "diff":
         if stats is None:
             tensor = patch[1][0]
             device = config.get("device")
             if device is not None:
                 tensor = tensor.to(device)
-            stats = _diff_score_stats(tensor, config.get("compute_svd", False))
+            stats = _diff_score_stats(tensor, config.get("compute_svd", False), target_key)
         return _ScoredDiff(stats)
     return patch
 
@@ -6378,19 +6419,14 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
                 gram_down = torch.mm(down_flat, down_flat.T)
                 fro_norm = (torch.trace(gram_up @ gram_down).clamp(min=0) ** 0.5 * abs(scale)).item()
                 norms.append(fro_norm)
-                # Estimate element-wise sparsity by sampling columns of the product.
-                # Seeded per target key: unseeded sampling made composite scores
-                # (and thus candidate rankings) vary run-to-run.
-                n_cols = down_flat.shape[1]
-                sample_k = min(64, n_cols)
-                _col_g = torch.Generator(device=down_flat.device)
-                _col_g.manual_seed(zlib.crc32(str(target_key).encode("utf-8")) & 0xFFFFFFFF)
-                col_idx = torch.randperm(n_cols, device=down_flat.device, generator=_col_g)[:sample_k]
-                sampled = torch.mm(up_flat, down_flat[:, col_idx]) * scale
-                max_val = sampled.abs().max().item()
-                threshold = max_val * 0.01
-                if threshold > 0:
-                    sparsity = (sampled.abs() < threshold).float().mean().item()
+                # Use the SAME columns and threshold as the dense path. The
+                # old full-matrix max vs sampled max rewarded a dense encoding
+                # of an unchanged merge, notably on conflict-guard skips.
+                columns = _score_sample_columns(down_flat.shape[1], target_key, down_flat.device)
+                sampled = torch.mm(up_flat, down_flat if columns is None
+                                   else down_flat.index_select(1, columns)) * scale
+                sparsity = _sample_sparsity(sampled)
+                if sparsity is not None:
                     sparsities.append(sparsity)
                 del sampled
                 # Defer effective-rank SVD to batched post-loop computation.
@@ -6424,7 +6460,7 @@ def _score_merge_result(model_patches, clip_patches, compute_svd=True,
         if score_device is not None:
             tensor = tensor.to(score_device)
 
-        fro_norm, sparsity, eff_rank = _diff_score_stats(tensor, compute_svd)
+        fro_norm, sparsity, eff_rank = _diff_score_stats(tensor, compute_svd, target_key)
         norms.append(fro_norm)
         if sparsity is not None:
             sparsities.append(sparsity)
@@ -9981,12 +10017,15 @@ class LoRAOptimizer(_LoRAMergeBase):
             # sampled Pass-1 conflict statistics. If it skipped, an otherwise
             # plain linear merge can retain exactly the same native factors as
             # its disabled-sparsification counterpart. Avoid rank padding/SVD
-            # and representation-dependent scoring. Cleaned/masked/cached
-            # dense inputs, preserved overlays and spatial targets stay dense.
+            # and representation-dependent scoring. The diff cache contains
+            # raw FP32 expansions; enabling it must not disable this no-op
+            # path. The builder still rejects genuinely dense/exotic inputs;
+            # cleaned/masked inputs, preserved overlays and spatial targets
+            # remain excluded.
             if (sparsification_stats.get("skipped")
                     and pf_mode in ("weighted_sum", "weighted_average", "normalize")
                     and merge_refinement == "none" and not stack_has_preserve
-                    and not stack_has_conflict_modes and _diff_cache is None
+                    and not stack_has_conflict_modes
                     and star_eta >= 100.0 and tame_layers <= 0.0
                     and merged_diff.ndim == 2
                     and (not has_virtual_loras or self._virtual_group_is_linear_ok(
@@ -10057,12 +10096,12 @@ class LoRAOptimizer(_LoRAMergeBase):
                             defer_gpu = True
                 if not defer_gpu:
                     score_stats = _diff_score_stats(
-                        merged_diff, _score_collector.get("compute_svd", False))
+                        merged_diff, _score_collector.get("compute_svd", False), target_key)
             if stream_diff and not should_compress:
                 # Score the SAME native-dtype dense delta on the requested
                 # device, then retain only scalars. No CPU copy or full model
                 # patch set is needed for an internal candidate.
-                patch = _score_only_patch(("diff", (merged_diff,)), _score_only, score_stats)
+                patch = _score_only_patch(("diff", (merged_diff,)), _score_only, score_stats, target_key)
                 result = (target_key, is_clip_key, patch, pf_mode, label_prefix,
                           pf_conflict, max(pf_n_loras, 1), False,
                           input_norms_mean, merged_norm, None, sparsification_stats)
@@ -10174,7 +10213,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                             pending, gpu_budget_bytes=vram_budget_bytes, _consume=True,
                             _score_collector=_score_collector, _score_only=_score_only)
                         for k, p in completed.items():
-                            model_patches[k] = _score_only_patch(p, _score_only)
+                            model_patches[k] = _score_only_patch(p, _score_only, target_key=k)
                         gpu_patch_bytes = self._cuda_patch_bytes(model_patches) + self._cuda_patch_bytes(clip_patches)
 
         _sl_cache_hits = 0
@@ -10381,7 +10420,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                         if _entry is not None and _entry[0] is _t:
                             continue
                         _st = _diff_score_stats(
-                            _t, _score_collector.get("compute_svd", False))
+                            _t, _score_collector.get("compute_svd", False), _k)
                         _t_cpu = _t.cpu()
                         model_patches[_k] = ("diff", (_t_cpu,))
                         _stats_map[id(_t_cpu)] = (_t_cpu, _st)
@@ -10399,7 +10438,7 @@ class LoRAOptimizer(_LoRAMergeBase):
                             entry = _score_collector["stats"].pop(id(tensor), None)
                             if entry is not None and entry[0] is tensor:
                                 stats = entry[1]
-                    patches[key] = _score_only_patch(patch, _score_only, stats)
+                    patches[key] = _score_only_patch(patch, _score_only, stats, key)
 
         resident_bytes = sum(self._estimate_single_patch_bytes(p)
                              for patches in (model_patches, clip_patches) for p in patches.values())
@@ -15586,9 +15625,9 @@ class LoRAAutoTuner(LoRAOptimizer):
             energy_label = f" | Energy: {m['energy_ratio']:.2f}x" if "energy_ratio" in m else ""
             if m.get("effective_rank_mean", 0) > 0:
                 lines.append(f"    Effective rank: {m['effective_rank_mean']:.1f} "
-                             f"| Sparsity: {m.get('sparsity_mean', 0):.1%}{energy_label}")
+                             f"| Sampled sparsity: {m.get('sparsity_mean', 0):.1%}{energy_label}")
             elif energy_label:
-                lines.append(f"    Sparsity: {m.get('sparsity_mean', 0):.1%}{energy_label}")
+                lines.append(f"    Sampled sparsity: {m.get('sparsity_mean', 0):.1%}{energy_label}")
 
         lines.append("")
         lines.append("  To use a different config: change selection=N")

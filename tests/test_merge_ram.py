@@ -195,9 +195,9 @@ def test_streamed_qkv_keeps_requested_gpu_scoring(merge_device):
                for i in range(3)}
     calls = []
     original = m._diff_score_stats
-    def check(tensor, compute_svd):
+    def check(tensor, compute_svd, target_key=None):
         calls.append((tensor.device.type, compute_svd, tuple(tensor.shape)))
-        return original(tensor, compute_svd)
+        return original(tensor, compute_svd, target_key)
     with mock.patch.object(m, "_diff_score_stats", new=check):
         result = m._LoRAMergeBase._refuse_fused_qkv_patches(
             patches, _consume=True, _score_only={"device": torch.device("cuda"), "compute_svd": True})
